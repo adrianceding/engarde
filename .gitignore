@@ -1,3 +1,9 @@
-/dist
+# Go build output
+/dist/
+/engarde
+/engarde.exe
+
+# Local/editor noise
+.idea/
 .DS_Store
-internal/assets/browser
+*.tmp

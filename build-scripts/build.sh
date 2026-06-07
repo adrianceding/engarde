@@ -1,23 +1,17 @@
 #!/bin/bash
+set -euo pipefail
 
-type=$1
-
-if [ "$type" != "client" ] && [ "$type" != "server" ]; then
-    echo "Usage: $0 [client|server]"
-    exit 1
-fi
-
-if [ "$GITHUB_REF" != "" ]; then
-    commit=$(echo "$GITHUB_SHA" | head -c 7);
-    branch=${GITHUB_REF#refs/heads/};
+if [ -n "${GITHUB_REF:-}" ]; then
+    commit=$(echo "${GITHUB_SHA:-}" | head -c 7)
+    branch=${GITHUB_REF#refs/heads/}
     if [ "$branch" = "master" ]; then
         version="$commit"
     else
         version="$commit ($branch)"
     fi
-elif [ $(which git) != "" ]; then
-    commit=$(git rev-parse HEAD | head -c 7);
-    branch=$(git rev-parse --abbrev-ref HEAD);
+elif command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+    commit=$(git rev-parse HEAD | head -c 7)
+    branch=$(git rev-parse --abbrev-ref HEAD)
     if [ "$branch" = "master" ]; then
         version="$commit"
     else
@@ -25,18 +19,21 @@ elif [ $(which git) != "" ]; then
     fi
     version="$version - UNOFFICIAL BUILD"
 else
-   version="UNOFFICIAL BUILD"
+    version="UNOFFICIAL BUILD"
 fi
 
-dstArch="$GOARCH"
-if [ "$dstArch" = "386" ]; then
-    dstArch="i386"
+dst_arch="${GOARCH:-$(go env GOARCH)}"
+if [ "$dst_arch" = "386" ]; then
+    dst_arch="i386"
 fi
 
-dstName="engarde-$type"
-if [ "$GOOS" = "windows" ]; then
-    dstName="$dstName.exe"
+goos="${GOOS:-$(go env GOOS)}"
+binary_name="engarde"
+if [ "$goos" = "windows" ]; then
+    binary_name="$binary_name.exe"
 fi
 
-echo "Building $type for $GOOS $dstArch - ver. $version"
-go build -ldflags "-s -w -X 'main.Version=$version'" -o dist/$GOOS/$dstArch/$dstName ./cmd/engarde-$type
+rm -rf "dist/$goos/$dst_arch"
+mkdir -p "dist/$goos/$dst_arch"
+echo "Building engarde for $goos $dst_arch - ver. $version"
+go build -ldflags "-s -w -X 'github.com/adrianceding/engarde/internal/version.Version=$version'" -o "dist/$goos/$dst_arch/$binary_name" ./cmd/engarde

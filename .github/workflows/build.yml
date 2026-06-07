@@ -1,123 +1,83 @@
-name: Build and Deploy
+name: Build and Release
 
 on:
   push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '22.21.0'
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.0'
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.25.3'
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25.3'
 
-    - name: Build Go application
-      run: make
+      - name: Run Go tests
+        run: go test ./...
 
-    - name: Deploy to GitHub Pages
-      run: |
-        BRANCH="${GITHUB_REF_NAME}"
+      - name: Build linux amd64 smoke artifact
+        run: make linux-amd64
 
-        # Configure git
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
-        # Save build artifacts
-        cp -r dist /tmp/dist
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-        # Fetch or create gh-pages branch
-        git fetch origin gh-pages:gh-pages 2>/dev/null || git checkout --orphan gh-pages
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.0'
 
-        git checkout gh-pages
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25.3'
 
-        # Clean untracked files left over from the build step
-        git clean -fd
+      - name: Build all release artifacts
+        run: make
 
-        # Remove old builds for this branch, keep others
-        rm -rf "$BRANCH"
-        mkdir -p "$BRANCH"
-        cp -r /tmp/dist/* "$BRANCH/"
-
-        # Generate index.html for every directory
-        generate_index() {
-          local dir="$1"
-          local rel="${dir#./}"
-          local title="${rel:-.}"
-
-          {
-            cat <<'HEADER'
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #333; }
-          h1 { border-bottom: 1px solid #eee; padding-bottom: 10px; }
-          table { width: 100%; border-collapse: collapse; }
-          th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; }
-          th { font-weight: 600; color: #666; }
-          a { color: #0366d6; text-decoration: none; }
-          a:hover { text-decoration: underline; }
-          .size { color: #666; }
-        </style>
-        HEADER
-            echo "<title>Index of /${title}</title>"
-            echo "</head><body>"
-            echo "<h1>Index of /${title}</h1>"
-            echo "<table><thead><tr><th>Name</th><th>Size</th></tr></thead><tbody>"
-
-            # Parent directory link
-            if [ "$dir" != "." ]; then
-              echo '<tr><td><a href="../">../</a></td><td></td></tr>'
-            fi
-
-            # List directories first, then files
-            for entry in "$dir"/*/; do
-              [ -d "$entry" ] || continue
-              name="$(basename "$entry")"
-              echo "<tr><td><a href=\"${name}/\">${name}/</a></td><td>-</td></tr>"
-            done
-
-            for entry in "$dir"/*; do
-              [ -f "$entry" ] || continue
-              name="$(basename "$entry")"
-              [ "$name" = "index.html" ] && continue
-              size=$(stat --format=%s "$entry" 2>/dev/null || stat -f%z "$entry" 2>/dev/null)
-              if [ "$size" -ge 1048576 ] 2>/dev/null; then
-                hsize="$(awk "BEGIN{printf \"%.1f MB\", $size/1048576}")"
-              elif [ "$size" -ge 1024 ] 2>/dev/null; then
-                hsize="$(awk "BEGIN{printf \"%.1f KB\", $size/1024}")"
-              else
-                hsize="${size} B"
+      - name: Package release artifacts
+        run: |
+          mkdir -p release
+          find dist -type f \( -name 'engarde' -o -name 'engarde.exe' \) -print0 |
+            while IFS= read -r -d '' artifact; do
+              os="$(echo "$artifact" | cut -d/ -f2)"
+              arch="$(echo "$artifact" | cut -d/ -f3)"
+              name="$(basename "$artifact")"
+              extension=""
+              if [[ "$name" == *.exe ]]; then
+                name="${name%.exe}"
+                extension=".exe"
               fi
-              echo "<tr><td><a href=\"${name}\">${name}</a></td><td class=\"size\">${hsize}</td></tr>"
+              cp "$artifact" "release/${name}-${os}-${arch}${extension}"
             done
+          (cd release && sha256sum * > SHA256SUMS.txt)
 
-            echo "</tbody></table></body></html>"
-          } > "$dir/index.html"
-        }
-
-        export -f generate_index
-        find . -type d \
-          -not -path './.git*' \
-          -exec bash -c 'generate_index "$0"' {} \;
-
-        # Commit and push
-        git add -A
-        git diff --cached --quiet && echo "No changes to deploy" && exit 0
-        git commit -m "Deploy builds for ${BRANCH} (${GITHUB_SHA::7})"
-        git push origin gh-pages
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
