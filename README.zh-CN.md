@@ -83,6 +83,10 @@ client:
   listenAddr: "127.0.0.1:59401"
   dstAddr: "1.2.3.4:59501"
   writeTimeout: 10
+  udpBatch:
+    enabled: true
+    readSize: 32
+    writeSize: 32
 ```
 
 server 模式需要 `server.listenAddr` 和 `server.dstAddr`：
@@ -93,6 +97,10 @@ server:
   dstAddr: "127.0.0.1:59301"
   clientTimeout: 30
   writeTimeout: 10
+  udpBatch:
+    enabled: true
+    readSize: 32
+    writeSize: 32
 ```
 
 角色选择规则：
@@ -104,6 +112,7 @@ server:
 重要字段：
 
 - `writeTimeout`：socket 写超时，单位是毫秒。请使用普通整数；负数表示禁用写超时。
+- `udpBatch`：可选的 UDP 批量 I/O 设置。省略时默认启用；设置 `enabled: false` 可强制使用逐包 I/O，也可以通过 `readSize` 和 `writeSize` 调整批量大小用于本地性能测试。
 - `excludedInterfaces`：client 侧不参与中继转发的网卡。
 - `interfaceLabels`：在 Web UI 中显示的网卡友好名称。
 - `dstOverrides`：client 侧按网卡覆盖远端中继地址。

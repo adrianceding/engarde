@@ -12,13 +12,18 @@ import (
 	"github.com/adrianceding/engarde/internal/config"
 	"github.com/adrianceding/engarde/internal/control"
 	"github.com/adrianceding/engarde/internal/relay"
+	"github.com/adrianceding/engarde/internal/udp"
 	log "github.com/sirupsen/logrus"
 )
 
 var runControl = control.Run
 var resolveUDPAddr = net.ResolveUDPAddr
 var listenUDP = func(network string, laddr *net.UDPAddr) (udpSocket, error) {
-	return net.ListenUDP(network, laddr)
+	conn, err := net.ListenUDP(network, laddr)
+	if err != nil {
+		return nil, err
+	}
+	return udp.Wrap(conn), nil
 }
 
 type udpSocket interface {
@@ -54,7 +59,7 @@ func New(cfg config.Server, version string, webFS fs.FS) *Server {
 		webFS:   webFS,
 		clients: make(map[string]*connectedClient),
 	}
-	server.dispatcher = relay.NewDispatcher(cfg.WriteTimeout, relay.DefaultQueueSize, func(result relay.Result) {
+	server.dispatcher = relay.NewDispatcherWithBatch(cfg.WriteTimeout, relay.DefaultQueueSize, cfg.UDPBatch.IsEnabled(), cfg.UDPBatch.EffectiveWriteSize(), func(result relay.Result) {
 		log.WithError(result.Err).Warn("Error writing to client '" + result.ID + "', terminating it")
 		server.removeClient(result.ID)
 	})
@@ -144,40 +149,77 @@ func (server *Server) closeOnCancel(ctx context.Context) {
 }
 
 func (server *Server) receiveFromClient(ctx context.Context) error {
-	buffer := make([]byte, 1500)
+	readBatch := udp.NewReadBatch(server.cfg.UDPBatch.EffectiveReadSize())
+	writeBatch := make([]udp.Packet, 0, server.cfg.UDPBatch.EffectiveWriteSize())
+	learnedAddrs := make([]*net.UDPAddr, 0, server.cfg.UDPBatch.EffectiveReadSize())
 	for {
-		n, srcAddr, err := server.clientSocket.ReadFromUDP(buffer)
-		if err != nil {
+		n, err := udp.ReadBatch(server.clientSocket, readBatch, server.cfg.UDPBatch.IsEnabled())
+		if err != nil && n == 0 {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			log.WithError(err).Warn("Error reading from client")
 			continue
 		}
-		server.learnClient(srcAddr)
-		if _, err := server.wgSocket.WriteToUDP(buffer[:n], server.wgAddr); err != nil {
+		writeBatch = writeBatch[:0]
+		learnedAddrs = learnedAddrs[:0]
+		now := time.Now().Unix()
+		for i := 0; i < n; i++ {
+			addr := readBatch[i].Addr
+			if addr == nil {
+				continue
+			}
+			if !containsUDPAddr(learnedAddrs, addr) {
+				server.learnClientAt(addr, now)
+				learnedAddrs = append(learnedAddrs, addr)
+			}
+			writeBatch = append(writeBatch, udp.Packet{Payload: readBatch[i].Payload, Addr: server.wgAddr})
+		}
+		if _, err := udp.WriteBatchChunks(server.wgSocket, writeBatch, server.cfg.UDPBatch.IsEnabled(), server.cfg.UDPBatch.EffectiveWriteSize()); err != nil {
 			log.WithError(err).Warn("Error writing to WireGuard")
+		}
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			log.WithError(err).Warn("Error reading from client")
 		}
 	}
 }
 
 func (server *Server) receiveFromWireGuard(ctx context.Context) {
-	buffer := make([]byte, 1500)
+	readBatch := udp.NewReadBatch(server.cfg.UDPBatch.EffectiveReadSize())
+	payloads := make([][]byte, 0, server.cfg.UDPBatch.EffectiveReadSize())
 	for {
-		n, _, err := server.wgSocket.ReadFromUDP(buffer)
-		if err != nil {
+		n, err := udp.ReadBatch(server.wgSocket, readBatch, server.cfg.UDPBatch.IsEnabled())
+		if err != nil && n == 0 {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			log.WithError(err).Warn("Error reading from WireGuard")
 			continue
 		}
-		server.dispatcher.Fanout(buffer[:n], server.clientTargets(time.Now().Unix()))
+		payloads = payloads[:0]
+		for i := 0; i < n; i++ {
+			payloads = append(payloads, readBatch[i].Payload)
+		}
+		if len(payloads) > 0 {
+			server.dispatcher.FanoutBatch(payloads, server.clientTargets(time.Now().Unix()))
+		}
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.WithError(err).Warn("Error reading from WireGuard")
+		}
 	}
 }
 
 func (server *Server) learnClient(addr *net.UDPAddr) {
-	now := time.Now().Unix()
+	server.learnClientAt(addr, time.Now().Unix())
+}
+
+func (server *Server) learnClientAt(addr *net.UDPAddr, now int64) {
 	key := addr.String()
 	server.clientsMu.RLock()
 	client, ok := server.clients[key]
@@ -194,6 +236,22 @@ func (server *Server) learnClient(addr *net.UDPAddr) {
 	server.clients[key] = client
 	server.clientsMu.Unlock()
 	server.updateWireGuardWriteBuffer()
+}
+
+func containsUDPAddr(addrs []*net.UDPAddr, addr *net.UDPAddr) bool {
+	for _, existing := range addrs {
+		if sameUDPAddr(existing, addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameUDPAddr(first, second *net.UDPAddr) bool {
+	if first == nil || second == nil {
+		return first == second
+	}
+	return first.Port == second.Port && first.Zone == second.Zone && first.IP.Equal(second.IP)
 }
 
 func (server *Server) clientTargets(now int64) []relay.Target {

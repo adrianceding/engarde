@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/adrianceding/engarde/internal/udp"
 )
 
 type fakeWriter struct {
@@ -16,6 +18,36 @@ type fakeWriter struct {
 	writeErr     error
 	writtenBytes []byte
 	block        chan struct{}
+}
+
+type fakeBatchWriter struct {
+	fakeWriter
+	batchWrites int
+	partial     int
+	batchErr    error
+	addrs       []string
+}
+
+func (writer *fakeBatchWriter) WriteBatch(packets []udp.Packet) (int, error) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	writer.batchWrites++
+	writer.writes += len(packets)
+	if len(packets) > 0 {
+		writer.writtenBytes = append(writer.writtenBytes[:0], packets[len(packets)-1].Payload...)
+	}
+	for _, packet := range packets {
+		if packet.Addr != nil {
+			writer.addrs = append(writer.addrs, packet.Addr.String())
+		}
+	}
+	if writer.batchErr != nil {
+		return 0, writer.batchErr
+	}
+	if writer.partial > 0 {
+		return writer.partial, nil
+	}
+	return len(packets), nil
 }
 
 func (writer *fakeWriter) SetWriteDeadline(deadline time.Time) error {
@@ -45,6 +77,18 @@ func (writer *fakeWriter) writeCount() int {
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	return writer.writes
+}
+
+func (writer *fakeBatchWriter) batchWriteCount() int {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.batchWrites
+}
+
+func (writer *fakeBatchWriter) writtenAddrs() []string {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return append([]string(nil), writer.addrs...)
 }
 
 func (writer *fakeWriter) hasDeadline() bool {
@@ -161,6 +205,65 @@ func TestDispatcherDoesNotBlockOnFullTargetQueue(t *testing.T) {
 	waitForWrites(t, fast, 3)
 	if blocked.writeCount() != 0 {
 		t.Fatalf("blocked writes = %d, want 0 while blocked", blocked.writeCount())
+	}
+}
+
+func TestDispatcherBatchesTargetsSharingConnection(t *testing.T) {
+	writer := &fakeBatchWriter{}
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 10}
+	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 11), Port: 11}
+	dispatcher := NewDispatcherWithBatch(10, 4, true, 4, nil)
+	t.Cleanup(dispatcher.Close)
+
+	dispatcher.Fanout([]byte("packet"), []Target{{ID: "first", Conn: writer, Addr: firstAddr}, {ID: "second", Conn: writer, Addr: secondAddr}})
+	waitForWrites(t, &writer.fakeWriter, 2)
+	if writer.batchWriteCount() != 1 {
+		t.Fatalf("batchWrites = %d, want 1", writer.batchWriteCount())
+	}
+	addrs := writer.writtenAddrs()
+	if len(addrs) != 2 || addrs[0] != firstAddr.String() || addrs[1] != secondAddr.String() {
+		t.Fatalf("written addrs = %#v", addrs)
+	}
+}
+
+func TestDispatcherBatchesPayloadsAndTargetsSharingConnection(t *testing.T) {
+	writer := &fakeBatchWriter{}
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 10}
+	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 11), Port: 11}
+	dispatcher := NewDispatcherWithBatch(10, 4, true, 8, nil)
+	t.Cleanup(dispatcher.Close)
+
+	dispatcher.FanoutBatch([][]byte{[]byte("first"), []byte("second")}, []Target{{ID: "first", Conn: writer, Addr: firstAddr}, {ID: "second", Conn: writer, Addr: secondAddr}})
+	waitForWrites(t, &writer.fakeWriter, 4)
+	if writer.batchWriteCount() != 1 {
+		t.Fatalf("batchWrites = %d, want 1", writer.batchWriteCount())
+	}
+	addrs := writer.writtenAddrs()
+	want := []string{firstAddr.String(), secondAddr.String(), firstAddr.String(), secondAddr.String()}
+	if len(addrs) != len(want) {
+		t.Fatalf("written addrs = %#v, want %#v", addrs, want)
+	}
+	for i := range want {
+		if addrs[i] != want[i] {
+			t.Fatalf("written addrs = %#v, want %#v", addrs, want)
+		}
+	}
+}
+
+func TestConnWorkerReportsPartialBatchWrite(t *testing.T) {
+	writeErr := errors.New("retry")
+	writer := &fakeBatchWriter{partial: 1}
+	writer.writeErr = writeErr
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 12), Port: 12}
+	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 13), Port: 13}
+	errorsCh := make(chan Result, 1)
+	dispatcher := NewDispatcherWithBatch(10, 4, true, 4, func(result Result) { errorsCh <- result })
+	t.Cleanup(dispatcher.Close)
+
+	dispatcher.Fanout([]byte("packet"), []Target{{ID: "first", Conn: writer, Addr: firstAddr}, {ID: "second", Conn: writer, Addr: secondAddr}})
+	result := readResult(t, errorsCh)
+	if result.ID != "second" || !errors.Is(result.Err, writeErr) {
+		t.Fatalf("result = %#v, want second retry error", result)
 	}
 }
 

@@ -63,6 +63,9 @@ func TestLoadErrorsAndClientDefaults(t *testing.T) {
 	if role != RoleClient || cfg.Client.WriteTimeout != 10 {
 		t.Fatalf("client role/defaults = %q/%v", role, cfg.Client.WriteTimeout)
 	}
+	if !cfg.Client.UDPBatch.IsEnabled() || cfg.Client.UDPBatch.ReadSize != DefaultUDPBatchReadSize || cfg.Client.UDPBatch.WriteSize != DefaultUDPBatchWriteSize {
+		t.Fatalf("client udp batch defaults = %#v", cfg.Client.UDPBatch)
+	}
 }
 
 func TestMissingFieldHelpers(t *testing.T) {
@@ -148,6 +151,43 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	}
 	if cfg.Server.ClientTimeout != 30 {
 		t.Fatalf("ClientTimeout = %v, want 30", cfg.Server.ClientTimeout)
+	}
+	if !cfg.Server.UDPBatch.IsEnabled() || cfg.Server.UDPBatch.ReadSize != DefaultUDPBatchReadSize || cfg.Server.UDPBatch.WriteSize != DefaultUDPBatchWriteSize {
+		t.Fatalf("server udp batch defaults = %#v", cfg.Server.UDPBatch)
+	}
+}
+
+func TestLoadUDPBatchOverrides(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "engarde.yml")
+	content := []byte("client:\n  listenAddr: \"127.0.0.1:1\"\n  dstAddr: \"127.0.0.1:2\"\n  udpBatch:\n    enabled: false\n    readSize: 7\n    writeSize: 9\n")
+	if err := os.WriteFile(configPath, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, role, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if role != RoleClient {
+		t.Fatalf("role = %q, want %q", role, RoleClient)
+	}
+	if cfg.Client.UDPBatch.IsEnabled() {
+		t.Fatal("udp batch enabled after explicit false")
+	}
+	if cfg.Client.UDPBatch.EffectiveReadSize() != 7 || cfg.Client.UDPBatch.EffectiveWriteSize() != 9 {
+		t.Fatalf("udp batch sizes = %#v", cfg.Client.UDPBatch)
+	}
+}
+
+func TestUDPBatchDefaultHelpersNormalizeSizes(t *testing.T) {
+	batch := UDPBatch{ReadSize: -1, WriteSize: 0}
+	batch.ApplyDefaults()
+	if !batch.IsEnabled() {
+		t.Fatal("zero-value udp batch should default to enabled")
+	}
+	if batch.ReadSize != DefaultUDPBatchReadSize || batch.WriteSize != DefaultUDPBatchWriteSize {
+		t.Fatalf("normalized udp batch = %#v", batch)
 	}
 }
 

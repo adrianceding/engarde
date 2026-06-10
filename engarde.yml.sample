@@ -10,6 +10,12 @@ client:
   dstAddr: "1.2.3.4:59501"
   # Socket write timeout in milliseconds. Use a plain integer; negative disables the timeout.
   writeTimeout: 10
+  # UDP batch I/O is enabled by default when this block is omitted. Set enabled
+  # to false to force single-packet I/O, or tune readSize/writeSize for testing.
+  udpBatch:
+    enabled: true
+    readSize: 32
+    writeSize: 32
   excludedInterfaces:
     - "Local Area Connection 2"
     - "VirtualBox Host-Only Network"
@@ -35,6 +41,11 @@ client:
 #   clientTimeout: 30
 #   # Socket write timeout in milliseconds. Use a plain integer; negative disables the timeout.
 #   writeTimeout: 10
+#   # UDP batch I/O is enabled by default when this block is omitted.
+#   udpBatch:
+#     enabled: true
+#     readSize: 32
+#     writeSize: 32
 #   webManager:
 #     listenAddr: "0.0.0.0:9001"
 #     username: "engarde"

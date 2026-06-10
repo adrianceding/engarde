@@ -20,7 +20,11 @@ import (
 var runControl = control.Run
 var resolveUDPAddr = net.ResolveUDPAddr
 var listenUDP = func(network string, laddr *net.UDPAddr) (udpSocket, error) {
-	return net.ListenUDP(network, laddr)
+	conn, err := net.ListenUDP(network, laddr)
+	if err != nil {
+		return nil, err
+	}
+	return udp.Wrap(conn), nil
 }
 var newRefreshTicker = defaultRefreshTicker
 
@@ -75,10 +79,14 @@ func New(cfg config.Client, version string, webFS fs.FS) *Client {
 		listInterfaces:   net.Interfaces,
 		interfaceAddress: pathmgr.AddressByInterface,
 		openUDPOnInterface: func(addr *net.UDPAddr, ifName string) (udpSocket, error) {
-			return udp.OpenUDPOnInterface(addr, ifName)
+			conn, err := udp.OpenUDPOnInterface(addr, ifName)
+			if err != nil {
+				return nil, err
+			}
+			return udp.Wrap(conn), nil
 		},
 	}
-	client.dispatcher = relay.NewDispatcher(cfg.WriteTimeout, relay.DefaultQueueSize, func(result relay.Result) {
+	client.dispatcher = relay.NewDispatcherWithBatch(cfg.WriteTimeout, relay.DefaultQueueSize, cfg.UDPBatch.IsEnabled(), cfg.UDPBatch.EffectiveWriteSize(), func(result relay.Result) {
 		log.WithError(result.Err).Warn("Error writing to '" + result.ID + "', re-creating socket")
 		client.removeRoute(result.ID)
 	})
@@ -268,41 +276,72 @@ func (client *Client) createSendRoute(ifName, sourceAddr string) {
 }
 
 func (client *Client) writeBack(route *sendRoute) {
-	buffer := make([]byte, 1500)
+	readBatch := udp.NewReadBatch(client.cfg.UDPBatch.EffectiveReadSize())
+	writeBatch := make([]udp.Packet, 0, client.cfg.UDPBatch.EffectiveWriteSize())
 	for {
-		n, _, err := route.socket.ReadFromUDP(buffer)
+		n, err := udp.ReadBatch(route.socket, readBatch, client.cfg.UDPBatch.IsEnabled())
 		if route.closing.Load() || errors.Is(err, net.ErrClosed) {
 			return
+		}
+		if err != nil && n == 0 {
+			log.WithError(err).Warn("Error reading from '" + route.ifName + "', re-creating socket")
+			client.removeRoute(route.ifName)
+			return
+		}
+
+		writeBatch = writeBatch[:0]
+		if n > 0 {
+			route.lastRec.Store(time.Now().Unix())
+		}
+		wgAddr := client.getWireGuardAddr()
+		if wgAddr != nil {
+			for i := 0; i < n; i++ {
+				writeBatch = append(writeBatch, udp.Packet{Payload: readBatch[i].Payload, Addr: wgAddr})
+			}
+		}
+		if _, err := udp.WriteBatchChunks(client.wgSocket, writeBatch, client.cfg.UDPBatch.IsEnabled(), client.cfg.UDPBatch.EffectiveWriteSize()); err != nil {
+			log.WithError(err).Warn("Error writing to WireGuard")
 		}
 		if err != nil {
 			log.WithError(err).Warn("Error reading from '" + route.ifName + "', re-creating socket")
 			client.removeRoute(route.ifName)
 			return
 		}
-		route.lastRec.Store(time.Now().Unix())
-		wgAddr := client.getWireGuardAddr()
-		if wgAddr == nil {
-			continue
-		}
-		if _, err := client.wgSocket.WriteToUDP(buffer[:n], wgAddr); err != nil {
-			log.WithError(err).Warn("Error writing to WireGuard")
-		}
 	}
 }
 
 func (client *Client) receiveFromWireGuard(ctx context.Context) error {
-	buffer := make([]byte, 1500)
+	readBatch := udp.NewReadBatch(client.cfg.UDPBatch.EffectiveReadSize())
+	payloads := make([][]byte, 0, client.cfg.UDPBatch.EffectiveReadSize())
 	for {
-		n, srcAddr, err := client.wgSocket.ReadFromUDP(buffer)
-		if err != nil {
+		n, err := udp.ReadBatch(client.wgSocket, readBatch, client.cfg.UDPBatch.IsEnabled())
+		if err != nil && n == 0 {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			log.WithError(err).Warn("Error reading from WireGuard")
 			continue
 		}
-		client.setWireGuardAddr(srcAddr)
-		client.dispatcher.Fanout(buffer[:n], client.routeTargets())
+		payloads = payloads[:0]
+		var wgAddr *net.UDPAddr
+		for i := 0; i < n; i++ {
+			if readBatch[i].Addr != nil {
+				wgAddr = readBatch[i].Addr
+			}
+			payloads = append(payloads, readBatch[i].Payload)
+		}
+		if wgAddr != nil {
+			client.setWireGuardAddr(wgAddr)
+		}
+		if len(payloads) > 0 {
+			client.dispatcher.FanoutBatch(payloads, client.routeTargets())
+		}
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			log.WithError(err).Warn("Error reading from WireGuard")
+		}
 	}
 }
 

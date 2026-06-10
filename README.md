@@ -83,6 +83,10 @@ client:
   listenAddr: "127.0.0.1:59401"
   dstAddr: "1.2.3.4:59501"
   writeTimeout: 10
+  udpBatch:
+    enabled: true
+    readSize: 32
+    writeSize: 32
 ```
 
 Server mode requires `server.listenAddr` and `server.dstAddr`:
@@ -93,6 +97,10 @@ server:
   dstAddr: "127.0.0.1:59301"
   clientTimeout: 30
   writeTimeout: 10
+  udpBatch:
+    enabled: true
+    readSize: 32
+    writeSize: 32
 ```
 
 Role selection rules:
@@ -104,6 +112,7 @@ Role selection rules:
 Important fields:
 
 - `writeTimeout`: socket write timeout in milliseconds. Use a plain integer; negative values disable the write deadline.
+- `udpBatch`: optional UDP batch I/O settings. It is enabled by default when omitted; set `enabled: false` to force single-packet I/O, or tune `readSize` and `writeSize` for local performance testing.
 - `excludedInterfaces`: client-side interfaces that must not be used for relay traffic.
 - `interfaceLabels`: human-friendly labels shown in the web UI.
 - `dstOverrides`: client-side per-interface remote relay address overrides.
