@@ -12,6 +12,8 @@ import (
 	"github.com/adrianceding/engarde/internal/config"
 	"github.com/adrianceding/engarde/internal/control"
 	"github.com/adrianceding/engarde/internal/relay"
+	"github.com/adrianceding/engarde/internal/transport"
+	"github.com/adrianceding/engarde/internal/udp"
 )
 
 func resetServerHooks(t *testing.T) {
@@ -37,6 +39,7 @@ type fakeUDPSocket struct {
 	closed          chan struct{}
 	writeErr        error
 	writeBufferSize int
+	writtenPayloads [][]byte
 }
 
 func newFakeUDPSocket() *fakeUDPSocket {
@@ -66,6 +69,7 @@ func (socket *fakeUDPSocket) WriteToUDP(payload []byte, addr *net.UDPAddr) (int,
 	if socket.writeErr != nil {
 		return 0, socket.writeErr
 	}
+	socket.writtenPayloads = append(socket.writtenPayloads, append([]byte(nil), payload...))
 	return len(payload), nil
 }
 
@@ -76,6 +80,10 @@ func (socket *fakeUDPSocket) Close() error {
 		close(socket.closed)
 	}
 	return nil
+}
+
+func (socket *fakeUDPSocket) writtenCount() int {
+	return len(socket.writtenPayloads)
 }
 
 func TestStatusIncludesLearnedClient(t *testing.T) {
@@ -149,9 +157,26 @@ func TestRemoveClient(t *testing.T) {
 	server.wgSocket = newFakeUDPSocket()
 	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 40), Port: 5004}
 	server.clients[addr.String()] = &connectedClient{addr: addr}
+	server.pathStats[addr.String()] = &transport.PathStats{ID: addr.String()}
 	server.removeClient(addr.String())
 	if _, ok := server.clients[addr.String()]; ok {
 		t.Fatal("client was not removed")
+	}
+	if _, ok := server.pathStats[addr.String()]; ok {
+		t.Fatal("pathStats entry was not removed")
+	}
+}
+
+func TestRetryDoesNotRecreateRemovedClientPathStats(t *testing.T) {
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10}}, "", nil)
+	id := server.tracker.NextID()
+	clientID := "192.0.2.40:5004"
+	server.tracker.Track(transport.PendingRecord{ID: id, PathID: clientID, SentAt: 0, TimeoutMillis: 10, Payload: []byte("payload")})
+
+	server.retryAdaptiveData(20)
+
+	if _, ok := server.pathStats[clientID]; ok {
+		t.Fatal("removed client pathStats was recreated by retry failure accounting")
 	}
 }
 
@@ -424,6 +449,97 @@ func TestReceiveFromWireGuardReadErrorThenStop(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("receiveFromWireGuard did not stop")
+	}
+}
+
+func TestReceiveFromClientAdaptiveDataAckAndDuplicateSuppression(t *testing.T) {
+	clientSocket := newFakeUDPSocket()
+	wgSocket := newFakeUDPSocket()
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive}}, "", nil)
+	server.clientSocket = clientSocket
+	server.wgSocket = wgSocket
+	server.wgAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8000}
+	clientAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 60), Port: 5060}
+	framePayload, err := transport.Encode(transport.Frame{Type: transport.FrameData, ID: transport.PacketID{Session: 2, Sequence: 1}, SentAt: transport.NowMillis(), Payload: []byte("inner")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSocket.readItems <- fakeUDPRead{payload: framePayload, addr: clientAddr}
+	clientSocket.readItems <- fakeUDPRead{payload: framePayload, addr: clientAddr}
+	done := make(chan error, 1)
+	go func() { done <- server.receiveFromClient(context.Background()) }()
+	time.Sleep(20 * time.Millisecond)
+	clientSocket.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("receiveFromClient returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("receiveFromClient did not stop")
+	}
+
+	if wgSocket.writtenCount() != 1 || string(wgSocket.writtenPayloads[0]) != "inner" {
+		t.Fatalf("WireGuard writes = %#v", wgSocket.writtenPayloads)
+	}
+	if clientSocket.writtenCount() < 2 {
+		t.Fatalf("ACK writes = %d, want at least 2", clientSocket.writtenCount())
+	}
+}
+
+func TestServerAdaptiveKeepaliveTracksPending(t *testing.T) {
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive}, ClientTimeout: 30}, "", nil)
+	clientSocket := newFakeUDPSocket()
+	server.clientSocket = clientSocket
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 61), Port: 5061}
+	client := &connectedClient{addr: addr}
+	client.last.Store(time.Now().Unix())
+	server.clients[addr.String()] = client
+	server.sendKeepaliveToClients(100)
+	time.Sleep(20 * time.Millisecond)
+	if clientSocket.writtenCount() != 1 {
+		t.Fatalf("keepalive writes = %d, want 1", clientSocket.writtenCount())
+	}
+	due := server.tracker.Due(200, 50, 1000, 1)
+	if len(due) != 1 || due[0].PathID != addr.String() {
+		t.Fatalf("due keepalive = %#v", due)
+	}
+}
+
+func TestReceiveFromClientAdaptiveInvalidFrameFallbackDependsOnConfirmation(t *testing.T) {
+	invalidFrame := make([]byte, transport.HeaderSize)
+	copy(invalidFrame, []byte{0x45, 0x47, 0x41, 0x44})
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 62), Port: 5062}
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}}, "", nil)
+	server.wgAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8000}
+	writeBatch := make([]udp.Packet, 0, 1)
+	now := transport.NowMillis()
+	server.handleAdaptiveFromClient(udp.Packet{Payload: invalidFrame}, addr, time.Now().Unix(), now, &writeBatch)
+	if len(writeBatch) != 1 {
+		t.Fatalf("unconfirmed invalid frame writes = %d, want 1", len(writeBatch))
+	}
+
+	writeBatch = writeBatch[:0]
+	server.markPathSuccess(addr.String(), now, 10)
+	server.handleAdaptiveFromClient(udp.Packet{Payload: invalidFrame}, addr, time.Now().Unix(), now, &writeBatch)
+	if len(writeBatch) != 0 {
+		t.Fatalf("confirmed invalid frame writes = %d, want 0", len(writeBatch))
+	}
+}
+
+func TestReceiveFromClientAdaptiveAllowsOversizedRawOnConfirmedPath(t *testing.T) {
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 63), Port: 5063}
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}}, "", nil)
+	server.wgAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8000}
+	now := transport.NowMillis()
+	server.markPathSuccess(addr.String(), now, 10)
+	rawPayload := make([]byte, transport.MaxPayloadSize+1)
+	writeBatch := make([]udp.Packet, 0, 1)
+
+	server.handleAdaptiveFromClient(udp.Packet{Payload: rawPayload}, addr, time.Now().Unix(), now, &writeBatch)
+
+	if len(writeBatch) != 1 || len(writeBatch[0].Payload) != len(rawPayload) {
+		t.Fatalf("writeBatch = %#v, want oversized raw payload", writeBatch)
 	}
 }
 

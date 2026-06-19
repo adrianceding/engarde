@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/adrianceding/engarde/internal/control"
 	pathmgr "github.com/adrianceding/engarde/internal/path"
 	"github.com/adrianceding/engarde/internal/relay"
+	"github.com/adrianceding/engarde/internal/transport"
 	"github.com/adrianceding/engarde/internal/udp"
 	log "github.com/sirupsen/logrus"
 )
@@ -63,6 +65,11 @@ type Client struct {
 	routes   map[string]*sendRoute
 
 	dispatcher *relay.Dispatcher
+	tracker    *transport.Tracker
+
+	pathStatsMu   sync.Mutex
+	pathStats     map[string]*transport.PathStats
+	lastKeepalive atomic.Int64
 }
 
 type sendRoute struct {
@@ -102,6 +109,7 @@ func (route *sendRoute) isReceiveStale(now int64) bool {
 }
 
 func New(cfg config.Client, version string, webFS fs.FS) *Client {
+	cfg.Transfer.ApplyDefaults()
 	client := &Client{
 		cfg:              cfg,
 		version:          version,
@@ -117,6 +125,8 @@ func New(cfg config.Client, version string, webFS fs.FS) *Client {
 			}
 			return udp.Wrap(conn), nil
 		},
+		tracker:   transport.NewTracker(cfg.Transfer.PendingWindow, cfg.Transfer.DuplicateWindow),
+		pathStats: make(map[string]*transport.PathStats),
 	}
 	client.dispatcher = relay.NewDispatcherWithBatch(cfg.WriteTimeout, relay.DefaultQueueSize, cfg.UDPBatch.IsEnabled(), cfg.UDPBatch.EffectiveWriteSize(), func(result relay.Result) {
 		log.WithError(result.Err).Warn("Error writing to '" + result.ID + "', re-creating socket")
@@ -151,6 +161,9 @@ func (client *Client) Run(ctx context.Context) error {
 		}()
 	}
 	go client.updateAvailableInterfaces(ctx)
+	if client.adaptiveEnabled() {
+		go client.updateAdaptiveTransport(ctx)
+	}
 	return client.receiveFromWireGuard(ctx)
 }
 
@@ -336,6 +349,15 @@ func (client *Client) writeBack(route *sendRoute) {
 		if n > 0 {
 			route.markReceived(time.Now().Unix())
 		}
+		if client.adaptiveEnabled() {
+			client.writeBackAdaptive(route, readBatch[:n], writeBatch)
+			if err != nil {
+				log.WithError(err).Warn("Error reading from '" + route.ifName + "', re-creating socket")
+				client.removeRoute(route.ifName)
+				return
+			}
+			continue
+		}
 		wgAddr := client.getWireGuardAddr()
 		if wgAddr != nil {
 			for i := 0; i < n; i++ {
@@ -377,7 +399,11 @@ func (client *Client) receiveFromWireGuard(ctx context.Context) error {
 			client.setWireGuardAddr(wgAddr)
 		}
 		if len(payloads) > 0 {
-			client.dispatcher.FanoutBatch(payloads, client.routeTargets())
+			if client.adaptiveEnabled() {
+				client.sendAdaptiveDataBatch(payloads)
+			} else {
+				client.dispatcher.FanoutBatch(payloads, client.routeTargets())
+			}
 		}
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
@@ -400,16 +426,283 @@ func (client *Client) getWireGuardAddr() *net.UDPAddr {
 	return client.wgAddr
 }
 
-func (client *Client) routeTargets() []relay.Target {
+func (client *Client) adaptiveEnabled() bool {
+	return client.cfg.Transfer.IsAdaptive() && client.tracker != nil
+}
+
+func (client *Client) updateAdaptiveTransport(ctx context.Context) {
+	interval := time.Duration(client.minAckTimeoutMillis()/2) * time.Millisecond
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			client.maintainAdaptiveTransport()
+		}
+	}
+}
+
+func (client *Client) maintainAdaptiveTransport() {
+	if !client.adaptiveEnabled() {
+		return
+	}
+	now := transport.NowMillis()
+	client.retryAdaptiveData(now)
+	lastKeepalive := client.lastKeepalive.Load()
+	if now-lastKeepalive >= client.cfg.Transfer.KeepaliveIntervalMillis && client.lastKeepalive.CompareAndSwap(lastKeepalive, now) {
+		client.sendKeepaliveToRoutes(now)
+	}
+}
+
+func (client *Client) sendAdaptiveDataBatch(payloads [][]byte) {
+	for _, payload := range payloads {
+		client.sendAdaptiveData(payload)
+	}
+}
+
+func (client *Client) sendAdaptiveData(payload []byte) {
+	if len(payload) > transport.MaxPayloadSize {
+		now := transport.NowMillis()
+		client.sendKeepaliveToRoutes(now)
+		client.dispatcher.Fanout(payload, client.routeTargets())
+		return
+	}
+	now := transport.NowMillis()
+	targets := client.adaptiveRouteTargets(now, true)
+	if len(targets) == 0 {
+		client.sendKeepaliveToRoutes(now)
+		client.dispatcher.Fanout(payload, client.routeTargets())
+		return
+	}
+	id := client.tracker.NextID()
+	framePayload, err := transport.Encode(transport.Frame{Type: transport.FrameData, ID: id, SentAt: now, Payload: payload})
+	if err != nil {
+		return
+	}
+	client.tracker.Track(transport.PendingRecord{ID: id, PathID: targets[0].ID, SentAt: now, TimeoutMillis: client.pathRTO(targets[0].ID), Payload: framePayload})
+	client.markRouteSent(targets[0].ID)
+	client.dispatcher.Send(framePayload, targets[0])
+}
+
+func (client *Client) retryAdaptiveData(now int64) {
+	due := client.tracker.Due(now, client.minAckTimeoutMillis(), client.maxAckTimeoutMillis(), client.cfg.Transfer.MaxRetriesValue())
+	if len(due) == 0 {
+		return
+	}
+	targets := client.adaptiveRouteTargets(now, true)
+	if len(targets) == 0 {
+		targets = client.adaptiveRouteTargets(now, false)
+	}
+	for _, record := range due {
+		for _, pathID := range record.PathIDs {
+			client.markPathFailure(pathID, now)
+		}
+		pathIDs := make([]string, 0, len(targets))
+		for _, target := range targets {
+			pathIDs = append(pathIDs, target.ID)
+			client.markRouteSent(target.ID)
+			client.dispatcher.Send(record.Payload, target)
+		}
+		client.tracker.UpdatePaths(record.ID, pathIDs)
+	}
+}
+
+func (client *Client) sendKeepaliveToRoutes(now int64) {
+	for _, target := range client.adaptiveRouteTargets(now, false) {
+		id := client.tracker.NextID()
+		payload, err := transport.Encode(transport.Frame{Type: transport.FrameKeepalive, ID: id, SentAt: now})
+		if err != nil {
+			continue
+		}
+		client.tracker.Track(transport.PendingRecord{ID: id, PathID: target.ID, SentAt: now, TimeoutMillis: client.pathRTO(target.ID), Payload: payload})
+		client.dispatcher.Send(payload, target)
+	}
+}
+
+func (client *Client) writeBackAdaptive(route *sendRoute, packets []udp.Packet, writeBatch []udp.Packet) {
+	writeBatch = writeBatch[:0]
+	now := transport.NowMillis()
+	for i := range packets {
+		packet := packets[i]
+		frame, err := transport.Decode(packet.Payload)
+		if err != nil {
+			if errors.Is(err, transport.ErrNotFrame) || len(packet.Payload) > transport.MaxPayloadSize || !client.pathConfirmed(route.ifName, now) {
+				if wgAddr := client.getWireGuardAddr(); wgAddr != nil {
+					writeBatch = append(writeBatch, udp.Packet{Payload: packet.Payload, Addr: wgAddr})
+				}
+			}
+			continue
+		}
+		client.markPathSeen(route.ifName, now)
+		switch frame.Type {
+		case transport.FrameProbe, transport.FrameKeepalive:
+			ackType := transport.FrameProbeAck
+			if frame.Type == transport.FrameKeepalive {
+				ackType = transport.FrameKeepaliveAck
+			}
+			client.sendControlFrame(route, ackType, frame.ID, frame.SentAt)
+		case transport.FrameProbeAck, transport.FrameKeepaliveAck:
+			client.markPathSuccess(route.ifName, now, now-frame.SentAt)
+		case transport.FrameAck:
+			if record, ok := client.tracker.Complete(frame.ID); ok {
+				client.markPathSuccess(route.ifName, now, now-record.SentAt)
+			}
+		case transport.FrameData:
+			client.sendControlFrame(route, transport.FrameAck, frame.ID, frame.SentAt)
+			if client.tracker.SeenOrRecord(frame.ID) {
+				continue
+			}
+			if wgAddr := client.getWireGuardAddr(); wgAddr != nil {
+				writeBatch = append(writeBatch, udp.Packet{Payload: frame.Payload, Addr: wgAddr})
+			}
+		}
+	}
+	if _, err := udp.WriteBatchChunks(client.wgSocket, writeBatch, client.cfg.UDPBatch.IsEnabled(), client.cfg.UDPBatch.EffectiveWriteSize()); err != nil {
+		log.WithError(err).Warn("Error writing to WireGuard")
+	}
+}
+
+func (client *Client) sendControlFrame(route *sendRoute, frameType transport.FrameType, id transport.PacketID, sentAt int64) {
+	payload, err := transport.Encode(transport.Frame{Type: frameType, ID: id, SentAt: sentAt})
+	if err != nil {
+		return
+	}
+	client.dispatcher.Send(payload, relay.Target{ID: route.ifName, Conn: route.socket, Addr: route.dstAddr})
+}
+
+func (client *Client) adaptiveRouteTargets(now int64, eligibleOnly bool) []relay.Target {
+	targets := client.routeTargetsSorted(false)
+	if len(targets) == 0 || !eligibleOnly {
+		return targets
+	}
+	timeout := time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis) * time.Millisecond
+	client.pathStatsMu.Lock()
+	defer client.pathStatsMu.Unlock()
+	eligible := targets[:0]
+	for _, target := range targets {
+		stats := client.pathStats[target.ID]
+		if stats != nil && stats.Eligible(now, timeout) {
+			eligible = append(eligible, target)
+		}
+	}
+	sort.SliceStable(eligible, func(i, j int) bool {
+		left := client.pathStats[eligible[i].ID]
+		right := client.pathStats[eligible[j].ID]
+		if left == nil || right == nil {
+			return eligible[i].ID < eligible[j].ID
+		}
+		if left.Failures != right.Failures {
+			return left.Failures < right.Failures
+		}
+		if left.SmoothedRTT != right.SmoothedRTT {
+			return left.SmoothedRTT < right.SmoothedRTT
+		}
+		return eligible[i].ID < eligible[j].ID
+	})
+	return eligible
+}
+
+func (client *Client) routeTargetsSorted(markSent bool) []relay.Target {
 	client.routesMu.RLock()
 	defer client.routesMu.RUnlock()
-	now := time.Now().Unix()
 	targets := make([]relay.Target, 0, len(client.routes))
+	now := time.Now().Unix()
 	for ifName, route := range client.routes {
-		route.markSent(now)
+		if markSent {
+			route.markSent(now)
+		}
 		targets = append(targets, relay.Target{ID: ifName, Conn: route.socket, Addr: route.dstAddr})
 	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].ID < targets[j].ID })
 	return targets
+}
+
+func (client *Client) markRouteSent(ifName string) {
+	client.routesMu.RLock()
+	route := client.routes[ifName]
+	client.routesMu.RUnlock()
+	if route != nil {
+		route.markSent(time.Now().Unix())
+	}
+}
+
+func (client *Client) markPathSeen(ifName string, now int64) {
+	client.pathStatsMu.Lock()
+	defer client.pathStatsMu.Unlock()
+	stats := client.pathStats[ifName]
+	if stats == nil {
+		stats = &transport.PathStats{ID: ifName}
+		client.pathStats[ifName] = stats
+	}
+	stats.MarkSeen(now)
+}
+
+func (client *Client) markPathSuccess(ifName string, now int64, rtt int64) {
+	client.pathStatsMu.Lock()
+	defer client.pathStatsMu.Unlock()
+	stats := client.pathStats[ifName]
+	if stats == nil {
+		stats = &transport.PathStats{ID: ifName}
+		client.pathStats[ifName] = stats
+	}
+	stats.MarkSuccess(now, rtt)
+}
+
+func (client *Client) markPathFailure(ifName string, now int64) {
+	if !client.hasRoute(ifName) {
+		return
+	}
+	client.pathStatsMu.Lock()
+	defer client.pathStatsMu.Unlock()
+	stats := client.pathStats[ifName]
+	if stats == nil {
+		stats = &transport.PathStats{ID: ifName}
+		client.pathStats[ifName] = stats
+	}
+	stats.MarkFailure(now)
+}
+
+func (client *Client) pathConfirmed(ifName string, now int64) bool {
+	client.pathStatsMu.Lock()
+	defer client.pathStatsMu.Unlock()
+	stats := client.pathStats[ifName]
+	if stats == nil {
+		return false
+	}
+	return stats.Eligible(now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
+}
+
+func (client *Client) pathRTO(ifName string) int64 {
+	client.pathStatsMu.Lock()
+	defer client.pathStatsMu.Unlock()
+	stats := client.pathStats[ifName]
+	if stats == nil {
+		return client.minAckTimeoutMillis()
+	}
+	return stats.RTO(client.minAckTimeoutMillis(), client.maxAckTimeoutMillis())
+}
+
+func (client *Client) minAckTimeoutMillis() int64 {
+	if client.cfg.Transfer.AckTimeoutMillis > 0 {
+		return client.cfg.Transfer.AckTimeoutMillis
+	}
+	return 1
+}
+
+func (client *Client) maxAckTimeoutMillis() int64 {
+	if client.cfg.Transfer.KeepaliveTimeoutMillis > client.minAckTimeoutMillis() {
+		return client.cfg.Transfer.KeepaliveTimeoutMillis
+	}
+	return client.minAckTimeoutMillis()
+}
+
+func (client *Client) routeTargets() []relay.Target {
+	return client.routeTargetsSorted(true)
 }
 
 func (client *Client) routeSnapshot() map[string]*sendRoute {
@@ -438,10 +731,17 @@ func (client *Client) removeRoute(ifName string) {
 	client.routesMu.Unlock()
 	if ok {
 		client.dispatcher.Remove(ifName)
+		client.removePathStats(ifName)
 		route.closing.Store(true)
 		route.socket.Close()
 		client.updateWireGuardWriteBuffer()
 	}
+}
+
+func (client *Client) removePathStats(ifName string) {
+	client.pathStatsMu.Lock()
+	delete(client.pathStats, ifName)
+	client.pathStatsMu.Unlock()
 }
 
 func (client *Client) closeAllRoutes() {

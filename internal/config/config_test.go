@@ -66,6 +66,12 @@ func TestLoadErrorsAndClientDefaults(t *testing.T) {
 	if !cfg.Client.UDPBatch.IsEnabled() || cfg.Client.UDPBatch.ReadSize != DefaultUDPBatchReadSize || cfg.Client.UDPBatch.WriteSize != DefaultUDPBatchWriteSize {
 		t.Fatalf("client udp batch defaults = %#v", cfg.Client.UDPBatch)
 	}
+	if cfg.Client.Transfer.Mode != TransferModeDirect || cfg.Client.Transfer.AckTimeoutMillis != DefaultTransferAckTimeoutMillis || cfg.Client.Transfer.PendingWindow != DefaultTransferPendingWindow {
+		t.Fatalf("client transfer defaults = %#v", cfg.Client.Transfer)
+	}
+	if cfg.Client.Transfer.MaxRetriesValue() != DefaultTransferMaxRetries {
+		t.Fatalf("client max retries default = %d", cfg.Client.Transfer.MaxRetriesValue())
+	}
 }
 
 func TestMissingFieldHelpers(t *testing.T) {
@@ -155,6 +161,9 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if !cfg.Server.UDPBatch.IsEnabled() || cfg.Server.UDPBatch.ReadSize != DefaultUDPBatchReadSize || cfg.Server.UDPBatch.WriteSize != DefaultUDPBatchWriteSize {
 		t.Fatalf("server udp batch defaults = %#v", cfg.Server.UDPBatch)
 	}
+	if cfg.Server.Transfer.Mode != TransferModeDirect || cfg.Server.Transfer.KeepaliveIntervalMillis != DefaultTransferKeepaliveIntervalMillis || cfg.Server.Transfer.DuplicateWindow != DefaultTransferDuplicateWindow {
+		t.Fatalf("server transfer defaults = %#v", cfg.Server.Transfer)
+	}
 }
 
 func TestLoadUDPBatchOverrides(t *testing.T) {
@@ -188,6 +197,57 @@ func TestUDPBatchDefaultHelpersNormalizeSizes(t *testing.T) {
 	}
 	if batch.ReadSize != DefaultUDPBatchReadSize || batch.WriteSize != DefaultUDPBatchWriteSize {
 		t.Fatalf("normalized udp batch = %#v", batch)
+	}
+}
+
+func TestLoadTransferAdaptiveOverrides(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "engarde.yml")
+	content := []byte("client:\n  listenAddr: \"127.0.0.1:1\"\n  dstAddr: \"127.0.0.1:2\"\n  transfer:\n    mode: 2\n    ackTimeoutMillis: 25\n    keepaliveIntervalMillis: 500\n    keepaliveTimeoutMillis: 3000\n    pendingWindow: 128\n    duplicateWindow: 256\n    maxRetries: 3\n")
+	if err := os.WriteFile(configPath, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, role, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if role != RoleClient {
+		t.Fatalf("role = %q, want %q", role, RoleClient)
+	}
+	transfer := cfg.Client.Transfer
+	if !transfer.IsAdaptive() || transfer.Mode != TransferModeAdaptive || transfer.AckTimeoutMillis != 25 || transfer.KeepaliveIntervalMillis != 500 || transfer.KeepaliveTimeoutMillis != 3000 || transfer.PendingWindow != 128 || transfer.DuplicateWindow != 256 || transfer.MaxRetriesValue() != 3 {
+		t.Fatalf("transfer overrides = %#v", transfer)
+	}
+}
+
+func TestLoadTransferAllowsZeroMaxRetries(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "engarde.yml")
+	content := []byte("client:\n  listenAddr: \"127.0.0.1:1\"\n  dstAddr: \"127.0.0.1:2\"\n  transfer:\n    mode: adaptive\n    maxRetries: 0\n")
+	if err := os.WriteFile(configPath, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, _, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Client.Transfer.MaxRetriesValue() != 0 {
+		t.Fatalf("maxRetries = %d, want 0", cfg.Client.Transfer.MaxRetriesValue())
+	}
+}
+
+func TestLoadRejectsInvalidTransfer(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "engarde.yml")
+	content := []byte("server:\n  listenAddr: \"0.0.0.0:59501\"\n  dstAddr: \"127.0.0.1:59301\"\n  transfer:\n    mode: maybe\n")
+	if err := os.WriteFile(configPath, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "server.transfer.mode") {
+		t.Fatalf("Load invalid transfer error = %v", err)
 	}
 }
 

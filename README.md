@@ -113,6 +113,7 @@ Important fields:
 
 - `writeTimeout`: socket write timeout in milliseconds. Use a plain integer; negative values disable the write deadline.
 - `udpBatch`: optional UDP batch I/O settings. It is enabled by default when omitted; set `enabled: false` to force single-packet I/O, or tune `readSize` and `writeSize` for local performance testing.
+- `transfer`: optional transfer strategy. `mode: direct` keeps the original redundant UDP fanout. `mode: adaptive` uses lightweight DATA/ACK frames, keepalives, bounded pending/duplicate windows, and a per-path adaptive ACK timeout to send on the best path first, then fall back to all healthy paths. `ackTimeoutMillis` is the minimum/initial timeout. Adaptive DATA frames add a 36-byte header; set WireGuard MTU so inner UDP packets fit within the framed payload limit.
 - `excludedInterfaces`: client-side interfaces that must not be used for relay traffic.
 - `interfaceLabels`: human-friendly labels shown in the web UI.
 - `dstOverrides`: client-side per-interface remote relay address overrides.

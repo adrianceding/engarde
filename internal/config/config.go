@@ -26,6 +26,18 @@ const (
 	DefaultUDPBatchWriteSize = 32
 )
 
+const (
+	TransferModeDirect   = "direct"
+	TransferModeAdaptive = "adaptive"
+
+	DefaultTransferAckTimeoutMillis        int64 = 50
+	DefaultTransferKeepaliveIntervalMillis int64 = 1000
+	DefaultTransferKeepaliveTimeoutMillis  int64 = 5000
+	DefaultTransferPendingWindow                 = 4096
+	DefaultTransferDuplicateWindow               = 8192
+	DefaultTransferMaxRetries                    = 1
+)
+
 type UDPBatch struct {
 	Enabled   *bool `yaml:"enabled"`
 	ReadSize  int   `yaml:"readSize"`
@@ -69,6 +81,96 @@ type WebManager struct {
 	Password   string `yaml:"password"`
 }
 
+type Transfer struct {
+	Mode                    string `yaml:"mode"`
+	AckTimeoutMillis        int64  `yaml:"ackTimeoutMillis"`
+	KeepaliveIntervalMillis int64  `yaml:"keepaliveIntervalMillis"`
+	KeepaliveTimeoutMillis  int64  `yaml:"keepaliveTimeoutMillis"`
+	PendingWindow           int    `yaml:"pendingWindow"`
+	DuplicateWindow         int    `yaml:"duplicateWindow"`
+	MaxRetries              *int   `yaml:"maxRetries"`
+}
+
+func (transfer *Transfer) ApplyDefaults() {
+	transfer.Mode = normalizeTransferMode(transfer.Mode)
+	if transfer.Mode == "" {
+		transfer.Mode = TransferModeDirect
+	}
+	if transfer.AckTimeoutMillis == 0 {
+		transfer.AckTimeoutMillis = DefaultTransferAckTimeoutMillis
+	}
+	if transfer.KeepaliveIntervalMillis == 0 {
+		transfer.KeepaliveIntervalMillis = DefaultTransferKeepaliveIntervalMillis
+	}
+	if transfer.KeepaliveTimeoutMillis == 0 {
+		transfer.KeepaliveTimeoutMillis = DefaultTransferKeepaliveTimeoutMillis
+	}
+	if transfer.PendingWindow == 0 {
+		transfer.PendingWindow = DefaultTransferPendingWindow
+	}
+	if transfer.DuplicateWindow == 0 {
+		transfer.DuplicateWindow = DefaultTransferDuplicateWindow
+	}
+	if transfer.MaxRetries == nil {
+		maxRetries := DefaultTransferMaxRetries
+		transfer.MaxRetries = &maxRetries
+	}
+}
+
+func (transfer Transfer) Validate(prefix string) error {
+	if transfer.Mode != TransferModeDirect && transfer.Mode != TransferModeAdaptive {
+		return fmt.Errorf("invalid %s.transfer.mode %q", prefix, transfer.Mode)
+	}
+	if transfer.AckTimeoutMillis < 0 {
+		return fmt.Errorf("%s.transfer.ackTimeoutMillis must not be negative", prefix)
+	}
+	if transfer.KeepaliveIntervalMillis < 0 {
+		return fmt.Errorf("%s.transfer.keepaliveIntervalMillis must not be negative", prefix)
+	}
+	if transfer.KeepaliveTimeoutMillis < 0 {
+		return fmt.Errorf("%s.transfer.keepaliveTimeoutMillis must not be negative", prefix)
+	}
+	if transfer.PendingWindow < 0 {
+		return fmt.Errorf("%s.transfer.pendingWindow must not be negative", prefix)
+	}
+	if transfer.DuplicateWindow < 0 {
+		return fmt.Errorf("%s.transfer.duplicateWindow must not be negative", prefix)
+	}
+	if transfer.MaxRetries == nil {
+		return fmt.Errorf("%s.transfer.maxRetries must be set", prefix)
+	}
+	if *transfer.MaxRetries < 0 {
+		return fmt.Errorf("%s.transfer.maxRetries must not be negative", prefix)
+	}
+	return nil
+}
+
+func (transfer Transfer) IsAdaptive() bool {
+	return transfer.Mode == TransferModeAdaptive
+}
+
+func (transfer Transfer) MaxRetriesValue() int {
+	if transfer.MaxRetries == nil {
+		return DefaultTransferMaxRetries
+	}
+	return *transfer.MaxRetries
+}
+
+func (transfer Transfer) present() bool {
+	return transfer.Mode != "" || transfer.AckTimeoutMillis != 0 || transfer.KeepaliveIntervalMillis != 0 || transfer.KeepaliveTimeoutMillis != 0 || transfer.PendingWindow != 0 || transfer.DuplicateWindow != 0 || transfer.MaxRetries != nil
+}
+
+func normalizeTransferMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", TransferModeDirect, "1", "mode1", "redundant":
+		return TransferModeDirect
+	case TransferModeAdaptive, "2", "mode2":
+		return TransferModeAdaptive
+	default:
+		return mode
+	}
+}
+
 type Client struct {
 	Description        string            `yaml:"description"`
 	ListenAddr         string            `yaml:"listenAddr"`
@@ -78,6 +180,7 @@ type Client struct {
 	InterfaceLabels    map[string]string `yaml:"interfaceLabels"`
 	DstOverrides       []DstOverride     `yaml:"dstOverrides"`
 	UDPBatch           UDPBatch          `yaml:"udpBatch"`
+	Transfer           Transfer          `yaml:"transfer"`
 	WebManager         WebManager        `yaml:"webManager"`
 }
 
@@ -93,6 +196,7 @@ type Server struct {
 	WriteTimeout  int64      `yaml:"writeTimeout"`
 	ClientTimeout int64      `yaml:"clientTimeout"`
 	UDPBatch      UDPBatch   `yaml:"udpBatch"`
+	Transfer      Transfer   `yaml:"transfer"`
 	WebManager    WebManager `yaml:"webManager"`
 }
 
@@ -112,6 +216,9 @@ func Load(filename string) (*Config, Role, error) {
 		return nil, "", err
 	}
 	cfg.ApplyDefaults(role)
+	if err := cfg.Validate(role); err != nil {
+		return nil, "", err
+	}
 	return &cfg, role, nil
 }
 
@@ -148,6 +255,7 @@ func (cfg *Config) ApplyDefaults(role Role) {
 			cfg.Client.WriteTimeout = 10
 		}
 		cfg.Client.UDPBatch.ApplyDefaults()
+		cfg.Client.Transfer.ApplyDefaults()
 	case RoleServer:
 		if cfg.Server.WriteTimeout == 0 {
 			cfg.Server.WriteTimeout = 10
@@ -156,15 +264,26 @@ func (cfg *Config) ApplyDefaults(role Role) {
 			cfg.Server.ClientTimeout = 30
 		}
 		cfg.Server.UDPBatch.ApplyDefaults()
+		cfg.Server.Transfer.ApplyDefaults()
 	}
 }
 
+func (cfg Config) Validate(role Role) error {
+	switch role {
+	case RoleClient:
+		return cfg.Client.Transfer.Validate("client")
+	case RoleServer:
+		return cfg.Server.Transfer.Validate("server")
+	}
+	return nil
+}
+
 func (cfg Config) clientPresent() bool {
-	return cfg.Client.Description != "" || cfg.Client.ListenAddr != "" || cfg.Client.DstAddr != "" || cfg.Client.WriteTimeout != 0 || len(cfg.Client.ExcludedInterfaces) > 0 || len(cfg.Client.InterfaceLabels) > 0 || len(cfg.Client.DstOverrides) > 0 || cfg.Client.UDPBatch.present() || webPresent(cfg.Client.WebManager)
+	return cfg.Client.Description != "" || cfg.Client.ListenAddr != "" || cfg.Client.DstAddr != "" || cfg.Client.WriteTimeout != 0 || len(cfg.Client.ExcludedInterfaces) > 0 || len(cfg.Client.InterfaceLabels) > 0 || len(cfg.Client.DstOverrides) > 0 || cfg.Client.UDPBatch.present() || cfg.Client.Transfer.present() || webPresent(cfg.Client.WebManager)
 }
 
 func (cfg Config) serverPresent() bool {
-	return cfg.Server.Description != "" || cfg.Server.ListenAddr != "" || cfg.Server.DstAddr != "" || cfg.Server.WriteTimeout != 0 || cfg.Server.ClientTimeout != 0 || cfg.Server.UDPBatch.present() || webPresent(cfg.Server.WebManager)
+	return cfg.Server.Description != "" || cfg.Server.ListenAddr != "" || cfg.Server.DstAddr != "" || cfg.Server.WriteTimeout != 0 || cfg.Server.ClientTimeout != 0 || cfg.Server.UDPBatch.present() || cfg.Server.Transfer.present() || webPresent(cfg.Server.WebManager)
 }
 
 func webPresent(web WebManager) bool {

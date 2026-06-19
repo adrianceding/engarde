@@ -12,6 +12,8 @@ import (
 	"github.com/adrianceding/engarde/internal/config"
 	"github.com/adrianceding/engarde/internal/control"
 	"github.com/adrianceding/engarde/internal/relay"
+	"github.com/adrianceding/engarde/internal/transport"
+	"github.com/adrianceding/engarde/internal/udp"
 )
 
 func resetClientHooks(t *testing.T) {
@@ -39,6 +41,7 @@ type fakeUDPSocket struct {
 	closed          chan struct{}
 	writeErr        error
 	writeBufferSize int
+	writtenPayloads [][]byte
 }
 
 func newFakeUDPSocket() *fakeUDPSocket {
@@ -68,6 +71,7 @@ func (socket *fakeUDPSocket) WriteToUDP(payload []byte, addr *net.UDPAddr) (int,
 	if socket.writeErr != nil {
 		return 0, socket.writeErr
 	}
+	socket.writtenPayloads = append(socket.writtenPayloads, append([]byte(nil), payload...))
 	return len(payload), nil
 }
 
@@ -78,6 +82,10 @@ func (socket *fakeUDPSocket) Close() error {
 		close(socket.closed)
 	}
 	return nil
+}
+
+func (socket *fakeUDPSocket) writtenCount() int {
+	return len(socket.writtenPayloads)
 }
 
 func TestClientActionsPreserveLegacyStatuses(t *testing.T) {
@@ -157,6 +165,30 @@ func TestUpdateWireGuardWriteBufferTracksRoutes(t *testing.T) {
 	client.removeRoute("second")
 	if wgSocket.writeBufferSize != relay.DefaultWriteBufferBytes {
 		t.Fatalf("one-route write buffer = %d, want %d", wgSocket.writeBufferSize, relay.DefaultWriteBufferBytes)
+	}
+}
+
+func TestRemoveRouteClearsPathStats(t *testing.T) {
+	client := New(config.Client{}, "", nil)
+	client.wgSocket = newFakeUDPSocket()
+	socket := newFakeUDPSocket()
+	client.routes["eth0"] = &sendRoute{ifName: "eth0", socket: socket}
+	client.pathStats["eth0"] = &transport.PathStats{ID: "eth0"}
+	client.removeRoute("eth0")
+	if _, ok := client.pathStats["eth0"]; ok {
+		t.Fatal("pathStats entry was not removed")
+	}
+}
+
+func TestRetryDoesNotRecreateRemovedRoutePathStats(t *testing.T) {
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10}}, "", nil)
+	id := client.tracker.NextID()
+	client.tracker.Track(transport.PendingRecord{ID: id, PathID: "eth0", SentAt: 0, TimeoutMillis: 10, Payload: []byte("payload")})
+
+	client.retryAdaptiveData(20)
+
+	if _, ok := client.pathStats["eth0"]; ok {
+		t.Fatal("removed route pathStats was recreated by retry failure accounting")
 	}
 }
 
@@ -674,6 +706,110 @@ func TestWriteBackReadErrorRemovesRoute(t *testing.T) {
 	client.writeBack(client.routes["lo"])
 	if client.hasRoute("lo") {
 		t.Fatal("route was not removed after read error")
+	}
+}
+
+func TestWriteBackAdaptiveDataAckAndDuplicateSuppression(t *testing.T) {
+	wgSocket := newFakeUDPSocket()
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive}}, "", nil)
+	client.wgSocket = wgSocket
+	client.setWireGuardAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9000})
+	routeSocket := newFakeUDPSocket()
+	route := &sendRoute{ifName: "tun0", socket: routeSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
+	client.routes["tun0"] = route
+	framePayload, err := transport.Encode(transport.Frame{Type: transport.FrameData, ID: transport.PacketID{Session: 1, Sequence: 1}, SentAt: transport.NowMillis(), Payload: []byte("inner")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeSocket.readItems <- fakeUDPRead{payload: framePayload}
+	routeSocket.readItems <- fakeUDPRead{payload: framePayload}
+	go client.writeBack(route)
+	time.Sleep(20 * time.Millisecond)
+	route.closing.Store(true)
+	routeSocket.Close()
+
+	if wgSocket.writtenCount() != 1 || string(wgSocket.writtenPayloads[0]) != "inner" {
+		t.Fatalf("WireGuard writes = %#v", wgSocket.writtenPayloads)
+	}
+	if routeSocket.writtenCount() < 2 {
+		t.Fatalf("ACK writes = %d, want at least 2", routeSocket.writtenCount())
+	}
+}
+
+func TestWriteBackAdaptiveAckCompletesPendingWithoutWireGuardWrite(t *testing.T) {
+	wgSocket := newFakeUDPSocket()
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive}}, "", nil)
+	client.wgSocket = wgSocket
+	routeSocket := newFakeUDPSocket()
+	route := &sendRoute{ifName: "tun0", socket: routeSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
+	id := client.tracker.NextID()
+	client.tracker.Track(transport.PendingRecord{ID: id, PathID: "tun0", SentAt: transport.NowMillis(), Payload: []byte("tracked")})
+	ackPayload, err := transport.Encode(transport.Frame{Type: transport.FrameAck, ID: id, SentAt: transport.NowMillis()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeSocket.readItems <- fakeUDPRead{payload: ackPayload}
+	go client.writeBack(route)
+	time.Sleep(20 * time.Millisecond)
+	route.closing.Store(true)
+	routeSocket.Close()
+
+	if wgSocket.writtenCount() != 0 {
+		t.Fatalf("ACK was written to WireGuard: %#v", wgSocket.writtenPayloads)
+	}
+	if _, ok := client.tracker.Complete(id); ok {
+		t.Fatal("pending record was not completed by ACK")
+	}
+}
+
+func TestClientAdaptiveKeepaliveTracksPending(t *testing.T) {
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive}}, "", nil)
+	routeSocket := newFakeUDPSocket()
+	client.routes["tun0"] = &sendRoute{ifName: "tun0", socket: routeSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
+	client.sendKeepaliveToRoutes(100)
+	time.Sleep(20 * time.Millisecond)
+	if routeSocket.writtenCount() != 1 {
+		t.Fatalf("keepalive writes = %d, want 1", routeSocket.writtenCount())
+	}
+	due := client.tracker.Due(200, 50, 1000, 1)
+	if len(due) != 1 || due[0].PathID != "tun0" {
+		t.Fatalf("due keepalive = %#v", due)
+	}
+}
+
+func TestWriteBackAdaptiveInvalidFrameFallbackDependsOnConfirmation(t *testing.T) {
+	invalidFrame := make([]byte, transport.HeaderSize)
+	copy(invalidFrame, []byte{0x45, 0x47, 0x41, 0x44})
+	wgSocket := newFakeUDPSocket()
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}}, "", nil)
+	client.wgSocket = wgSocket
+	client.setWireGuardAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9000})
+	route := &sendRoute{ifName: "tun0"}
+	client.writeBackAdaptive(route, []udp.Packet{{Payload: invalidFrame}}, nil)
+	if wgSocket.writtenCount() != 1 {
+		t.Fatalf("unconfirmed invalid frame writes = %d, want 1", wgSocket.writtenCount())
+	}
+
+	client.markPathSuccess("tun0", transport.NowMillis(), 10)
+	client.writeBackAdaptive(route, []udp.Packet{{Payload: invalidFrame}}, nil)
+	if wgSocket.writtenCount() != 1 {
+		t.Fatalf("confirmed invalid frame writes = %d, want still 1", wgSocket.writtenCount())
+	}
+}
+
+func TestWriteBackAdaptiveAllowsOversizedRawOnConfirmedPath(t *testing.T) {
+	wgSocket := newFakeUDPSocket()
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}}, "", nil)
+	client.wgSocket = wgSocket
+	client.setWireGuardAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9000})
+	client.markPathSuccess("tun0", transport.NowMillis(), 10)
+	rawPayload := make([]byte, transport.MaxPayloadSize+1)
+	route := &sendRoute{ifName: "tun0"}
+
+	client.writeBackAdaptive(route, []udp.Packet{{Payload: rawPayload}}, nil)
+
+	if wgSocket.writtenCount() != 1 || len(wgSocket.writtenPayloads[0]) != len(rawPayload) {
+		t.Fatalf("WireGuard writes = %#v, want oversized raw payload", wgSocket.writtenPayloads)
 	}
 }
 

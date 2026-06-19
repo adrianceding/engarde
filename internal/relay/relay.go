@@ -51,10 +51,11 @@ type Dispatcher struct {
 	writeBatchSize     int
 	onError            func(Result)
 
-	mu      sync.Mutex
-	closed  bool
-	targets map[string]*targetState
-	workers map[UDPWriter]*connWorker
+	mu       sync.Mutex
+	closed   bool
+	targets  map[string]*targetState
+	oneShots map[string]*targetState
+	workers  map[UDPWriter]*connWorker
 }
 
 type targetState struct {
@@ -64,6 +65,7 @@ type targetState struct {
 	addrKey string
 	worker  *connWorker
 	active  atomic.Bool
+	pending int
 }
 
 type connWorker struct {
@@ -106,6 +108,7 @@ func NewDispatcherWithBatch(writeTimeoutMillis int64, queueSize int, writeBatchE
 		writeBatchSize:     writeBatchSize,
 		onError:            onError,
 		targets:            make(map[string]*targetState),
+		oneShots:           make(map[string]*targetState),
 		workers:            make(map[UDPWriter]*connWorker),
 	}
 }
@@ -113,6 +116,35 @@ func NewDispatcherWithBatch(writeTimeoutMillis int64, queueSize int, writeBatchE
 func (dispatcher *Dispatcher) Fanout(payload []byte, targets []Target) {
 	payloads := [1][]byte{payload}
 	dispatcher.FanoutBatch(payloads[:], targets)
+}
+
+func (dispatcher *Dispatcher) Send(payload []byte, target Target) {
+	payloads := [1][]byte{payload}
+	dispatcher.SendBatch(payloads[:], target)
+}
+
+func (dispatcher *Dispatcher) SendBatch(payloads [][]byte, target Target) {
+	if len(payloads) == 0 || target.Conn == nil || target.Addr == nil {
+		return
+	}
+	state := dispatcher.syncOneShotTarget(target, len(payloads))
+	if state == nil {
+		return
+	}
+	packets := make([]queuedPacket, 0, len(payloads))
+	for _, payload := range payloads {
+		packets = append(packets, queuedPacket{
+			state:   state,
+			id:      state.id,
+			conn:    state.conn,
+			addr:    state.addr,
+			addrKey: state.addrKey,
+			payload: append([]byte(nil), payload...),
+		})
+	}
+	if !state.worker.enqueue(queuedBatch{packets: packets}) {
+		dispatcher.completeOneShots(packets)
+	}
 }
 
 func (dispatcher *Dispatcher) FanoutBatch(payloads [][]byte, targets []Target) {
@@ -174,7 +206,17 @@ func (dispatcher *Dispatcher) Remove(id string) {
 	if ok {
 		delete(dispatcher.targets, id)
 		target.active.Store(false)
+	}
+	oneShotState := dispatcher.oneShots[id]
+	delete(dispatcher.oneShots, id)
+	if oneShotState != nil {
+		oneShotState.active.Store(false)
+	}
+	if ok {
 		dispatcher.stopWorkerIfUnusedLocked(target.worker)
+	}
+	if oneShotState != nil {
+		dispatcher.stopWorkerIfUnusedLocked(oneShotState.worker)
 	}
 	dispatcher.mu.Unlock()
 }
@@ -185,8 +227,12 @@ func (dispatcher *Dispatcher) Close() {
 	for _, target := range dispatcher.targets {
 		target.active.Store(false)
 	}
+	for _, state := range dispatcher.oneShots {
+		state.active.Store(false)
+	}
 	dispatcher.workers = make(map[UDPWriter]*connWorker)
 	dispatcher.targets = make(map[string]*targetState)
+	dispatcher.oneShots = make(map[string]*targetState)
 	dispatcher.closed = true
 	dispatcher.mu.Unlock()
 
@@ -242,6 +288,31 @@ func (dispatcher *Dispatcher) syncTargets(targets []Target) []*targetState {
 	return states
 }
 
+func (dispatcher *Dispatcher) syncOneShotTarget(target Target, packetCount int) *targetState {
+	dispatcher.mu.Lock()
+	defer dispatcher.mu.Unlock()
+	if dispatcher.closed || target.Conn == nil || target.Addr == nil || packetCount <= 0 {
+		return nil
+	}
+	worker := dispatcher.workerForConnLocked(target.Conn)
+	addrKey := target.Addr.String()
+	state := dispatcher.oneShots[target.ID]
+	if state == nil || state.conn != target.Conn || state.addrKey != addrKey || !state.active.Load() {
+		oldState := state
+		if oldState != nil {
+			oldState.active.Store(false)
+		}
+		state = &targetState{id: target.ID, conn: target.Conn, addr: target.Addr, addrKey: addrKey, worker: worker}
+		state.active.Store(true)
+		dispatcher.oneShots[target.ID] = state
+		if oldState != nil && oldState.worker != worker {
+			dispatcher.stopWorkerIfUnusedLocked(oldState.worker)
+		}
+	}
+	state.pending += packetCount
+	return state
+}
+
 func (dispatcher *Dispatcher) workerForConnLocked(conn UDPWriter) *connWorker {
 	worker := dispatcher.workers[conn]
 	if worker != nil {
@@ -270,12 +341,17 @@ func (dispatcher *Dispatcher) stopWorkerIfUnusedLocked(worker *connWorker) {
 			return
 		}
 	}
+	for _, state := range dispatcher.oneShots {
+		if state.worker == worker {
+			return
+		}
+	}
 	delete(dispatcher.workers, worker.conn)
 	worker.stopWorker()
 }
 
 func (dispatcher *Dispatcher) targetActive(packet queuedPacket) bool {
-	return packet.state != nil && packet.state.active.Load()
+	return packet.state == nil || packet.state.active.Load()
 }
 
 func (dispatcher *Dispatcher) failTarget(packet queuedPacket, err error) {
@@ -285,6 +361,11 @@ func (dispatcher *Dispatcher) failTarget(packet queuedPacket, err error) {
 		delete(dispatcher.targets, packet.id)
 		target.active.Store(false)
 		dispatcher.stopWorkerIfUnusedLocked(target.worker)
+	} else if state, exists := dispatcher.oneShots[packet.id]; exists && state == packet.state {
+		delete(dispatcher.oneShots, packet.id)
+		state.active.Store(false)
+		dispatcher.stopWorkerIfUnusedLocked(state.worker)
+		ok = true
 	} else {
 		ok = false
 	}
@@ -295,11 +376,14 @@ func (dispatcher *Dispatcher) failTarget(packet queuedPacket, err error) {
 	}
 }
 
-func (worker *connWorker) enqueue(batch queuedBatch) {
+func (worker *connWorker) enqueue(batch queuedBatch) bool {
 	select {
 	case <-worker.stop:
+		return false
 	case worker.packets <- batch:
+		return true
 	default:
+		return false
 	}
 }
 
@@ -374,6 +458,7 @@ func (worker *connWorker) writeChunk(queued []queuedPacket, packets []udp.Packet
 	}
 	written, err := udp.WriteBatch(worker.conn, packets, worker.writeBatchEnabled)
 	if err == nil && written == len(packets) {
+		worker.dispatcher.completeOneShots(queued[:len(packets)])
 		return
 	}
 	if written < 0 {
@@ -384,9 +469,11 @@ func (worker *connWorker) writeChunk(queued []queuedPacket, packets []udp.Packet
 	}
 	if !batchCapable {
 		worker.failSequentialWrite(queued, written, err)
+		worker.dispatcher.completeOneShots(queued)
 		return
 	}
 	worker.writeRemainingIndividually(queued, packets, written)
+	worker.dispatcher.completeOneShots(queued)
 }
 
 func (worker *connWorker) failSequentialWrite(queued []queuedPacket, written int, err error) {
@@ -420,8 +507,31 @@ func (worker *connWorker) writeRemainingIndividually(queued []queuedPacket, pack
 		}
 		if n != len(payload) {
 			worker.dispatcher.failTarget(packet, io.ErrShortWrite)
+			continue
 		}
 	}
+}
+
+func (dispatcher *Dispatcher) completeOneShots(packets []queuedPacket) {
+	for _, packet := range packets {
+		dispatcher.completeOneShot(packet)
+	}
+}
+
+func (dispatcher *Dispatcher) completeOneShot(packet queuedPacket) {
+	dispatcher.mu.Lock()
+	state, ok := dispatcher.oneShots[packet.id]
+	if ok && state == packet.state {
+		if state.pending > 0 {
+			state.pending--
+		}
+		if state.pending == 0 {
+			delete(dispatcher.oneShots, packet.id)
+			state.active.Store(false)
+			dispatcher.stopWorkerIfUnusedLocked(state.worker)
+		}
+	}
+	dispatcher.mu.Unlock()
 }
 
 func (worker *connWorker) stopWorker() {

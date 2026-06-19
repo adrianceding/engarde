@@ -127,6 +127,122 @@ func TestDispatcherWritesAllTargets(t *testing.T) {
 	}
 }
 
+func TestDispatcherSendWritesSingleTarget(t *testing.T) {
+	first := &fakeWriter{}
+	second := &fakeWriter{}
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1}
+	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 2}
+	dispatcher := NewDispatcher(10, 2, nil)
+	t.Cleanup(dispatcher.Close)
+
+	dispatcher.Fanout([]byte("fanout"), []Target{{ID: "first", Conn: first, Addr: firstAddr}, {ID: "second", Conn: second, Addr: secondAddr}})
+	waitForWrites(t, first, 1)
+	waitForWrites(t, second, 1)
+	dispatcher.Send([]byte("direct"), Target{ID: "first", Conn: first, Addr: firstAddr})
+	waitForWrites(t, first, 2)
+	time.Sleep(20 * time.Millisecond)
+	if second.writeCount() != 1 {
+		t.Fatalf("second writes = %d, want 1", second.writeCount())
+	}
+}
+
+func TestDispatcherSendDoesNotRegisterFanoutTarget(t *testing.T) {
+	first := &fakeWriter{}
+	second := &fakeWriter{}
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1}
+	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 2}
+	dispatcher := NewDispatcher(10, 2, nil)
+	t.Cleanup(dispatcher.Close)
+
+	dispatcher.Send([]byte("direct"), Target{ID: "second", Conn: second, Addr: secondAddr})
+	waitForWrites(t, second, 1)
+	dispatcher.Fanout([]byte("fanout"), []Target{{ID: "first", Conn: first, Addr: firstAddr}})
+	waitForWrites(t, first, 1)
+	time.Sleep(20 * time.Millisecond)
+	if second.writeCount() != 1 {
+		t.Fatalf("second writes = %d, want 1", second.writeCount())
+	}
+
+	dispatcher.Send([]byte("again"), Target{ID: "second", Conn: second, Addr: secondAddr})
+	waitForWrites(t, second, 2)
+}
+
+func TestDispatcherRemoveCleansOneShotTarget(t *testing.T) {
+	writer := &fakeWriter{}
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 3), Port: 3}
+	dispatcher := NewDispatcher(10, 2, nil)
+	t.Cleanup(dispatcher.Close)
+
+	dispatcher.Send([]byte("first"), Target{ID: "target", Conn: writer, Addr: addr})
+	waitForWrites(t, writer, 1)
+	dispatcher.Remove("target")
+	dispatcher.Send([]byte("second"), Target{ID: "target", Conn: writer, Addr: addr})
+	waitForWrites(t, writer, 2)
+}
+
+func TestDispatcherSendReleasesOneShotStateAfterSuccess(t *testing.T) {
+	writer := &fakeWriter{}
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 30), Port: 30}
+	dispatcher := NewDispatcher(10, 2, nil)
+	t.Cleanup(dispatcher.Close)
+
+	dispatcher.Send([]byte("first"), Target{ID: "target", Conn: writer, Addr: addr})
+	waitForWrites(t, writer, 1)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		dispatcher.mu.Lock()
+		_, ok := dispatcher.oneShots["target"]
+		dispatcher.mu.Unlock()
+		if !ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("one-shot state was retained after successful send")
+}
+
+func TestDispatcherQueuedOneShotsSharingTargetAllWrite(t *testing.T) {
+	writer := &fakeWriter{block: make(chan struct{})}
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 33), Port: 33}
+	dispatcher := NewDispatcher(10, 8, nil)
+	t.Cleanup(dispatcher.Close)
+
+	dispatcher.Send([]byte("first"), Target{ID: "target", Conn: writer, Addr: addr})
+	dispatcher.Send([]byte("second"), Target{ID: "target", Conn: writer, Addr: addr})
+	close(writer.block)
+	waitForWrites(t, writer, 2)
+}
+
+func TestDispatcherRemoveCancelsQueuedOneShot(t *testing.T) {
+	writer := &fakeWriter{block: make(chan struct{})}
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 4), Port: 4}
+	dispatcher := NewDispatcher(10, 2, nil)
+	dispatcher.Send([]byte("first"), Target{ID: "target", Conn: writer, Addr: addr})
+	dispatcher.Remove("target")
+	close(writer.block)
+	t.Cleanup(dispatcher.Close)
+	time.Sleep(20 * time.Millisecond)
+	if writer.writeCount() != 0 {
+		t.Fatalf("writes = %d, want 0 after one-shot remove", writer.writeCount())
+	}
+}
+
+func TestDispatcherOneShotPartialBatchReportsFailedTarget(t *testing.T) {
+	writeErr := errors.New("individual write")
+	writer := &fakeBatchWriter{partial: 1}
+	writer.writeErr = writeErr
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 31), Port: 31}
+	errorsCh := make(chan Result, 1)
+	dispatcher := NewDispatcherWithBatch(10, 4, true, 4, func(result Result) { errorsCh <- result })
+	t.Cleanup(dispatcher.Close)
+
+	dispatcher.SendBatch([][]byte{[]byte("first"), []byte("second")}, Target{ID: "target", Conn: writer, Addr: firstAddr})
+	result := readResult(t, errorsCh)
+	if result.ID != "target" || !errors.Is(result.Err, writeErr) {
+		t.Fatalf("result = %#v, want target individual write error", result)
+	}
+}
+
 func TestDispatcherReportsDeadlineAndWriteErrors(t *testing.T) {
 	deadlineErr := errors.New("deadline")
 	writeErr := errors.New("write")
