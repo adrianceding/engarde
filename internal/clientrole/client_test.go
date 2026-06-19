@@ -325,6 +325,122 @@ func TestRefreshInterfacesRemovesMissingAndExcludedRoutes(t *testing.T) {
 	}
 }
 
+func TestRefreshInterfacesRecreatesRouteWhenIndexChanges(t *testing.T) {
+	client := New(config.Client{DstAddr: "127.0.0.1:1"}, "", nil)
+	t.Cleanup(client.closeAllRoutes)
+	oldSocket := newFakeUDPSocket()
+	client.routes["tun0"] = &sendRoute{ifName: "tun0", ifIndex: 1, srcAddr: "198.18.0.1", socket: oldSocket}
+	client.listInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{{Name: "tun0", Index: 2}}, nil
+	}
+	client.interfaceAddress = func(iface net.Interface) string { return "198.18.0.1" }
+	client.openUDPOnInterface = func(addr *net.UDPAddr, ifName string) (udpSocket, error) {
+		if ifName != "tun0" {
+			t.Fatalf("unexpected route creation for %s", ifName)
+		}
+		return newFakeUDPSocket(), nil
+	}
+
+	client.refreshInterfaces()
+
+	select {
+	case <-oldSocket.closed:
+	default:
+		t.Fatal("old route socket was not closed")
+	}
+	route := client.routeSnapshot()["tun0"]
+	if route == nil || route.ifIndex != 2 || route.srcAddr != "198.18.0.1" {
+		t.Fatalf("tun0 route was not recreated with new index: %#v", route)
+	}
+}
+
+func TestRefreshInterfacesRecreatesStaleRoute(t *testing.T) {
+	client := New(config.Client{DstAddr: "127.0.0.1:1"}, "", nil)
+	t.Cleanup(client.closeAllRoutes)
+	oldSocket := newFakeUDPSocket()
+	route := &sendRoute{ifName: "tun0", ifIndex: 3, srcAddr: "198.18.0.1", socket: oldSocket}
+	now := time.Now().Unix()
+	route.lastSent.Store(now)
+	route.staleSince.Store(now - routeReceiveStaleSeconds - 1)
+	client.routes["tun0"] = route
+	client.listInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{{Name: "tun0", Index: 3}}, nil
+	}
+	client.interfaceAddress = func(iface net.Interface) string { return "198.18.0.1" }
+	client.openUDPOnInterface = func(addr *net.UDPAddr, ifName string) (udpSocket, error) {
+		return newFakeUDPSocket(), nil
+	}
+
+	client.refreshInterfaces()
+
+	select {
+	case <-oldSocket.closed:
+	default:
+		t.Fatal("stale route socket was not closed")
+	}
+	if newRoute := client.routeSnapshot()["tun0"]; newRoute == nil || newRoute == route {
+		t.Fatalf("stale route was not recreated: %#v", newRoute)
+	}
+}
+
+func TestRefreshInterfacesKeepsRouteWithoutOutboundActivity(t *testing.T) {
+	client := New(config.Client{DstAddr: "127.0.0.1:1"}, "", nil)
+	t.Cleanup(client.closeAllRoutes)
+	socket := newFakeUDPSocket()
+	route := &sendRoute{ifName: "tun0", ifIndex: 3, srcAddr: "198.18.0.1", socket: socket}
+	client.routes["tun0"] = route
+	client.listInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{{Name: "tun0", Index: 3}}, nil
+	}
+	client.interfaceAddress = func(iface net.Interface) string { return "198.18.0.1" }
+	client.openUDPOnInterface = func(addr *net.UDPAddr, ifName string) (udpSocket, error) {
+		t.Fatalf("unexpected route creation for %s", ifName)
+		return nil, nil
+	}
+
+	client.refreshInterfaces()
+
+	if client.routeSnapshot()["tun0"] != route {
+		t.Fatal("route without outbound activity was recreated")
+	}
+	select {
+	case <-socket.closed:
+		t.Fatal("route without outbound activity was closed")
+	default:
+	}
+}
+
+func TestRefreshInterfacesKeepsRouteWithCurrentReceive(t *testing.T) {
+	client := New(config.Client{DstAddr: "127.0.0.1:1"}, "", nil)
+	t.Cleanup(client.closeAllRoutes)
+	socket := newFakeUDPSocket()
+	route := &sendRoute{ifName: "tun0", ifIndex: 3, srcAddr: "198.18.0.1", socket: socket}
+	now := time.Now().Unix()
+	route.lastSent.Store(now)
+	route.lastRec.Store(now)
+	route.staleSince.Store(now - routeReceiveStaleSeconds - 1)
+	client.routes["tun0"] = route
+	client.listInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{{Name: "tun0", Index: 3}}, nil
+	}
+	client.interfaceAddress = func(iface net.Interface) string { return "198.18.0.1" }
+	client.openUDPOnInterface = func(addr *net.UDPAddr, ifName string) (udpSocket, error) {
+		t.Fatalf("unexpected route creation for %s", ifName)
+		return nil, nil
+	}
+
+	client.refreshInterfaces()
+
+	if client.routeSnapshot()["tun0"] != route {
+		t.Fatal("route with current receive activity was recreated")
+	}
+	select {
+	case <-socket.closed:
+		t.Fatal("route with current receive activity was closed")
+	default:
+	}
+}
+
 func TestUpdateAvailableInterfacesStopsOnContext(t *testing.T) {
 	client := New(config.Client{}, "", nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -435,20 +551,20 @@ func TestRunDescriptionListenAndControlErrors(t *testing.T) {
 
 func TestCreateSendRouteErrorsAndDuplicate(t *testing.T) {
 	client := New(config.Client{DstAddr: "bad dst"}, "", nil)
-	client.createSendRoute("eth0", "127.0.0.1")
+	client.createSendRoute("eth0", 1, "127.0.0.1")
 	if client.hasRoute("eth0") {
 		t.Fatal("route created with bad dst")
 	}
 
 	client = New(config.Client{DstAddr: "127.0.0.1:1"}, "", nil)
-	client.createSendRoute("eth0", "bad source")
+	client.createSendRoute("eth0", 1, "bad source")
 	if client.hasRoute("eth0") {
 		t.Fatal("route created with bad source")
 	}
 
 	client = New(config.Client{DstAddr: "127.0.0.1:1"}, "", nil)
 	client.openUDPOnInterface = func(addr *net.UDPAddr, ifName string) (udpSocket, error) { return nil, errors.New("open") }
-	client.createSendRoute("eth0", "127.0.0.1")
+	client.createSendRoute("eth0", 1, "127.0.0.1")
 	if client.hasRoute("eth0") {
 		t.Fatal("route created after socket open error")
 	}
@@ -465,7 +581,7 @@ func TestCreateSendRouteErrorsAndDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.openUDPOnInterface = func(addr *net.UDPAddr, ifName string) (udpSocket, error) { return secondSocket, nil }
-	client.createSendRoute("eth0", "127.0.0.1")
+	client.createSendRoute("eth0", 1, "127.0.0.1")
 	if !client.hasRoute("eth0") {
 		t.Fatal("existing route removed")
 	}

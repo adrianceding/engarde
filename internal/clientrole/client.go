@@ -28,6 +28,11 @@ var listenUDP = func(network string, laddr *net.UDPAddr) (udpSocket, error) {
 }
 var newRefreshTicker = defaultRefreshTicker
 
+const (
+	routeReceiveStaleSeconds   int64 = 60
+	routeOutboundActiveSeconds int64 = 10
+)
+
 type udpSocket interface {
 	relay.UDPWriter
 	ReadFromUDP([]byte) (int, *net.UDPAddr, error)
@@ -61,12 +66,39 @@ type Client struct {
 }
 
 type sendRoute struct {
-	ifName  string
-	srcAddr string
-	dstAddr *net.UDPAddr
-	socket  udpSocket
-	lastRec atomic.Int64
-	closing atomic.Bool
+	ifName     string
+	ifIndex    int
+	srcAddr    string
+	dstAddr    *net.UDPAddr
+	socket     udpSocket
+	lastRec    atomic.Int64
+	lastSent   atomic.Int64
+	staleSince atomic.Int64
+	closing    atomic.Bool
+}
+
+func (route *sendRoute) markSent(now int64) {
+	previousSent := route.lastSent.Swap(now)
+	if route.staleSince.Load() == 0 || now-previousSent > routeOutboundActiveSeconds {
+		route.staleSince.Store(now)
+	}
+}
+
+func (route *sendRoute) markReceived(now int64) {
+	route.lastRec.Store(now)
+	route.staleSince.Store(0)
+}
+
+func (route *sendRoute) isReceiveStale(now int64) bool {
+	lastSent := route.lastSent.Load()
+	if lastSent == 0 || now-lastSent > routeOutboundActiveSeconds {
+		return false
+	}
+	staleSince := route.staleSince.Load()
+	if staleSince == 0 || route.lastRec.Load() >= staleSince {
+		return false
+	}
+	return now-staleSince >= routeReceiveStaleSeconds
 }
 
 func New(cfg config.Client, version string, webFS fs.FS) *Client {
@@ -207,6 +239,7 @@ func (client *Client) refreshInterfaces() {
 	if err != nil {
 		return
 	}
+	now := time.Now().Unix()
 	known := make(map[string]net.Interface, len(interfaces))
 	for _, iface := range interfaces {
 		known[iface.Name] = iface
@@ -224,8 +257,18 @@ func (client *Client) refreshInterfaces() {
 			client.removeRoute(ifName)
 			continue
 		}
+		if route.ifIndex != 0 && iface.Index != route.ifIndex {
+			log.Info("Interface '" + ifName + "' changed index, re-creating socket")
+			client.removeRoute(ifName)
+			continue
+		}
 		if address := client.interfaceAddress(iface); address != route.srcAddr {
 			log.Info("Interface '" + ifName + "' changed address, re-creating socket")
+			client.removeRoute(ifName)
+			continue
+		}
+		if route.isReceiveStale(now) {
+			log.Info("Interface '" + ifName + "' stopped receiving packets, re-creating socket")
 			client.removeRoute(ifName)
 		}
 	}
@@ -240,11 +283,11 @@ func (client *Client) refreshInterfaces() {
 			continue
 		}
 		log.Info("New interface '" + ifName + "' with IP '" + address + "', adding it")
-		client.createSendRoute(ifName, address)
+		client.createSendRoute(ifName, iface.Index, address)
 	}
 }
 
-func (client *Client) createSendRoute(ifName, sourceAddr string) {
+func (client *Client) createSendRoute(ifName string, ifIndex int, sourceAddr string) {
 	dst := client.paths.Destination(ifName)
 	dstAddr, err := resolveUDPAddr("udp4", dst)
 	if err != nil {
@@ -262,7 +305,7 @@ func (client *Client) createSendRoute(ifName, sourceAddr string) {
 		return
 	}
 
-	route := &sendRoute{ifName: ifName, srcAddr: sourceAddr, dstAddr: dstAddr, socket: socket}
+	route := &sendRoute{ifName: ifName, ifIndex: ifIndex, srcAddr: sourceAddr, dstAddr: dstAddr, socket: socket}
 	client.routesMu.Lock()
 	if _, exists := client.routes[ifName]; exists {
 		client.routesMu.Unlock()
@@ -291,7 +334,7 @@ func (client *Client) writeBack(route *sendRoute) {
 
 		writeBatch = writeBatch[:0]
 		if n > 0 {
-			route.lastRec.Store(time.Now().Unix())
+			route.markReceived(time.Now().Unix())
 		}
 		wgAddr := client.getWireGuardAddr()
 		if wgAddr != nil {
@@ -360,8 +403,10 @@ func (client *Client) getWireGuardAddr() *net.UDPAddr {
 func (client *Client) routeTargets() []relay.Target {
 	client.routesMu.RLock()
 	defer client.routesMu.RUnlock()
+	now := time.Now().Unix()
 	targets := make([]relay.Target, 0, len(client.routes))
 	for ifName, route := range client.routes {
+		route.markSent(now)
 		targets = append(targets, relay.Target{ID: ifName, Conn: route.socket, Addr: route.dstAddr})
 	}
 	return targets
