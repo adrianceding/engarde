@@ -185,7 +185,7 @@ go build -ldflags "-s -w" -o engarde ./cmd/engarde
 
 The Makefile writes platform artifacts under `dist/{os}/{arch}/`. Each platform contains one binary: `engarde` on Unix-like systems or `engarde.exe` on Windows.
 
-The embedded web UI is built from `webmanager/` by `make web-assets` and copied into `internal/assets/browser` before Go builds. The produced binary can serve the management UI directly from those embedded assets.
+The embedded web UI is built from `webmanager/` by `make web-assets` and copied into `internal/assets/browser` before Go builds. Generated files in `internal/assets/browser` are intentionally not committed; build through `make` or run `make web-assets` before a manual `go build` when you need the management UI embedded.
 
 ## Status
 

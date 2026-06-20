@@ -21,6 +21,7 @@
             <mat-card class="card card-active">
               <mat-card-title class="title">
                 {{iface.label || iface.name}}@if (iface.label) { <span class="iface-name">({{iface.name}})</span>}
+                @if (iface.primary) { <span class="primary-badge">Primary</span> }
               </mat-card-title>
               <mat-card-content>
                 <div class="text last-received"><strong>Last received packet: </strong>
@@ -32,6 +33,31 @@
                 <div class="text"><strong>Sender address: </strong>{{iface.senderAddress}}</div>
                 <div class="text"><strong>Destination address: </strong>{{ iface.dstAddress }}</div>
               </span>
+              <div class="stats-grid">
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data in</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.rxPackets, traffic(iface).data.rxBytes) }}</div>
+                </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data out</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.txPackets, traffic(iface).data.txBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control in</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.rxPackets, traffic(iface).control.rxBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control out</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.txPackets, traffic(iface).control.txBytes) }}</div>
+                </div>
+              </div>
+              @if (iface.path) {
+                <div class="path-status" [ngClass]="{alert: !iface.path.eligible}">
+                  <span>RTT {{ iface.path.rttMillis }} ms</span>
+                  <span>Failures {{ iface.path.failures }}</span>
+                  <span>Control {{ formatPathLast(iface.path.lastSuccess) }}</span>
+                </div>
+              }
             </mat-card-content>
             <mat-card-actions>
               <button mat-button class="card-action" (click)="toggleExclude(iface.name)">Exclude</button>
@@ -60,6 +86,24 @@
                 <div class="text"><strong>Sender address: </strong>{{iface.senderAddress}}</div>
                 <div class="text"><strong>Destination address: </strong>{{ iface.dstAddress }} </div>
               </span>
+              <div class="stats-grid stats-muted">
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data in</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.rxPackets, traffic(iface).data.rxBytes) }}</div>
+                </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data out</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.txPackets, traffic(iface).data.txBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control in</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.rxPackets, traffic(iface).control.rxBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control out</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.txPackets, traffic(iface).control.txBytes) }}</div>
+                </div>
+              </div>
             </mat-card-content>
             <mat-card-actions>
               <button mat-button class="card-action" (click)="toggleExclude(iface.name)">Exclude</button>
@@ -87,6 +131,24 @@
               <span class="other-infos">
                 <div class="text"><strong>Sender address: </strong>{{iface.senderAddress}}</div>
               </span>
+              <div class="stats-grid stats-muted">
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data in</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.rxPackets, traffic(iface).data.rxBytes) }}</div>
+                </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data out</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.txPackets, traffic(iface).data.txBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control in</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.rxPackets, traffic(iface).control.rxBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control out</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.txPackets, traffic(iface).control.txBytes) }}</div>
+                </div>
+              </div>
             </mat-card-content>
             <mat-card-actions>
               <button mat-button class="card-action" (click)="toggleExclude(iface.name)">Include</button>
@@ -115,6 +177,7 @@
           <mat-card class="card card-server">
             <mat-card-title class="title">
               {{ iface.address.split(":").slice(0, -1).join(":") }}<span class="port">:{{ iface.address.split(":").slice(-1) }}</span>
+              @if (iface.primary) { <span class="primary-badge">Primary</span> }
             </mat-card-title>
             <mat-card-content>
               <div class="text last-received"><strong>Last received packet: </strong>
@@ -122,6 +185,31 @@
                 <span [ngClass]="{alert: iface.last >= 10}">{{ iface.last }} second{{ iface.last == 1 ? '' : 's' }} ago</span>
               }
             </div>
+            <div class="stats-grid">
+              <div class="stat-block stat-data">
+                <div class="stat-label">Data in</div>
+                <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.rxPackets, traffic(iface).data.rxBytes) }}</div>
+              </div>
+              <div class="stat-block stat-data">
+                <div class="stat-label">Data out</div>
+                <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.txPackets, traffic(iface).data.txBytes) }}</div>
+              </div>
+              <div class="stat-block stat-control">
+                <div class="stat-label">Control in</div>
+                <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.rxPackets, traffic(iface).control.rxBytes) }}</div>
+              </div>
+              <div class="stat-block stat-control">
+                <div class="stat-label">Control out</div>
+                <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.txPackets, traffic(iface).control.txBytes) }}</div>
+              </div>
+            </div>
+            @if (iface.path) {
+              <div class="path-status" [ngClass]="{alert: !iface.path.eligible}">
+                <span>RTT {{ iface.path.rttMillis }} ms</span>
+                <span>Failures {{ iface.path.failures }}</span>
+                <span>Control {{ formatPathLast(iface.path.lastSuccess) }}</span>
+              </div>
+            }
           </mat-card-content>
         </mat-card>
       }

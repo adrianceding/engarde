@@ -141,3 +141,59 @@ func TestPathStatsSuccessFailureAndEligibility(t *testing.T) {
 		t.Fatal("stale success should not be eligible")
 	}
 }
+
+func TestSelectPrimaryPathKeepsCurrentForSmallRTTChanges(t *testing.T) {
+	now := int64(1000)
+	stats := map[string]PathStats{
+		"eth0": {ID: "eth0", LastSuccess: now, SmoothedRTT: 100},
+		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 90},
+	}
+
+	primary := SelectPrimaryPath("eth0", []string{"eth0", "eth1"}, stats, now, time.Second)
+
+	if primary != "eth0" {
+		t.Fatalf("primary = %q, want current path eth0", primary)
+	}
+}
+
+func TestSelectPrimaryPathSwitchesForSignificantRTTChanges(t *testing.T) {
+	now := int64(1000)
+	stats := map[string]PathStats{
+		"eth0": {ID: "eth0", LastSuccess: now, SmoothedRTT: 100},
+		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 70},
+	}
+
+	primary := SelectPrimaryPath("eth0", []string{"eth0", "eth1"}, stats, now, time.Second)
+
+	if primary != "eth1" {
+		t.Fatalf("primary = %q, want faster path eth1", primary)
+	}
+}
+
+func TestSelectPrimaryPathSwitchesWhenCurrentIsNotEligible(t *testing.T) {
+	now := int64(3000)
+	stats := map[string]PathStats{
+		"eth0": {ID: "eth0", LastSuccess: 1000, SmoothedRTT: 10},
+		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 100},
+	}
+
+	primary := SelectPrimaryPath("eth0", []string{"eth0", "eth1"}, stats, now, time.Second)
+
+	if primary != "eth1" {
+		t.Fatalf("primary = %q, want eligible path eth1", primary)
+	}
+}
+
+func TestSelectPrimaryPathSwitchesForFewerFailures(t *testing.T) {
+	now := int64(1000)
+	stats := map[string]PathStats{
+		"eth0": {ID: "eth0", LastSuccess: now, SmoothedRTT: 10, Failures: 1},
+		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 100, Failures: 0},
+	}
+
+	primary := SelectPrimaryPath("eth0", []string{"eth0", "eth1"}, stats, now, time.Second)
+
+	if primary != "eth1" {
+		t.Fatalf("primary = %q, want lower-failure path eth1", primary)
+	}
+}

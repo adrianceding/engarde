@@ -12,8 +12,8 @@ func TestGetWebFS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetWebFS returned error: %v", err)
 	}
-	if _, err := fs.Stat(webFS, "index.html"); err != nil {
-		t.Fatalf("embedded index.html unavailable: %v", err)
+	if _, err := fs.Stat(webFS, "README.md"); err != nil {
+		t.Fatalf("embedded browser placeholder unavailable: %v", err)
 	}
 }
 

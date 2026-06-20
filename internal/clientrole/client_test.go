@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"net"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -37,6 +38,7 @@ type fakeUDPRead struct {
 }
 
 type fakeUDPSocket struct {
+	mu              sync.Mutex
 	readItems       chan fakeUDPRead
 	closed          chan struct{}
 	writeErr        error
@@ -63,11 +65,15 @@ func (socket *fakeUDPSocket) ReadFromUDP(buffer []byte) (int, *net.UDPAddr, erro
 func (socket *fakeUDPSocket) SetWriteDeadline(time.Time) error { return nil }
 
 func (socket *fakeUDPSocket) SetWriteBuffer(size int) error {
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
 	socket.writeBufferSize = size
 	return nil
 }
 
 func (socket *fakeUDPSocket) WriteToUDP(payload []byte, addr *net.UDPAddr) (int, error) {
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
 	if socket.writeErr != nil {
 		return 0, socket.writeErr
 	}
@@ -85,7 +91,25 @@ func (socket *fakeUDPSocket) Close() error {
 }
 
 func (socket *fakeUDPSocket) writtenCount() int {
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
 	return len(socket.writtenPayloads)
+}
+
+func (socket *fakeUDPSocket) writtenSnapshot() [][]byte {
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	payloads := make([][]byte, 0, len(socket.writtenPayloads))
+	for _, payload := range socket.writtenPayloads {
+		payloads = append(payloads, append([]byte(nil), payload...))
+	}
+	return payloads
+}
+
+func (socket *fakeUDPSocket) writeBuffer() int {
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	return socket.writeBufferSize
 }
 
 func TestClientActionsPreserveLegacyStatuses(t *testing.T) {
@@ -148,8 +172,8 @@ func TestUpdateWireGuardWriteBufferTracksRoutes(t *testing.T) {
 	client.wgSocket = wgSocket
 
 	client.updateWireGuardWriteBuffer()
-	if wgSocket.writeBufferSize != relay.DefaultWriteBufferBytes {
-		t.Fatalf("initial write buffer = %d, want %d", wgSocket.writeBufferSize, relay.DefaultWriteBufferBytes)
+	if got := wgSocket.writeBuffer(); got != relay.DefaultWriteBufferBytes {
+		t.Fatalf("initial write buffer = %d, want %d", got, relay.DefaultWriteBufferBytes)
 	}
 
 	first := newFakeUDPSocket()
@@ -158,13 +182,13 @@ func TestUpdateWireGuardWriteBufferTracksRoutes(t *testing.T) {
 	client.routes["second"] = &sendRoute{ifName: "second", socket: second}
 	client.updateWireGuardWriteBuffer()
 	want := relay.DefaultWriteBufferBytes + relay.DefaultWriteBufferTargetBytes
-	if wgSocket.writeBufferSize != want {
-		t.Fatalf("two-route write buffer = %d, want %d", wgSocket.writeBufferSize, want)
+	if got := wgSocket.writeBuffer(); got != want {
+		t.Fatalf("two-route write buffer = %d, want %d", got, want)
 	}
 
 	client.removeRoute("second")
-	if wgSocket.writeBufferSize != relay.DefaultWriteBufferBytes {
-		t.Fatalf("one-route write buffer = %d, want %d", wgSocket.writeBufferSize, relay.DefaultWriteBufferBytes)
+	if got := wgSocket.writeBuffer(); got != relay.DefaultWriteBufferBytes {
+		t.Fatalf("one-route write buffer = %d, want %d", got, relay.DefaultWriteBufferBytes)
 	}
 }
 
@@ -208,6 +232,12 @@ func TestClientStatusIncludesActiveRoute(t *testing.T) {
 	}
 	route := &sendRoute{ifName: ifName, srcAddr: "192.0.2.10", dstAddr: dstAddr}
 	route.lastRec.Store(time.Now().Unix() - 1)
+	route.traffic.Data.RecordRX(120)
+	route.traffic.Data.RecordTX(240)
+	route.traffic.Control.RecordRX(36)
+	pathNow := transport.NowMillis()
+	client.pathStats[ifName] = &transport.PathStats{ID: ifName, LastSeen: pathNow - 50, LastSuccess: pathNow - 25, SmoothedRTT: 12, RTTVariance: 3, Failures: 1}
+	client.primaryPathID = ifName
 	client.routes[ifName] = route
 
 	statusValue, err := client.Status()
@@ -226,8 +256,17 @@ func TestClientStatusIncludesActiveRoute(t *testing.T) {
 		if webInterface.Name != ifName {
 			continue
 		}
-		if webInterface.Status != "active" || webInterface.DstAddress != "198.51.100.1:59501" || webInterface.Last == nil {
+		if webInterface.Status != "active" || webInterface.DstAddress != "198.51.100.1:59501" || webInterface.Last == nil || !webInterface.Primary {
 			t.Fatalf("interface status = %#v", webInterface)
+		}
+		if webInterface.Traffic.Data.RXPackets != 1 || webInterface.Traffic.Data.RXBytes != 120 || webInterface.Traffic.Data.TXPackets != 1 || webInterface.Traffic.Data.TXBytes != 240 {
+			t.Fatalf("data traffic = %#v", webInterface.Traffic.Data)
+		}
+		if webInterface.Traffic.Control.RXPackets != 1 || webInterface.Traffic.Control.RXBytes != 36 {
+			t.Fatalf("control traffic = %#v", webInterface.Traffic.Control)
+		}
+		if webInterface.Path == nil || webInterface.Path.SmoothedRTTMillis != 12 || webInterface.Path.Failures != 1 || webInterface.Path.LastSeen == nil || webInterface.Path.LastSuccess == nil {
+			t.Fatalf("path status = %#v", webInterface.Path)
 		}
 		return
 	}
@@ -653,6 +692,10 @@ func TestWriteBackLoopback(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertUDPRead(t, wgPeer, "route-to-wg")
+	traffic := route.traffic.Snapshot()
+	if traffic.Data.RXPackets != 1 || traffic.Data.RXBytes != uint64(len("route-to-wg")) {
+		t.Fatalf("route data RX traffic = %#v", traffic.Data)
+	}
 	route.closing.Store(true)
 	routeSocket.Close()
 }
@@ -728,11 +771,19 @@ func TestWriteBackAdaptiveDataAckAndDuplicateSuppression(t *testing.T) {
 	route.closing.Store(true)
 	routeSocket.Close()
 
-	if wgSocket.writtenCount() != 1 || string(wgSocket.writtenPayloads[0]) != "inner" {
-		t.Fatalf("WireGuard writes = %#v", wgSocket.writtenPayloads)
+	wgPayloads := wgSocket.writtenSnapshot()
+	if len(wgPayloads) != 1 || string(wgPayloads[0]) != "inner" {
+		t.Fatalf("WireGuard writes = %#v", wgPayloads)
 	}
 	if routeSocket.writtenCount() < 2 {
 		t.Fatalf("ACK writes = %d, want at least 2", routeSocket.writtenCount())
+	}
+	traffic := route.traffic.Snapshot()
+	if traffic.Data.RXPackets != 1 || traffic.Data.RXBytes != uint64(len("inner")) {
+		t.Fatalf("adaptive data RX traffic = %#v", traffic.Data)
+	}
+	if traffic.Control.TXPackets != 2 {
+		t.Fatalf("adaptive control TX traffic = %#v", traffic.Control)
 	}
 }
 
@@ -754,8 +805,8 @@ func TestWriteBackAdaptiveAckCompletesPendingWithoutWireGuardWrite(t *testing.T)
 	route.closing.Store(true)
 	routeSocket.Close()
 
-	if wgSocket.writtenCount() != 0 {
-		t.Fatalf("ACK was written to WireGuard: %#v", wgSocket.writtenPayloads)
+	if wgPayloads := wgSocket.writtenSnapshot(); len(wgPayloads) != 0 {
+		t.Fatalf("ACK was written to WireGuard: %#v", wgPayloads)
 	}
 	if _, ok := client.tracker.Complete(id); ok {
 		t.Fatal("pending record was not completed by ACK")
@@ -774,6 +825,81 @@ func TestClientAdaptiveKeepaliveTracksPending(t *testing.T) {
 	due := client.tracker.Due(200, 50, 1000, 1)
 	if len(due) != 1 || due[0].PathID != "tun0" {
 		t.Fatalf("due keepalive = %#v", due)
+	}
+}
+
+func TestClientAdaptiveKeepaliveAckCompletesPending(t *testing.T) {
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive}}, "", nil)
+	routeSocket := newFakeUDPSocket()
+	route := &sendRoute{ifName: "tun0", socket: routeSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
+	client.routes["tun0"] = route
+	client.sendKeepaliveToRoutes(100)
+	time.Sleep(20 * time.Millisecond)
+	payloads := routeSocket.writtenSnapshot()
+	if len(payloads) != 1 {
+		t.Fatalf("keepalive writes = %d, want 1", len(payloads))
+	}
+	frame, err := transport.Decode(payloads[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackPayload, err := transport.Encode(transport.Frame{Type: transport.FrameKeepaliveAck, ID: frame.ID, SentAt: frame.SentAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.writeBackAdaptive(route, []udp.Packet{{Payload: ackPayload}}, nil)
+	if _, ok := client.tracker.Complete(frame.ID); ok {
+		t.Fatal("keepalive pending record was not completed by ACK")
+	}
+	if due := client.tracker.Due(200, 50, 1000, 1); len(due) != 0 {
+		t.Fatalf("ACKed keepalive was retried: %#v", due)
+	}
+	controlTraffic := route.traffic.Snapshot().Control
+	if controlTraffic.TXPackets != 1 || controlTraffic.RXPackets != 1 {
+		t.Fatalf("control traffic = %#v", controlTraffic)
+	}
+}
+
+func TestClientAdaptiveDataUsesCachedPrimaryPath(t *testing.T) {
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}}, "", nil)
+	firstSocket := newFakeUDPSocket()
+	secondSocket := newFakeUDPSocket()
+	client.routes["eth0"] = &sendRoute{ifName: "eth0", socket: firstSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
+	client.routes["eth1"] = &sendRoute{ifName: "eth1", socket: secondSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9002}}
+	now := transport.NowMillis()
+	client.pathStats["eth0"] = &transport.PathStats{ID: "eth0", LastSuccess: now, SmoothedRTT: 100}
+	client.pathStats["eth1"] = &transport.PathStats{ID: "eth1", LastSuccess: now, SmoothedRTT: 90}
+	client.primaryPathID = "eth0"
+
+	client.sendAdaptiveData([]byte("inner"))
+	time.Sleep(20 * time.Millisecond)
+
+	if firstSocket.writtenCount() != 1 {
+		t.Fatalf("eth0 writes = %d, want 1", firstSocket.writtenCount())
+	}
+	if secondSocket.writtenCount() != 0 {
+		t.Fatalf("eth1 writes = %d, want 0", secondSocket.writtenCount())
+	}
+}
+
+func TestClientRefreshPrimaryPathRequiresSignificantRTTImprovement(t *testing.T) {
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}}, "", nil)
+	client.routes["eth0"] = &sendRoute{ifName: "eth0", socket: newFakeUDPSocket(), dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
+	client.routes["eth1"] = &sendRoute{ifName: "eth1", socket: newFakeUDPSocket(), dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9002}}
+	now := transport.NowMillis()
+	client.pathStats["eth0"] = &transport.PathStats{ID: "eth0", LastSuccess: now, SmoothedRTT: 100}
+	client.pathStats["eth1"] = &transport.PathStats{ID: "eth1", LastSuccess: now, SmoothedRTT: 90}
+	client.primaryPathID = "eth0"
+
+	client.refreshPrimaryPath(now)
+	if client.primaryPathID != "eth0" {
+		t.Fatalf("primary after small RTT change = %q, want eth0", client.primaryPathID)
+	}
+
+	client.pathStats["eth1"].SmoothedRTT = 70
+	client.refreshPrimaryPath(now)
+	if client.primaryPathID != "eth1" {
+		t.Fatalf("primary after significant RTT change = %q, want eth1", client.primaryPathID)
 	}
 }
 
@@ -808,8 +934,9 @@ func TestWriteBackAdaptiveAllowsOversizedRawOnConfirmedPath(t *testing.T) {
 
 	client.writeBackAdaptive(route, []udp.Packet{{Payload: rawPayload}}, nil)
 
-	if wgSocket.writtenCount() != 1 || len(wgSocket.writtenPayloads[0]) != len(rawPayload) {
-		t.Fatalf("WireGuard writes = %#v, want oversized raw payload", wgSocket.writtenPayloads)
+	wgPayloads := wgSocket.writtenSnapshot()
+	if len(wgPayloads) != 1 || len(wgPayloads[0]) != len(rawPayload) {
+		t.Fatalf("WireGuard writes = %#v, want oversized raw payload", wgPayloads)
 	}
 }
 

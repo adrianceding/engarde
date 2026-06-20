@@ -185,7 +185,7 @@ go build -ldflags "-s -w" -o engarde ./cmd/engarde
 
 Makefile 会把平台产物写入 `dist/{os}/{arch}/`。每个平台只有一个二进制：类 Unix 系统为 `engarde`，Windows 为 `engarde.exe`。
 
-嵌入式 Web UI 由 `make web-assets` 从 `webmanager/` 构建，并复制到 `internal/assets/browser`，随后被 Go 二进制嵌入。生成的二进制可以直接提供 Web 管理界面。
+嵌入式 Web UI 由 `make web-assets` 从 `webmanager/` 构建，并复制到 `internal/assets/browser`，随后被 Go 二进制嵌入。`internal/assets/browser` 中的生成文件不会提交入库；需要嵌入 Web 管理界面时，请通过 `make` 构建，或在手动 `go build` 前先运行 `make web-assets`。
 
 ## 项目状态
 

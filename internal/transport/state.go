@@ -1,6 +1,9 @@
 package transport
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 type PendingRing struct {
 	slots []pendingSlot
@@ -168,6 +171,11 @@ type PathStats struct {
 	Failures    int
 }
 
+const (
+	PathSwitchRTTMarginMillis  int64 = 25
+	PathSwitchRTTMarginPercent int64 = 25
+)
+
 func (stats *PathStats) MarkSuccess(now int64, rtt int64) {
 	stats.LastSeen = now
 	stats.LastSuccess = now
@@ -202,6 +210,74 @@ func (stats PathStats) Eligible(now int64, timeout time.Duration) bool {
 		return false
 	}
 	return now-stats.LastSuccess <= timeout.Milliseconds()
+}
+
+func SelectPrimaryPath(current string, candidates []string, pathStats map[string]PathStats, now int64, timeout time.Duration) string {
+	eligible := make([]string, 0, len(candidates))
+	for _, id := range candidates {
+		stats, ok := pathStats[id]
+		if ok && stats.Eligible(now, timeout) {
+			eligible = append(eligible, id)
+		}
+	}
+	if len(eligible) == 0 {
+		return ""
+	}
+	sort.SliceStable(eligible, func(i, j int) bool {
+		return pathStatsLess(eligible[i], eligible[j], pathStats)
+	})
+	best := eligible[0]
+	if current == "" || current == best || !containsPathID(eligible, current) {
+		return best
+	}
+	currentStats, currentOK := pathStats[current]
+	bestStats, bestOK := pathStats[best]
+	if !currentOK || !bestOK || !currentStats.Eligible(now, timeout) {
+		return best
+	}
+	if shouldSwitchPrimary(currentStats, bestStats) {
+		return best
+	}
+	return current
+}
+
+func pathStatsLess(leftID string, rightID string, pathStats map[string]PathStats) bool {
+	left := pathStats[leftID]
+	right := pathStats[rightID]
+	if left.Failures != right.Failures {
+		return left.Failures < right.Failures
+	}
+	if left.SmoothedRTT != right.SmoothedRTT {
+		return left.SmoothedRTT < right.SmoothedRTT
+	}
+	return leftID < rightID
+}
+
+func shouldSwitchPrimary(current PathStats, candidate PathStats) bool {
+	if candidate.Failures != current.Failures {
+		return candidate.Failures < current.Failures
+	}
+	return rttSignificantlyBetter(candidate.SmoothedRTT, current.SmoothedRTT)
+}
+
+func rttSignificantlyBetter(candidateRTT int64, currentRTT int64) bool {
+	if currentRTT <= 0 || candidateRTT >= currentRTT {
+		return false
+	}
+	margin := currentRTT * PathSwitchRTTMarginPercent / 100
+	if margin < PathSwitchRTTMarginMillis {
+		margin = PathSwitchRTTMarginMillis
+	}
+	return currentRTT-candidateRTT >= margin
+}
+
+func containsPathID(ids []string, target string) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (stats PathStats) RTO(minTimeoutMillis int64, maxTimeoutMillis int64) int64 {

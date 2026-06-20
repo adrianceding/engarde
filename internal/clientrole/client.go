@@ -14,6 +14,7 @@ import (
 	"github.com/adrianceding/engarde/internal/control"
 	pathmgr "github.com/adrianceding/engarde/internal/path"
 	"github.com/adrianceding/engarde/internal/relay"
+	"github.com/adrianceding/engarde/internal/stats"
 	"github.com/adrianceding/engarde/internal/transport"
 	"github.com/adrianceding/engarde/internal/udp"
 	log "github.com/sirupsen/logrus"
@@ -69,6 +70,7 @@ type Client struct {
 
 	pathStatsMu   sync.Mutex
 	pathStats     map[string]*transport.PathStats
+	primaryPathID string
 	lastKeepalive atomic.Int64
 }
 
@@ -82,6 +84,7 @@ type sendRoute struct {
 	lastSent   atomic.Int64
 	staleSince atomic.Int64
 	closing    atomic.Bool
+	traffic    stats.Traffic
 }
 
 func (route *sendRoute) markSent(now int64) {
@@ -174,6 +177,7 @@ func (client *Client) Status() (any, error) {
 	}
 	now := time.Now().Unix()
 	routes := client.routeSnapshot()
+	primaryPathID := client.currentPrimaryPathID()
 	webInterfaces := make([]control.WebInterface, 0, len(interfaces))
 	for _, iface := range interfaces {
 		ifName := iface.Name
@@ -191,6 +195,9 @@ func (client *Client) Status() (any, error) {
 		webInterface.DstAddress = client.paths.Destination(ifName)
 		if route, ok := routes[ifName]; ok {
 			webInterface.Status = "active"
+			webInterface.Primary = ifName == primaryPathID
+			webInterface.Traffic = route.traffic.Snapshot()
+			webInterface.Path = client.pathStatus(ifName, transport.NowMillis())
 			lastRec := route.lastRec.Load()
 			if lastRec > 0 {
 				last := now - lastRec
@@ -361,6 +368,7 @@ func (client *Client) writeBack(route *sendRoute) {
 		wgAddr := client.getWireGuardAddr()
 		if wgAddr != nil {
 			for i := 0; i < n; i++ {
+				route.traffic.Data.RecordRX(len(readBatch[i].Payload))
 				writeBatch = append(writeBatch, udp.Packet{Payload: readBatch[i].Payload, Addr: wgAddr})
 			}
 		}
@@ -402,7 +410,9 @@ func (client *Client) receiveFromWireGuard(ctx context.Context) error {
 			if client.adaptiveEnabled() {
 				client.sendAdaptiveDataBatch(payloads)
 			} else {
-				client.dispatcher.FanoutBatch(payloads, client.routeTargets())
+				targets := client.routeTargets()
+				client.recordDataTXBatch(targets, payloads)
+				client.dispatcher.FanoutBatch(payloads, targets)
 			}
 		}
 		if err != nil {
@@ -452,6 +462,7 @@ func (client *Client) maintainAdaptiveTransport() {
 		return
 	}
 	now := transport.NowMillis()
+	client.refreshPrimaryPath(now)
 	client.retryAdaptiveData(now)
 	lastKeepalive := client.lastKeepalive.Load()
 	if now-lastKeepalive >= client.cfg.Transfer.KeepaliveIntervalMillis && client.lastKeepalive.CompareAndSwap(lastKeepalive, now) {
@@ -469,14 +480,22 @@ func (client *Client) sendAdaptiveData(payload []byte) {
 	if len(payload) > transport.MaxPayloadSize {
 		now := transport.NowMillis()
 		client.sendKeepaliveToRoutes(now)
-		client.dispatcher.Fanout(payload, client.routeTargets())
+		targets := client.routeTargets()
+		client.recordDataTX(targets, len(payload))
+		client.dispatcher.Fanout(payload, targets)
 		return
 	}
 	now := transport.NowMillis()
-	targets := client.adaptiveRouteTargets(now, true)
-	if len(targets) == 0 {
+	target, ok := client.primaryRouteTarget(now)
+	if !ok {
+		client.refreshPrimaryPath(now)
+		target, ok = client.primaryRouteTarget(now)
+	}
+	if !ok {
 		client.sendKeepaliveToRoutes(now)
-		client.dispatcher.Fanout(payload, client.routeTargets())
+		fallbackTargets := client.routeTargets()
+		client.recordDataTX(fallbackTargets, len(payload))
+		client.dispatcher.Fanout(payload, fallbackTargets)
 		return
 	}
 	id := client.tracker.NextID()
@@ -484,9 +503,10 @@ func (client *Client) sendAdaptiveData(payload []byte) {
 	if err != nil {
 		return
 	}
-	client.tracker.Track(transport.PendingRecord{ID: id, PathID: targets[0].ID, SentAt: now, TimeoutMillis: client.pathRTO(targets[0].ID), Payload: framePayload})
-	client.markRouteSent(targets[0].ID)
-	client.dispatcher.Send(framePayload, targets[0])
+	client.tracker.Track(transport.PendingRecord{ID: id, PathID: target.ID, SentAt: now, TimeoutMillis: client.pathRTO(target.ID), Payload: framePayload})
+	client.markRouteSent(target.ID)
+	client.recordDataTX([]relay.Target{target}, len(payload))
+	client.dispatcher.Send(framePayload, target)
 }
 
 func (client *Client) retryAdaptiveData(now int64) {
@@ -506,6 +526,7 @@ func (client *Client) retryAdaptiveData(now int64) {
 		for _, target := range targets {
 			pathIDs = append(pathIDs, target.ID)
 			client.markRouteSent(target.ID)
+			client.recordDataTX([]relay.Target{target}, stats.AdaptiveDataPayloadSize(record.Payload))
 			client.dispatcher.Send(record.Payload, target)
 		}
 		client.tracker.UpdatePaths(record.ID, pathIDs)
@@ -520,6 +541,7 @@ func (client *Client) sendKeepaliveToRoutes(now int64) {
 			continue
 		}
 		client.tracker.Track(transport.PendingRecord{ID: id, PathID: target.ID, SentAt: now, TimeoutMillis: client.pathRTO(target.ID), Payload: payload})
+		client.recordControlTX([]relay.Target{target}, len(payload))
 		client.dispatcher.Send(payload, target)
 	}
 }
@@ -533,6 +555,7 @@ func (client *Client) writeBackAdaptive(route *sendRoute, packets []udp.Packet, 
 		if err != nil {
 			if errors.Is(err, transport.ErrNotFrame) || len(packet.Payload) > transport.MaxPayloadSize || !client.pathConfirmed(route.ifName, now) {
 				if wgAddr := client.getWireGuardAddr(); wgAddr != nil {
+					route.traffic.Data.RecordRX(len(packet.Payload))
 					writeBatch = append(writeBatch, udp.Packet{Payload: packet.Payload, Addr: wgAddr})
 				}
 			}
@@ -541,14 +564,21 @@ func (client *Client) writeBackAdaptive(route *sendRoute, packets []udp.Packet, 
 		client.markPathSeen(route.ifName, now)
 		switch frame.Type {
 		case transport.FrameProbe, transport.FrameKeepalive:
+			route.traffic.Control.RecordRX(len(packet.Payload))
 			ackType := transport.FrameProbeAck
 			if frame.Type == transport.FrameKeepalive {
 				ackType = transport.FrameKeepaliveAck
 			}
 			client.sendControlFrame(route, ackType, frame.ID, frame.SentAt)
 		case transport.FrameProbeAck, transport.FrameKeepaliveAck:
-			client.markPathSuccess(route.ifName, now, now-frame.SentAt)
+			route.traffic.Control.RecordRX(len(packet.Payload))
+			if record, ok := client.tracker.Complete(frame.ID); ok {
+				client.markPathSuccess(route.ifName, now, now-record.SentAt)
+			} else {
+				client.markPathSuccess(route.ifName, now, now-frame.SentAt)
+			}
 		case transport.FrameAck:
+			route.traffic.Control.RecordRX(len(packet.Payload))
 			if record, ok := client.tracker.Complete(frame.ID); ok {
 				client.markPathSuccess(route.ifName, now, now-record.SentAt)
 			}
@@ -558,6 +588,7 @@ func (client *Client) writeBackAdaptive(route *sendRoute, packets []udp.Packet, 
 				continue
 			}
 			if wgAddr := client.getWireGuardAddr(); wgAddr != nil {
+				route.traffic.Data.RecordRX(len(frame.Payload))
 				writeBatch = append(writeBatch, udp.Packet{Payload: frame.Payload, Addr: wgAddr})
 			}
 		}
@@ -572,6 +603,7 @@ func (client *Client) sendControlFrame(route *sendRoute, frameType transport.Fra
 	if err != nil {
 		return
 	}
+	route.traffic.Control.RecordTX(len(payload))
 	client.dispatcher.Send(payload, relay.Target{ID: route.ifName, Conn: route.socket, Addr: route.dstAddr})
 }
 
@@ -607,6 +639,50 @@ func (client *Client) adaptiveRouteTargets(now int64, eligibleOnly bool) []relay
 	return eligible
 }
 
+func (client *Client) refreshPrimaryPath(now int64) {
+	candidates := client.routeIDsSorted()
+	client.pathStatsMu.Lock()
+	statsSnapshot := client.pathStatsSnapshotLocked()
+	current := client.primaryPathID
+	client.primaryPathID = transport.SelectPrimaryPath(current, candidates, statsSnapshot, now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
+	client.pathStatsMu.Unlock()
+}
+
+func (client *Client) primaryRouteTarget(now int64) (relay.Target, bool) {
+	client.pathStatsMu.Lock()
+	primaryID := client.primaryPathID
+	stats := client.pathStats[primaryID]
+	eligible := primaryID != "" && stats != nil && stats.Eligible(now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
+	client.pathStatsMu.Unlock()
+	if !eligible {
+		return relay.Target{}, false
+	}
+	client.routesMu.RLock()
+	route := client.routes[primaryID]
+	client.routesMu.RUnlock()
+	if route == nil {
+		return relay.Target{}, false
+	}
+	return relay.Target{ID: primaryID, Conn: route.socket, Addr: route.dstAddr}, true
+}
+
+func (client *Client) currentPrimaryPathID() string {
+	client.pathStatsMu.Lock()
+	defer client.pathStatsMu.Unlock()
+	return client.primaryPathID
+}
+
+func (client *Client) routeIDsSorted() []string {
+	client.routesMu.RLock()
+	defer client.routesMu.RUnlock()
+	ids := make([]string, 0, len(client.routes))
+	for id := range client.routes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func (client *Client) routeTargetsSorted(markSent bool) []relay.Target {
 	client.routesMu.RLock()
 	defer client.routesMu.RUnlock()
@@ -631,6 +707,34 @@ func (client *Client) markRouteSent(ifName string) {
 	}
 }
 
+func (client *Client) recordDataTXBatch(targets []relay.Target, payloads [][]byte) {
+	for _, payload := range payloads {
+		client.recordDataTX(targets, len(payload))
+	}
+}
+
+func (client *Client) recordDataTX(targets []relay.Target, payloadSize int) {
+	for _, target := range targets {
+		client.routesMu.RLock()
+		route := client.routes[target.ID]
+		client.routesMu.RUnlock()
+		if route != nil {
+			route.traffic.Data.RecordTX(payloadSize)
+		}
+	}
+}
+
+func (client *Client) recordControlTX(targets []relay.Target, payloadSize int) {
+	for _, target := range targets {
+		client.routesMu.RLock()
+		route := client.routes[target.ID]
+		client.routesMu.RUnlock()
+		if route != nil {
+			route.traffic.Control.RecordTX(payloadSize)
+		}
+	}
+}
+
 func (client *Client) markPathSeen(ifName string, now int64) {
 	client.pathStatsMu.Lock()
 	defer client.pathStatsMu.Unlock()
@@ -643,6 +747,7 @@ func (client *Client) markPathSeen(ifName string, now int64) {
 }
 
 func (client *Client) markPathSuccess(ifName string, now int64, rtt int64) {
+	candidates := client.routeIDsSorted()
 	client.pathStatsMu.Lock()
 	defer client.pathStatsMu.Unlock()
 	stats := client.pathStats[ifName]
@@ -651,12 +756,14 @@ func (client *Client) markPathSuccess(ifName string, now int64, rtt int64) {
 		client.pathStats[ifName] = stats
 	}
 	stats.MarkSuccess(now, rtt)
+	client.primaryPathID = transport.SelectPrimaryPath(client.primaryPathID, candidates, client.pathStatsSnapshotLocked(), now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
 }
 
 func (client *Client) markPathFailure(ifName string, now int64) {
 	if !client.hasRoute(ifName) {
 		return
 	}
+	candidates := client.routeIDsSorted()
 	client.pathStatsMu.Lock()
 	defer client.pathStatsMu.Unlock()
 	stats := client.pathStats[ifName]
@@ -665,6 +772,17 @@ func (client *Client) markPathFailure(ifName string, now int64) {
 		client.pathStats[ifName] = stats
 	}
 	stats.MarkFailure(now)
+	client.primaryPathID = transport.SelectPrimaryPath(client.primaryPathID, candidates, client.pathStatsSnapshotLocked(), now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
+}
+
+func (client *Client) pathStatsSnapshotLocked() map[string]transport.PathStats {
+	snapshot := make(map[string]transport.PathStats, len(client.pathStats))
+	for id, stats := range client.pathStats {
+		if stats != nil {
+			snapshot[id] = *stats
+		}
+	}
+	return snapshot
 }
 
 func (client *Client) pathConfirmed(ifName string, now int64) bool {
@@ -685,6 +803,30 @@ func (client *Client) pathRTO(ifName string) int64 {
 		return client.minAckTimeoutMillis()
 	}
 	return stats.RTO(client.minAckTimeoutMillis(), client.maxAckTimeoutMillis())
+}
+
+func (client *Client) pathStatus(ifName string, now int64) *control.PathStatus {
+	client.pathStatsMu.Lock()
+	defer client.pathStatsMu.Unlock()
+	stats := client.pathStats[ifName]
+	if stats == nil {
+		return nil
+	}
+	status := &control.PathStatus{
+		SmoothedRTTMillis: stats.SmoothedRTT,
+		RTTVarianceMillis: stats.RTTVariance,
+		Failures:          stats.Failures,
+		Eligible:          stats.Eligible(now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond),
+	}
+	if stats.LastSeen > 0 {
+		lastSeen := now - stats.LastSeen
+		status.LastSeen = &lastSeen
+	}
+	if stats.LastSuccess > 0 {
+		lastSuccess := now - stats.LastSuccess
+		status.LastSuccess = &lastSuccess
+	}
+	return status
 }
 
 func (client *Client) minAckTimeoutMillis() int64 {
@@ -741,6 +883,9 @@ func (client *Client) removeRoute(ifName string) {
 func (client *Client) removePathStats(ifName string) {
 	client.pathStatsMu.Lock()
 	delete(client.pathStats, ifName)
+	if client.primaryPathID == ifName {
+		client.primaryPathID = ""
+	}
 	client.pathStatsMu.Unlock()
 }
 

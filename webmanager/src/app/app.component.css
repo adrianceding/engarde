@@ -94,12 +94,77 @@
     margin-left: 4px;
 }
 
+.primary-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 6px;
+    border: 1px solid #00bfa5;
+    border-radius: 4px;
+    color: #00897b;
+    font-size: .55em;
+    font-weight: 600;
+    line-height: 1.4;
+    text-transform: uppercase;
+    vertical-align: middle;
+}
+
 .last-received {
     margin-bottom: 20px;
 }
 
 .other-infos {
     display: block;
+    font-weight: 300;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(150px, 1fr));
+    gap: 10px;
+    margin-top: 18px;
+}
+
+.stat-block {
+    border: 1px solid #e0e0e0;
+    border-left-width: 4px;
+    border-radius: 4px;
+    padding: 8px 10px;
+    min-width: 0;
+}
+
+.stat-data {
+    border-left-color: #00bfa5;
+}
+
+.stat-control {
+    border-left-color: #03A9F4;
+}
+
+.stat-label {
+    color: #666;
+    font-size: .75em;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.stat-value {
+    font-size: .9em;
+    font-weight: 300;
+    margin-top: 4px;
+    overflow-wrap: anywhere;
+}
+
+.stats-muted {
+    opacity: .75;
+}
+
+.path-status {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 14px;
+    color: #666;
+    font-size: .85em;
     font-weight: 300;
 }
 
@@ -110,6 +175,9 @@
 @media(max-width: 600px) {
     .card {
         margin: 40px;
+    }
+    .stats-grid {
+        grid-template-columns: 1fr;
     }
     body {
         margin: 5px;

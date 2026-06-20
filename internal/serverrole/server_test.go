@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"net"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -35,6 +36,7 @@ type fakeUDPRead struct {
 }
 
 type fakeUDPSocket struct {
+	mu              sync.Mutex
 	readItems       chan fakeUDPRead
 	closed          chan struct{}
 	writeErr        error
@@ -61,11 +63,15 @@ func (socket *fakeUDPSocket) ReadFromUDP(buffer []byte) (int, *net.UDPAddr, erro
 func (socket *fakeUDPSocket) SetWriteDeadline(time.Time) error { return nil }
 
 func (socket *fakeUDPSocket) SetWriteBuffer(size int) error {
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
 	socket.writeBufferSize = size
 	return nil
 }
 
 func (socket *fakeUDPSocket) WriteToUDP(payload []byte, addr *net.UDPAddr) (int, error) {
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
 	if socket.writeErr != nil {
 		return 0, socket.writeErr
 	}
@@ -83,7 +89,25 @@ func (socket *fakeUDPSocket) Close() error {
 }
 
 func (socket *fakeUDPSocket) writtenCount() int {
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
 	return len(socket.writtenPayloads)
+}
+
+func (socket *fakeUDPSocket) writtenSnapshot() [][]byte {
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	payloads := make([][]byte, 0, len(socket.writtenPayloads))
+	for _, payload := range socket.writtenPayloads {
+		payloads = append(payloads, append([]byte(nil), payload...))
+	}
+	return payloads
+}
+
+func (socket *fakeUDPSocket) writeBuffer() int {
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	return socket.writeBufferSize
 }
 
 func TestStatusIncludesLearnedClient(t *testing.T) {
@@ -91,6 +115,13 @@ func TestStatusIncludesLearnedClient(t *testing.T) {
 	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 5000}
 
 	server.learnClient(addr)
+	client := server.clients[addr.String()]
+	client.traffic.Data.RecordRX(100)
+	client.traffic.Data.RecordTX(200)
+	client.traffic.Control.RecordTX(36)
+	pathNow := transport.NowMillis()
+	server.pathStats[addr.String()] = &transport.PathStats{ID: addr.String(), LastSeen: pathNow - 80, LastSuccess: pathNow - 40, SmoothedRTT: 16, RTTVariance: 4, Failures: 2}
+	server.primaryPathID = addr.String()
 	statusValue, err := server.Status()
 	if err != nil {
 		t.Fatalf("Status returned error: %v", err)
@@ -106,8 +137,17 @@ func TestStatusIncludesLearnedClient(t *testing.T) {
 	if len(status.Sockets) != 1 {
 		t.Fatalf("len(Sockets) = %d, want 1", len(status.Sockets))
 	}
-	if status.Sockets[0].Address != addr.String() || status.Sockets[0].Last == nil {
+	if status.Sockets[0].Address != addr.String() || status.Sockets[0].Last == nil || !status.Sockets[0].Primary {
 		t.Fatalf("socket status = %#v", status.Sockets[0])
+	}
+	if status.Sockets[0].Traffic.Data.RXPackets != 1 || status.Sockets[0].Traffic.Data.RXBytes != 100 || status.Sockets[0].Traffic.Data.TXPackets != 1 || status.Sockets[0].Traffic.Data.TXBytes != 200 {
+		t.Fatalf("data traffic = %#v", status.Sockets[0].Traffic.Data)
+	}
+	if status.Sockets[0].Traffic.Control.TXPackets != 1 || status.Sockets[0].Traffic.Control.TXBytes != 36 {
+		t.Fatalf("control traffic = %#v", status.Sockets[0].Traffic.Control)
+	}
+	if status.Sockets[0].Path == nil || status.Sockets[0].Path.SmoothedRTTMillis != 16 || status.Sockets[0].Path.Failures != 2 || status.Sockets[0].Path.LastSeen == nil || status.Sockets[0].Path.LastSuccess == nil {
+		t.Fatalf("path status = %#v", status.Sockets[0].Path)
 	}
 }
 
@@ -186,8 +226,8 @@ func TestUpdateWireGuardWriteBufferTracksClients(t *testing.T) {
 	server.wgSocket = wgSocket
 
 	server.updateWireGuardWriteBuffer()
-	if wgSocket.writeBufferSize != relay.DefaultWriteBufferBytes {
-		t.Fatalf("initial write buffer = %d, want %d", wgSocket.writeBufferSize, relay.DefaultWriteBufferBytes)
+	if got := wgSocket.writeBuffer(); got != relay.DefaultWriteBufferBytes {
+		t.Fatalf("initial write buffer = %d, want %d", got, relay.DefaultWriteBufferBytes)
 	}
 
 	first := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 41), Port: 5005}
@@ -196,13 +236,13 @@ func TestUpdateWireGuardWriteBufferTracksClients(t *testing.T) {
 	server.clients[second.String()] = &connectedClient{addr: second}
 	server.updateWireGuardWriteBuffer()
 	want := relay.DefaultWriteBufferBytes + relay.DefaultWriteBufferTargetBytes
-	if wgSocket.writeBufferSize != want {
-		t.Fatalf("two-client write buffer = %d, want %d", wgSocket.writeBufferSize, want)
+	if got := wgSocket.writeBuffer(); got != want {
+		t.Fatalf("two-client write buffer = %d, want %d", got, want)
 	}
 
 	server.removeClient(second.String())
-	if wgSocket.writeBufferSize != relay.DefaultWriteBufferBytes {
-		t.Fatalf("one-client write buffer = %d, want %d", wgSocket.writeBufferSize, relay.DefaultWriteBufferBytes)
+	if got := wgSocket.writeBuffer(); got != relay.DefaultWriteBufferBytes {
+		t.Fatalf("one-client write buffer = %d, want %d", got, relay.DefaultWriteBufferBytes)
 	}
 }
 
@@ -479,11 +519,19 @@ func TestReceiveFromClientAdaptiveDataAckAndDuplicateSuppression(t *testing.T) {
 		t.Fatal("receiveFromClient did not stop")
 	}
 
-	if wgSocket.writtenCount() != 1 || string(wgSocket.writtenPayloads[0]) != "inner" {
-		t.Fatalf("WireGuard writes = %#v", wgSocket.writtenPayloads)
+	wgPayloads := wgSocket.writtenSnapshot()
+	if len(wgPayloads) != 1 || string(wgPayloads[0]) != "inner" {
+		t.Fatalf("WireGuard writes = %#v", wgPayloads)
 	}
 	if clientSocket.writtenCount() < 2 {
 		t.Fatalf("ACK writes = %d, want at least 2", clientSocket.writtenCount())
+	}
+	traffic := server.clients[clientAddr.String()].traffic.Snapshot()
+	if traffic.Data.RXPackets != 1 || traffic.Data.RXBytes != uint64(len("inner")) {
+		t.Fatalf("adaptive data RX traffic = %#v", traffic.Data)
+	}
+	if traffic.Control.TXPackets != 2 {
+		t.Fatalf("adaptive control TX traffic = %#v", traffic.Control)
 	}
 }
 
@@ -503,6 +551,96 @@ func TestServerAdaptiveKeepaliveTracksPending(t *testing.T) {
 	due := server.tracker.Due(200, 50, 1000, 1)
 	if len(due) != 1 || due[0].PathID != addr.String() {
 		t.Fatalf("due keepalive = %#v", due)
+	}
+}
+
+func TestServerAdaptiveKeepaliveAckCompletesPending(t *testing.T) {
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive}, ClientTimeout: 30}, "", nil)
+	clientSocket := newFakeUDPSocket()
+	server.clientSocket = clientSocket
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 61), Port: 5061}
+	client := &connectedClient{addr: addr}
+	client.last.Store(time.Now().Unix())
+	server.clients[addr.String()] = client
+	server.sendKeepaliveToClients(100)
+	time.Sleep(20 * time.Millisecond)
+	payloads := clientSocket.writtenSnapshot()
+	if len(payloads) != 1 {
+		t.Fatalf("keepalive writes = %d, want 1", len(payloads))
+	}
+	frame, err := transport.Decode(payloads[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackPayload, err := transport.Encode(transport.Frame{Type: transport.FrameKeepaliveAck, ID: frame.ID, SentAt: frame.SentAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBatch := make([]udp.Packet, 0, 1)
+	server.handleAdaptiveFromClient(udp.Packet{Payload: ackPayload}, addr, time.Now().Unix(), 120, &writeBatch)
+	if _, ok := server.tracker.Complete(frame.ID); ok {
+		t.Fatal("keepalive pending record was not completed by ACK")
+	}
+	if due := server.tracker.Due(200, 50, 1000, 1); len(due) != 0 {
+		t.Fatalf("ACKed keepalive was retried: %#v", due)
+	}
+}
+
+func TestServerAdaptiveDataUsesCachedPrimaryPath(t *testing.T) {
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}, ClientTimeout: 30}, "", nil)
+	clientSocket := newFakeUDPSocket()
+	server.clientSocket = clientSocket
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 70), Port: 5070}
+	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 71), Port: 5071}
+	nowUnix := time.Now().Unix()
+	server.clients[firstAddr.String()] = &connectedClient{addr: firstAddr}
+	server.clients[firstAddr.String()].last.Store(nowUnix)
+	server.clients[secondAddr.String()] = &connectedClient{addr: secondAddr}
+	server.clients[secondAddr.String()].last.Store(nowUnix)
+	now := transport.NowMillis()
+	server.pathStats[firstAddr.String()] = &transport.PathStats{ID: firstAddr.String(), LastSuccess: now, SmoothedRTT: 100}
+	server.pathStats[secondAddr.String()] = &transport.PathStats{ID: secondAddr.String(), LastSuccess: now, SmoothedRTT: 90}
+	server.primaryPathID = firstAddr.String()
+
+	server.sendAdaptiveData([]byte("inner"))
+	time.Sleep(20 * time.Millisecond)
+
+	if clientSocket.writtenCount() != 1 {
+		t.Fatalf("client socket writes = %d, want 1", clientSocket.writtenCount())
+	}
+	payloads := clientSocket.writtenSnapshot()
+	frame, err := transport.Decode(payloads[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(frame.Payload) != "inner" {
+		t.Fatalf("payload = %q, want inner", string(frame.Payload))
+	}
+}
+
+func TestServerRefreshPrimaryPathRequiresSignificantRTTImprovement(t *testing.T) {
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}, ClientTimeout: 30}, "", nil)
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 72), Port: 5072}
+	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 73), Port: 5073}
+	nowUnix := time.Now().Unix()
+	server.clients[firstAddr.String()] = &connectedClient{addr: firstAddr}
+	server.clients[firstAddr.String()].last.Store(nowUnix)
+	server.clients[secondAddr.String()] = &connectedClient{addr: secondAddr}
+	server.clients[secondAddr.String()].last.Store(nowUnix)
+	now := transport.NowMillis()
+	server.pathStats[firstAddr.String()] = &transport.PathStats{ID: firstAddr.String(), LastSuccess: now, SmoothedRTT: 100}
+	server.pathStats[secondAddr.String()] = &transport.PathStats{ID: secondAddr.String(), LastSuccess: now, SmoothedRTT: 90}
+	server.primaryPathID = firstAddr.String()
+
+	server.refreshPrimaryPath(now)
+	if server.primaryPathID != firstAddr.String() {
+		t.Fatalf("primary after small RTT change = %q, want %q", server.primaryPathID, firstAddr.String())
+	}
+
+	server.pathStats[secondAddr.String()].SmoothedRTT = 70
+	server.refreshPrimaryPath(now)
+	if server.primaryPathID != secondAddr.String() {
+		t.Fatalf("primary after significant RTT change = %q, want %q", server.primaryPathID, secondAddr.String())
 	}
 }
 

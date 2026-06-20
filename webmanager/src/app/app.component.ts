@@ -7,6 +7,7 @@ import { MatDialog, MatDialogRef } from '@angular/material/dialog';
 import { getSlideOutAnimation } from './animations/slideout.animation';
 import { DialogComponent } from './components/dialog/dialog.component';
 import { RespModel } from './models/resp.model';
+import { PathStatus, TrafficStats } from './models/traffic.model';
 
 @Component({
     selector: 'app-root',
@@ -95,6 +96,54 @@ export class AppComponent {
 
   trackByAddress(index, iface) {
     return iface.address;
+  }
+
+  emptyTraffic(): TrafficStats {
+    return {
+      data: { rxPackets: 0, rxBytes: 0, txPackets: 0, txBytes: 0 },
+      control: { rxPackets: 0, rxBytes: 0, txPackets: 0, txBytes: 0 },
+    };
+  }
+
+  traffic(item: IfaceModel | SocketModel): TrafficStats {
+    return item && item.traffic ? item.traffic : this.emptyTraffic();
+  }
+
+  formatBytes(bytes: number): string {
+    if (!bytes) {
+      return '0 B';
+    }
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value = value / 1024;
+      unit += 1;
+    }
+    return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
+  }
+
+  formatPackets(packets: number): string {
+    if (!packets) {
+      return '0 packets';
+    }
+    return `${packets} packet${packets == 1 ? '' : 's'}`;
+  }
+
+  formatPacketBytes(packets: number, bytes: number): string {
+    return `${this.formatPackets(packets)} / ${this.formatBytes(bytes)}`;
+  }
+
+  formatPathLast(milliseconds: number): string {
+    if (milliseconds === null || milliseconds === undefined) {
+      return '--';
+    }
+    const seconds = Math.floor(milliseconds / 1000);
+    return `${seconds} second${seconds == 1 ? '' : 's'} ago`;
+  }
+
+  hasPath(path: PathStatus): boolean {
+    return !!path;
   }
 
   toggleExclude(ifname: string) {

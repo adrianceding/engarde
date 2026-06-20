@@ -3,6 +3,10 @@
 /engarde
 /engarde.exe
 
+# Generated embedded web assets
+/internal/assets/browser/*
+!/internal/assets/browser/README.md
+
 # Local/editor noise
 .idea/
 .DS_Store

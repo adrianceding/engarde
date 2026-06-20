@@ -1,3 +1,5 @@
+import { PathStatus, TrafficStats } from './traffic.model';
+
 export interface IfaceModel {
     "name": string,
     "label"?: string,
@@ -5,4 +7,7 @@ export interface IfaceModel {
     "senderAddress": string,
     "dstAddress": string,
     "last": number,
+    "primary"?: boolean,
+    "traffic"?: TrafficStats,
+    "path"?: PathStatus,
 }
