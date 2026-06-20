@@ -70,7 +70,7 @@ type Client struct {
 
 	pathStatsMu   sync.Mutex
 	pathStats     map[string]*transport.PathStats
-	primaryPathID string
+	selection     transport.PathSelection
 	lastKeepalive atomic.Int64
 }
 
@@ -177,7 +177,7 @@ func (client *Client) Status() (any, error) {
 	}
 	now := time.Now().Unix()
 	routes := client.routeSnapshot()
-	primaryPathID := client.currentPrimaryPathID()
+	selection := client.currentPathSelection()
 	webInterfaces := make([]control.WebInterface, 0, len(interfaces))
 	for _, iface := range interfaces {
 		ifName := iface.Name
@@ -195,7 +195,7 @@ func (client *Client) Status() (any, error) {
 		webInterface.DstAddress = client.paths.Destination(ifName)
 		if route, ok := routes[ifName]; ok {
 			webInterface.Status = "active"
-			webInterface.Primary = ifName == primaryPathID
+			webInterface.PathRole = selection.Role(ifName)
 			webInterface.Traffic = route.traffic.Snapshot()
 			webInterface.Path = client.pathStatus(ifName, transport.NowMillis())
 			lastRec := route.lastRec.Load()
@@ -462,7 +462,7 @@ func (client *Client) maintainAdaptiveTransport() {
 		return
 	}
 	now := transport.NowMillis()
-	client.refreshPrimaryPath(now)
+	client.refreshPathSelection(now)
 	client.retryAdaptiveData(now)
 	lastKeepalive := client.lastKeepalive.Load()
 	if now-lastKeepalive >= client.cfg.Transfer.KeepaliveIntervalMillis && client.lastKeepalive.CompareAndSwap(lastKeepalive, now) {
@@ -486,12 +486,14 @@ func (client *Client) sendAdaptiveData(payload []byte) {
 		return
 	}
 	now := transport.NowMillis()
-	target, ok := client.primaryRouteTarget(now)
-	if !ok {
-		client.refreshPrimaryPath(now)
-		target, ok = client.primaryRouteTarget(now)
+	selection := client.currentPathSelection()
+	targets := client.firstRouteTargets(selection, now)
+	if len(targets) == 0 {
+		client.refreshPathSelection(now)
+		selection = client.currentPathSelection()
+		targets = client.firstRouteTargets(selection, now)
 	}
-	if !ok {
+	if len(targets) == 0 {
 		client.sendKeepaliveToRoutes(now)
 		fallbackTargets := client.routeTargets()
 		client.recordDataTX(fallbackTargets, len(payload))
@@ -503,10 +505,13 @@ func (client *Client) sendAdaptiveData(payload []byte) {
 	if err != nil {
 		return
 	}
-	client.tracker.Track(transport.PendingRecord{ID: id, PathID: target.ID, SentAt: now, TimeoutMillis: client.pathRTO(target.ID), Payload: framePayload})
-	client.markRouteSent(target.ID)
-	client.recordDataTX([]relay.Target{target}, len(payload))
-	client.dispatcher.Send(framePayload, target)
+	pathIDs := targetIDs(targets)
+	client.tracker.Track(transport.PendingRecord{ID: id, PathID: pathIDs[0], PathIDs: pathIDs, AttemptPathIDs: pathIDs, FallbackPathIDs: selection.FallbackPathIDs, SentAt: now, TimeoutMillis: client.pathsRTO(pathIDs), Payload: framePayload})
+	for _, target := range targets {
+		client.markRouteSent(target.ID)
+		client.recordDataTX([]relay.Target{target}, len(payload))
+		client.dispatcher.Send(framePayload, target)
+	}
 }
 
 func (client *Client) retryAdaptiveData(now int64) {
@@ -514,22 +519,19 @@ func (client *Client) retryAdaptiveData(now int64) {
 	if len(due) == 0 {
 		return
 	}
-	targets := client.adaptiveRouteTargets(now, true)
-	if len(targets) == 0 {
-		targets = client.adaptiveRouteTargets(now, false)
-	}
 	for _, record := range due {
-		for _, pathID := range record.PathIDs {
+		for _, pathID := range record.AttemptPathIDs {
 			client.markPathFailure(pathID, now)
 		}
-		pathIDs := make([]string, 0, len(targets))
-		for _, target := range targets {
-			pathIDs = append(pathIDs, target.ID)
-			client.markRouteSent(target.ID)
-			client.recordDataTX([]relay.Target{target}, stats.AdaptiveDataPayloadSize(record.Payload))
-			client.dispatcher.Send(record.Payload, target)
+		target, ok := client.nextFallbackRouteTarget(record.PendingRecord, now)
+		if !ok {
+			client.tracker.Drop(record.ID)
+			continue
 		}
-		client.tracker.UpdatePaths(record.ID, pathIDs)
+		client.markRouteSent(target.ID)
+		client.recordDataTX([]relay.Target{target}, stats.AdaptiveDataPayloadSize(record.Payload))
+		client.dispatcher.Send(record.Payload, target)
+		client.tracker.RecordAttempt(record.ID, []string{target.ID})
 	}
 }
 
@@ -581,6 +583,8 @@ func (client *Client) writeBackAdaptive(route *sendRoute, packets []udp.Packet, 
 			route.traffic.Control.RecordRX(len(packet.Payload))
 			if record, ok := client.tracker.Complete(frame.ID); ok {
 				client.markPathSuccess(route.ifName, now, now-record.SentAt)
+			} else {
+				client.markPathSuccess(route.ifName, now, now-frame.SentAt)
 			}
 		case transport.FrameData:
 			client.sendControlFrame(route, transport.FrameAck, frame.ID, frame.SentAt)
@@ -639,37 +643,102 @@ func (client *Client) adaptiveRouteTargets(now int64, eligibleOnly bool) []relay
 	return eligible
 }
 
-func (client *Client) refreshPrimaryPath(now int64) {
+func (client *Client) refreshPathSelection(now int64) {
 	candidates := client.routeIDsSorted()
 	client.pathStatsMu.Lock()
 	statsSnapshot := client.pathStatsSnapshotLocked()
-	current := client.primaryPathID
-	client.primaryPathID = transport.SelectPrimaryPath(current, candidates, statsSnapshot, now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
+	client.selection = transport.SelectPathSelection(client.selection, candidates, statsSnapshot, now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
 	client.pathStatsMu.Unlock()
 }
 
-func (client *Client) primaryRouteTarget(now int64) (relay.Target, bool) {
-	client.pathStatsMu.Lock()
-	primaryID := client.primaryPathID
-	stats := client.pathStats[primaryID]
-	eligible := primaryID != "" && stats != nil && stats.Eligible(now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
-	client.pathStatsMu.Unlock()
-	if !eligible {
-		return relay.Target{}, false
+func (client *Client) firstRouteTargets(selection transport.PathSelection, now int64) []relay.Target {
+	return client.routeTargetsByID(selection.FirstPathIDs, now, true)
+}
+
+func (client *Client) nextFallbackRouteTarget(record transport.PendingRecord, now int64) (relay.Target, bool) {
+	selection := client.currentPathSelection()
+	pathIDs := mergeStrings(record.FallbackPathIDs, mergeStrings(selection.FirstPathIDs, selection.FallbackPathIDs))
+	for _, target := range client.routeTargetsByID(pathIDs, now, true) {
+		if !containsString(record.PathIDs, target.ID) {
+			return target, true
+		}
 	}
+	return relay.Target{}, false
+}
+
+func (client *Client) routeTargetsByID(pathIDs []string, now int64, requireEligible bool) []relay.Target {
+	if len(pathIDs) == 0 {
+		return nil
+	}
+	timeout := time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis) * time.Millisecond
+	targets := make([]relay.Target, 0, len(pathIDs))
 	client.routesMu.RLock()
-	route := client.routes[primaryID]
-	client.routesMu.RUnlock()
-	if route == nil {
-		return relay.Target{}, false
-	}
-	return relay.Target{ID: primaryID, Conn: route.socket, Addr: route.dstAddr}, true
-}
-
-func (client *Client) currentPrimaryPathID() string {
+	defer client.routesMu.RUnlock()
 	client.pathStatsMu.Lock()
 	defer client.pathStatsMu.Unlock()
-	return client.primaryPathID
+	for _, pathID := range pathIDs {
+		if requireEligible {
+			stats := client.pathStats[pathID]
+			if stats == nil || !stats.Eligible(now, timeout) {
+				continue
+			}
+		}
+		route := client.routes[pathID]
+		if route == nil {
+			continue
+		}
+		targets = append(targets, relay.Target{ID: pathID, Conn: route.socket, Addr: route.dstAddr})
+	}
+	return targets
+}
+
+func (client *Client) currentPathSelection() transport.PathSelection {
+	client.pathStatsMu.Lock()
+	defer client.pathStatsMu.Unlock()
+	return transport.PathSelection{FirstPathIDs: append([]string(nil), client.selection.FirstPathIDs...), FallbackPathIDs: append([]string(nil), client.selection.FallbackPathIDs...), FirstPathCountChangedAt: client.selection.FirstPathCountChangedAt}
+}
+
+func targetIDs(targets []relay.Target) []string {
+	ids := make([]string, 0, len(targets))
+	for _, target := range targets {
+		ids = append(ids, target.ID)
+	}
+	return ids
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeStrings(first []string, second []string) []string {
+	merged := make([]string, 0, len(first)+len(second))
+	seen := make(map[string]struct{}, len(first)+len(second))
+	for _, value := range first {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		merged = append(merged, value)
+	}
+	for _, value := range second {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		merged = append(merged, value)
+	}
+	return merged
 }
 
 func (client *Client) routeIDsSorted() []string {
@@ -756,7 +825,7 @@ func (client *Client) markPathSuccess(ifName string, now int64, rtt int64) {
 		client.pathStats[ifName] = stats
 	}
 	stats.MarkSuccess(now, rtt)
-	client.primaryPathID = transport.SelectPrimaryPath(client.primaryPathID, candidates, client.pathStatsSnapshotLocked(), now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
+	client.selection = transport.SelectPathSelection(client.selection, candidates, client.pathStatsSnapshotLocked(), now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
 }
 
 func (client *Client) markPathFailure(ifName string, now int64) {
@@ -772,7 +841,7 @@ func (client *Client) markPathFailure(ifName string, now int64) {
 		client.pathStats[ifName] = stats
 	}
 	stats.MarkFailure(now)
-	client.primaryPathID = transport.SelectPrimaryPath(client.primaryPathID, candidates, client.pathStatsSnapshotLocked(), now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
+	client.selection = transport.SelectPathSelection(client.selection, candidates, client.pathStatsSnapshotLocked(), now, time.Duration(client.cfg.Transfer.KeepaliveTimeoutMillis)*time.Millisecond)
 }
 
 func (client *Client) pathStatsSnapshotLocked() map[string]transport.PathStats {
@@ -803,6 +872,17 @@ func (client *Client) pathRTO(ifName string) int64 {
 		return client.minAckTimeoutMillis()
 	}
 	return stats.RTO(client.minAckTimeoutMillis(), client.maxAckTimeoutMillis())
+}
+
+func (client *Client) pathsRTO(pathIDs []string) int64 {
+	timeoutMillis := client.minAckTimeoutMillis()
+	for _, pathID := range pathIDs {
+		pathTimeoutMillis := client.pathRTO(pathID)
+		if pathTimeoutMillis > timeoutMillis {
+			timeoutMillis = pathTimeoutMillis
+		}
+	}
+	return timeoutMillis
 }
 
 func (client *Client) pathStatus(ifName string, now int64) *control.PathStatus {
@@ -883,9 +963,7 @@ func (client *Client) removeRoute(ifName string) {
 func (client *Client) removePathStats(ifName string) {
 	client.pathStatsMu.Lock()
 	delete(client.pathStats, ifName)
-	if client.primaryPathID == ifName {
-		client.primaryPathID = ""
-	}
+	client.selection = client.selection.Without(ifName)
 	client.pathStatsMu.Unlock()
 }
 

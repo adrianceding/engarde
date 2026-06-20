@@ -237,7 +237,7 @@ func TestClientStatusIncludesActiveRoute(t *testing.T) {
 	route.traffic.Control.RecordRX(36)
 	pathNow := transport.NowMillis()
 	client.pathStats[ifName] = &transport.PathStats{ID: ifName, LastSeen: pathNow - 50, LastSuccess: pathNow - 25, SmoothedRTT: 12, RTTVariance: 3, Failures: 1}
-	client.primaryPathID = ifName
+	client.selection = transport.PathSelection{FirstPathIDs: []string{ifName}}
 	client.routes[ifName] = route
 
 	statusValue, err := client.Status()
@@ -256,7 +256,7 @@ func TestClientStatusIncludesActiveRoute(t *testing.T) {
 		if webInterface.Name != ifName {
 			continue
 		}
-		if webInterface.Status != "active" || webInterface.DstAddress != "198.51.100.1:59501" || webInterface.Last == nil || !webInterface.Primary {
+		if webInterface.Status != "active" || webInterface.DstAddress != "198.51.100.1:59501" || webInterface.Last == nil || webInterface.PathRole != transport.PathRoleFirst {
 			t.Fatalf("interface status = %#v", webInterface)
 		}
 		if webInterface.Traffic.Data.RXPackets != 1 || webInterface.Traffic.Data.RXBytes != 120 || webInterface.Traffic.Data.TXPackets != 1 || webInterface.Traffic.Data.TXBytes != 240 {
@@ -860,16 +860,19 @@ func TestClientAdaptiveKeepaliveAckCompletesPending(t *testing.T) {
 	}
 }
 
-func TestClientAdaptiveDataUsesCachedPrimaryPath(t *testing.T) {
+func TestClientAdaptiveDataUsesCachedFirstPaths(t *testing.T) {
 	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}}, "", nil)
 	firstSocket := newFakeUDPSocket()
 	secondSocket := newFakeUDPSocket()
+	thirdSocket := newFakeUDPSocket()
 	client.routes["eth0"] = &sendRoute{ifName: "eth0", socket: firstSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
 	client.routes["eth1"] = &sendRoute{ifName: "eth1", socket: secondSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9002}}
+	client.routes["eth2"] = &sendRoute{ifName: "eth2", socket: thirdSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9003}}
 	now := transport.NowMillis()
 	client.pathStats["eth0"] = &transport.PathStats{ID: "eth0", LastSuccess: now, SmoothedRTT: 100}
 	client.pathStats["eth1"] = &transport.PathStats{ID: "eth1", LastSuccess: now, SmoothedRTT: 90}
-	client.primaryPathID = "eth0"
+	client.pathStats["eth2"] = &transport.PathStats{ID: "eth2", LastSuccess: now, SmoothedRTT: 80}
+	client.selection = transport.PathSelection{FirstPathIDs: []string{"eth0", "eth1"}, FallbackPathIDs: []string{"eth2"}}
 
 	client.sendAdaptiveData([]byte("inner"))
 	time.Sleep(20 * time.Millisecond)
@@ -877,30 +880,160 @@ func TestClientAdaptiveDataUsesCachedPrimaryPath(t *testing.T) {
 	if firstSocket.writtenCount() != 1 {
 		t.Fatalf("eth0 writes = %d, want 1", firstSocket.writtenCount())
 	}
-	if secondSocket.writtenCount() != 0 {
-		t.Fatalf("eth1 writes = %d, want 0", secondSocket.writtenCount())
+	if secondSocket.writtenCount() != 1 {
+		t.Fatalf("eth1 writes = %d, want 1", secondSocket.writtenCount())
+	}
+	if thirdSocket.writtenCount() != 0 {
+		t.Fatalf("eth2 writes = %d, want 0", thirdSocket.writtenCount())
 	}
 }
 
-func TestClientRefreshPrimaryPathRequiresSignificantRTTImprovement(t *testing.T) {
+func TestClientRefreshPathSelectionRequiresSignificantImprovement(t *testing.T) {
 	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}}, "", nil)
 	client.routes["eth0"] = &sendRoute{ifName: "eth0", socket: newFakeUDPSocket(), dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
 	client.routes["eth1"] = &sendRoute{ifName: "eth1", socket: newFakeUDPSocket(), dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9002}}
 	now := transport.NowMillis()
 	client.pathStats["eth0"] = &transport.PathStats{ID: "eth0", LastSuccess: now, SmoothedRTT: 100}
 	client.pathStats["eth1"] = &transport.PathStats{ID: "eth1", LastSuccess: now, SmoothedRTT: 90}
-	client.primaryPathID = "eth0"
+	client.selection = transport.PathSelection{FirstPathIDs: []string{"eth0"}}
 
-	client.refreshPrimaryPath(now)
-	if client.primaryPathID != "eth0" {
-		t.Fatalf("primary after small RTT change = %q, want eth0", client.primaryPathID)
+	client.refreshPathSelection(now)
+	if got := client.selection.FirstPathIDs; len(got) != 1 || got[0] != "eth0" {
+		t.Fatalf("first paths after small RTT change = %#v, want eth0", got)
 	}
 
 	client.pathStats["eth1"].SmoothedRTT = 70
-	client.refreshPrimaryPath(now)
-	if client.primaryPathID != "eth1" {
-		t.Fatalf("primary after significant RTT change = %q, want eth1", client.primaryPathID)
+	client.refreshPathSelection(now)
+	if got := client.selection.FirstPathIDs; len(got) != 1 || got[0] != "eth1" {
+		t.Fatalf("first paths after significant RTT change = %#v, want eth1", got)
 	}
+}
+
+func TestClientRetryUsesOnlyUnsentFallbackPath(t *testing.T) {
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10, KeepaliveTimeoutMillis: 1000, MaxRetries: intPtr(2)}}, "", nil)
+	firstSocket := newFakeUDPSocket()
+	secondSocket := newFakeUDPSocket()
+	thirdSocket := newFakeUDPSocket()
+	client.routes["eth0"] = &sendRoute{ifName: "eth0", socket: firstSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
+	client.routes["eth1"] = &sendRoute{ifName: "eth1", socket: secondSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9002}}
+	client.routes["eth2"] = &sendRoute{ifName: "eth2", socket: thirdSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9003}}
+	now := int64(100)
+	for _, id := range []string{"eth0", "eth1", "eth2"} {
+		client.pathStats[id] = &transport.PathStats{ID: id, LastSuccess: now, SmoothedRTT: 50}
+	}
+	id := client.tracker.NextID()
+	client.tracker.Track(transport.PendingRecord{ID: id, PathID: "eth0", PathIDs: []string{"eth0", "eth1"}, AttemptPathIDs: []string{"eth0", "eth1"}, FallbackPathIDs: []string{"eth2"}, SentAt: 0, TimeoutMillis: 10, Payload: []byte("payload")})
+
+	client.retryAdaptiveData(now)
+	time.Sleep(20 * time.Millisecond)
+
+	if firstSocket.writtenCount() != 0 || secondSocket.writtenCount() != 0 {
+		t.Fatalf("first path retry writes = eth0:%d eth1:%d, want 0", firstSocket.writtenCount(), secondSocket.writtenCount())
+	}
+	if thirdSocket.writtenCount() != 1 {
+		t.Fatalf("fallback writes = %d, want 1", thirdSocket.writtenCount())
+	}
+	record, ok := client.tracker.Get(id)
+	if !ok {
+		t.Fatal("pending record missing")
+	}
+	if got, want := record.PathIDs, []string{"eth0", "eth1", "eth2"}; !sameStrings(got, want) {
+		t.Fatalf("PathIDs = %#v, want %#v", got, want)
+	}
+	if got, want := record.AttemptPathIDs, []string{"eth2"}; !sameStrings(got, want) {
+		t.Fatalf("AttemptPathIDs = %#v, want %#v", got, want)
+	}
+}
+
+func TestClientRetryDropsWhenNoFallbackPath(t *testing.T) {
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10, KeepaliveTimeoutMillis: 1000, MaxRetries: intPtr(2)}}, "", nil)
+	firstSocket := newFakeUDPSocket()
+	client.routes["eth0"] = &sendRoute{ifName: "eth0", socket: firstSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
+	client.pathStats["eth0"] = &transport.PathStats{ID: "eth0", LastSuccess: 100, SmoothedRTT: 50}
+	client.selection = transport.PathSelection{FirstPathIDs: []string{"eth0"}}
+	id := client.tracker.NextID()
+	client.tracker.Track(transport.PendingRecord{ID: id, PathID: "eth0", PathIDs: []string{"eth0"}, AttemptPathIDs: []string{"eth0"}, SentAt: 0, TimeoutMillis: 10, Payload: []byte("payload")})
+
+	client.retryAdaptiveData(100)
+	time.Sleep(20 * time.Millisecond)
+
+	if firstSocket.writtenCount() != 0 {
+		t.Fatalf("first path retry writes = %d, want 0", firstSocket.writtenCount())
+	}
+	if _, ok := client.tracker.Get(id); ok {
+		t.Fatal("pending record was not dropped")
+	}
+}
+
+func TestClientRetryUsesCurrentFallbackPath(t *testing.T) {
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10, KeepaliveTimeoutMillis: 1000, MaxRetries: intPtr(2)}}, "", nil)
+	firstSocket := newFakeUDPSocket()
+	secondSocket := newFakeUDPSocket()
+	client.routes["eth0"] = &sendRoute{ifName: "eth0", socket: firstSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
+	client.routes["eth1"] = &sendRoute{ifName: "eth1", socket: secondSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9002}}
+	for _, id := range []string{"eth0", "eth1"} {
+		client.pathStats[id] = &transport.PathStats{ID: id, LastSuccess: 100, SmoothedRTT: 50}
+	}
+	client.selection = transport.PathSelection{FirstPathIDs: []string{"eth0"}, FallbackPathIDs: []string{"eth1"}}
+	id := client.tracker.NextID()
+	client.tracker.Track(transport.PendingRecord{ID: id, PathID: "eth0", PathIDs: []string{"eth0"}, AttemptPathIDs: []string{"eth0"}, SentAt: 0, TimeoutMillis: 10, Payload: []byte("payload")})
+
+	client.retryAdaptiveData(100)
+	time.Sleep(20 * time.Millisecond)
+
+	if firstSocket.writtenCount() != 0 {
+		t.Fatalf("first path retry writes = %d, want 0", firstSocket.writtenCount())
+	}
+	if secondSocket.writtenCount() != 1 {
+		t.Fatalf("current fallback writes = %d, want 1", secondSocket.writtenCount())
+	}
+}
+
+func TestClientAdaptiveDataTracksMaxFirstPathRTO(t *testing.T) {
+	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10, KeepaliveTimeoutMillis: 1000}}, "", nil)
+	firstSocket := newFakeUDPSocket()
+	secondSocket := newFakeUDPSocket()
+	client.routes["eth0"] = &sendRoute{ifName: "eth0", socket: firstSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9001}}
+	client.routes["eth1"] = &sendRoute{ifName: "eth1", socket: secondSocket, dstAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9002}}
+	now := transport.NowMillis()
+	client.pathStats["eth0"] = &transport.PathStats{ID: "eth0", LastSuccess: now, SmoothedRTT: 20, RTTVariance: 5}
+	client.pathStats["eth1"] = &transport.PathStats{ID: "eth1", LastSuccess: now, SmoothedRTT: 120, RTTVariance: 10}
+	client.selection = transport.PathSelection{FirstPathIDs: []string{"eth0", "eth1"}}
+
+	client.sendAdaptiveData([]byte("inner"))
+	time.Sleep(20 * time.Millisecond)
+
+	payloads := firstSocket.writtenSnapshot()
+	if len(payloads) != 1 {
+		t.Fatalf("eth0 writes = %d, want 1", len(payloads))
+	}
+	frame, err := transport.Decode(payloads[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, ok := client.tracker.Get(frame.ID)
+	if !ok {
+		t.Fatal("pending record missing")
+	}
+	if got, want := record.TimeoutMillis, int64(160); got != want {
+		t.Fatalf("TimeoutMillis = %d, want %d", got, want)
+	}
+}
+
+func intPtr(value int) *int {
+	return &value
+}
+
+func sameStrings(got []string, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestWriteBackAdaptiveInvalidFrameFallbackDependsOnConfirmation(t *testing.T) {

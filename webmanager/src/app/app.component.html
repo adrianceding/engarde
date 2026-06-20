@@ -21,7 +21,8 @@
             <mat-card class="card card-active">
               <mat-card-title class="title">
                 {{iface.label || iface.name}}@if (iface.label) { <span class="iface-name">({{iface.name}})</span>}
-                @if (iface.primary) { <span class="primary-badge">Primary</span> }
+                @if (iface.pathRole == 'first') { <span class="path-role-badge path-role-first">First</span> }
+                @if (iface.pathRole == 'fallback') { <span class="path-role-badge path-role-fallback">Fallback</span> }
               </mat-card-title>
               <mat-card-content>
                 <div class="text last-received"><strong>Last received packet: </strong>
@@ -177,7 +178,8 @@
           <mat-card class="card card-server">
             <mat-card-title class="title">
               {{ iface.address.split(":").slice(0, -1).join(":") }}<span class="port">:{{ iface.address.split(":").slice(-1) }}</span>
-              @if (iface.primary) { <span class="primary-badge">Primary</span> }
+              @if (iface.pathRole == 'first') { <span class="path-role-badge path-role-first">First</span> }
+              @if (iface.pathRole == 'fallback') { <span class="path-role-badge path-role-fallback">Fallback</span> }
             </mat-card-title>
             <mat-card-content>
               <div class="text last-received"><strong>Last received packet: </strong>

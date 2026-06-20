@@ -1,11 +1,11 @@
 package control
 
 type WebSocket struct {
-	Address string       `json:"address"`
-	Last    *int64       `json:"last"`
-	Primary bool         `json:"primary"`
-	Traffic TrafficStats `json:"traffic"`
-	Path    *PathStatus  `json:"path,omitempty"`
+	Address  string       `json:"address"`
+	Last     *int64       `json:"last"`
+	PathRole string       `json:"pathRole,omitempty"`
+	Traffic  TrafficStats `json:"traffic"`
+	Path     *PathStatus  `json:"path,omitempty"`
 }
 
 type WebInterface struct {
@@ -15,7 +15,7 @@ type WebInterface struct {
 	SenderAddress string       `json:"senderAddress"`
 	DstAddress    string       `json:"dstAddress"`
 	Last          *int64       `json:"last"`
-	Primary       bool         `json:"primary"`
+	PathRole      string       `json:"pathRole,omitempty"`
 	Traffic       TrafficStats `json:"traffic"`
 	Path          *PathStatus  `json:"path,omitempty"`
 }

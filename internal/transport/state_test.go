@@ -49,6 +49,43 @@ func TestPendingRingUpdatePaths(t *testing.T) {
 	}
 }
 
+func TestPendingRingDrop(t *testing.T) {
+	ring := NewPendingRing(2)
+	id := PacketID{Session: 1, Sequence: 1}
+	ring.Put(PendingRecord{ID: id, PathID: "eth0", Payload: []byte("first")})
+	if !ring.Drop(id) {
+		t.Fatal("Drop returned false")
+	}
+	if _, ok := ring.Get(id); ok {
+		t.Fatal("dropped packet was still pending")
+	}
+	if ring.Drop(id) {
+		t.Fatal("dropped packet dropped twice")
+	}
+}
+
+func TestPendingRingRecordAttemptTracksLatestAndAllPaths(t *testing.T) {
+	ring := NewPendingRing(2)
+	id := PacketID{Session: 1, Sequence: 1}
+	ring.Put(PendingRecord{ID: id, PathID: "eth0", PathIDs: []string{"eth0"}, AttemptPathIDs: []string{"eth0"}, FallbackPathIDs: []string{"eth1", "eth2"}, Payload: []byte("first")})
+	if !ring.RecordAttempt(id, []string{"eth1"}) {
+		t.Fatal("RecordAttempt returned false")
+	}
+	record, ok := ring.Get(id)
+	if !ok {
+		t.Fatal("record missing")
+	}
+	if got, want := record.PathIDs, []string{"eth0", "eth1"}; !sameStrings(got, want) {
+		t.Fatalf("PathIDs = %#v, want %#v", got, want)
+	}
+	if got, want := record.AttemptPathIDs, []string{"eth1"}; !sameStrings(got, want) {
+		t.Fatalf("AttemptPathIDs = %#v, want %#v", got, want)
+	}
+	if got, want := record.FallbackPathIDs, []string{"eth1", "eth2"}; !sameStrings(got, want) {
+		t.Fatalf("FallbackPathIDs = %#v, want %#v", got, want)
+	}
+}
+
 func TestPendingRingDueRetriesAndDrops(t *testing.T) {
 	ring := NewPendingRing(2)
 	first := PacketID{Session: 1, Sequence: 1}
@@ -142,58 +179,167 @@ func TestPathStatsSuccessFailureAndEligibility(t *testing.T) {
 	}
 }
 
-func TestSelectPrimaryPathKeepsCurrentForSmallRTTChanges(t *testing.T) {
+func TestPathStatsTimeoutScoreUsesFixedWindowDecay(t *testing.T) {
+	stats := PathStats{TimeoutScore: 800, TimeoutScoreUpdatedAt: 1000}
+	if got, want := timeoutScoreAt(stats, 16000), int64(400); got != want {
+		t.Fatalf("timeout score halfway through window = %d, want %d", got, want)
+	}
+	if got := timeoutScoreAt(stats, 31000); got != 0 {
+		t.Fatalf("timeout score after window = %d, want 0", got)
+	}
+}
+
+func TestSelectPathSelectionKeepsCurrentFirstForSmallScoreChanges(t *testing.T) {
 	now := int64(1000)
 	stats := map[string]PathStats{
 		"eth0": {ID: "eth0", LastSuccess: now, SmoothedRTT: 100},
 		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 90},
 	}
 
-	primary := SelectPrimaryPath("eth0", []string{"eth0", "eth1"}, stats, now, time.Second)
+	selection := SelectPathSelection(PathSelection{FirstPathIDs: []string{"eth0"}}, []string{"eth0", "eth1"}, stats, now, time.Second)
 
-	if primary != "eth0" {
-		t.Fatalf("primary = %q, want current path eth0", primary)
+	if got, want := selection.FirstPathIDs, []string{"eth0"}; !sameStrings(got, want) {
+		t.Fatalf("FirstPathIDs = %#v, want %#v", got, want)
+	}
+	if got, want := selection.FallbackPathIDs, []string{"eth1"}; !sameStrings(got, want) {
+		t.Fatalf("FallbackPathIDs = %#v, want %#v", got, want)
 	}
 }
 
-func TestSelectPrimaryPathSwitchesForSignificantRTTChanges(t *testing.T) {
+func TestSelectPathSelectionExpandsWithoutSwitchingSimilarCurrentFirst(t *testing.T) {
+	now := int64(1000)
+	stats := map[string]PathStats{
+		"eth0": {ID: "eth0", LastSuccess: now, SmoothedRTT: 100, RTTVariance: 10, TimeoutScore: 500},
+		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 95, RTTVariance: 10},
+	}
+
+	selection := SelectPathSelection(PathSelection{FirstPathIDs: []string{"eth0"}}, []string{"eth0", "eth1"}, stats, now, time.Second)
+
+	if got, want := selection.FirstPathIDs, []string{"eth0", "eth1"}; !sameStrings(got, want) {
+		t.Fatalf("FirstPathIDs = %#v, want %#v", got, want)
+	}
+}
+
+func TestSelectPathSelectionSwitchesForSignificantScoreChanges(t *testing.T) {
 	now := int64(1000)
 	stats := map[string]PathStats{
 		"eth0": {ID: "eth0", LastSuccess: now, SmoothedRTT: 100},
 		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 70},
 	}
 
-	primary := SelectPrimaryPath("eth0", []string{"eth0", "eth1"}, stats, now, time.Second)
+	selection := SelectPathSelection(PathSelection{FirstPathIDs: []string{"eth0"}}, []string{"eth0", "eth1"}, stats, now, time.Second)
 
-	if primary != "eth1" {
-		t.Fatalf("primary = %q, want faster path eth1", primary)
+	if got, want := selection.FirstPathIDs, []string{"eth1"}; !sameStrings(got, want) {
+		t.Fatalf("FirstPathIDs = %#v, want %#v", got, want)
 	}
 }
 
-func TestSelectPrimaryPathSwitchesWhenCurrentIsNotEligible(t *testing.T) {
+func TestSelectPathSelectionDropsIneligibleCurrentFirst(t *testing.T) {
 	now := int64(3000)
 	stats := map[string]PathStats{
 		"eth0": {ID: "eth0", LastSuccess: 1000, SmoothedRTT: 10},
 		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 100},
 	}
 
-	primary := SelectPrimaryPath("eth0", []string{"eth0", "eth1"}, stats, now, time.Second)
+	selection := SelectPathSelection(PathSelection{FirstPathIDs: []string{"eth0"}}, []string{"eth0", "eth1"}, stats, now, time.Second)
 
-	if primary != "eth1" {
-		t.Fatalf("primary = %q, want eligible path eth1", primary)
+	if got, want := selection.FirstPathIDs, []string{"eth1"}; !sameStrings(got, want) {
+		t.Fatalf("FirstPathIDs = %#v, want %#v", got, want)
+	}
+	if got, want := selection.FallbackPathIDs, []string{"eth0"}; !sameStrings(got, want) {
+		t.Fatalf("FallbackPathIDs = %#v, want %#v", got, want)
 	}
 }
 
-func TestSelectPrimaryPathSwitchesForFewerFailures(t *testing.T) {
+func TestSelectPathSelectionKeepsTimedOutPathAsFallback(t *testing.T) {
+	now := int64(3000)
+	stats := map[string]PathStats{
+		"eth0": {ID: "eth0", LastSeen: now, LastSuccess: 1000, SmoothedRTT: 10, TimeoutScore: 500},
+		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 100},
+	}
+
+	selection := SelectPathSelection(PathSelection{FirstPathIDs: []string{"eth0"}}, []string{"eth0", "eth1"}, stats, now, 100*time.Millisecond)
+
+	if got, want := selection.FirstPathIDs, []string{"eth1"}; !sameStrings(got, want) {
+		t.Fatalf("FirstPathIDs = %#v, want %#v", got, want)
+	}
+	if got, want := selection.FallbackPathIDs, []string{"eth0"}; !sameStrings(got, want) {
+		t.Fatalf("FallbackPathIDs = %#v, want %#v", got, want)
+	}
+}
+
+func TestSelectPathSelectionShrinksFirstPathsSlowly(t *testing.T) {
+	stats := map[string]PathStats{}
+	current := PathSelection{FirstPathIDs: []string{"eth0", "eth1"}, FirstPathCountChangedAt: 1000}
+	stats["eth0"] = PathStats{ID: "eth0", LastSuccess: 1500, SmoothedRTT: 80}
+	stats["eth1"] = PathStats{ID: "eth1", LastSuccess: 1500, SmoothedRTT: 90}
+
+	selection := SelectPathSelection(current, []string{"eth0", "eth1"}, stats, 1500, time.Second)
+
+	if got, want := selection.FirstPathIDs, []string{"eth0", "eth1"}; !sameStrings(got, want) {
+		t.Fatalf("FirstPathIDs before hold = %#v, want %#v", got, want)
+	}
+	stats["eth0"] = PathStats{ID: "eth0", LastSuccess: 10500, SmoothedRTT: 80}
+	stats["eth1"] = PathStats{ID: "eth1", LastSuccess: 10500, SmoothedRTT: 90}
+
+	selection = SelectPathSelection(current, []string{"eth0", "eth1"}, stats, 10500, time.Second)
+
+	if got, want := selection.FirstPathIDs, []string{"eth0", "eth1"}; !sameStrings(got, want) {
+		t.Fatalf("FirstPathIDs before fixed hold = %#v, want %#v", got, want)
+	}
+	stats["eth0"] = PathStats{ID: "eth0", LastSuccess: 11100, SmoothedRTT: 80}
+	stats["eth1"] = PathStats{ID: "eth1", LastSuccess: 11100, SmoothedRTT: 90}
+
+	selection = SelectPathSelection(current, []string{"eth0", "eth1"}, stats, 11100, time.Second)
+
+	if got, want := selection.FirstPathIDs, []string{"eth0"}; !sameStrings(got, want) {
+		t.Fatalf("FirstPathIDs after hold = %#v, want %#v", got, want)
+	}
+	if got, want := selection.FallbackPathIDs, []string{"eth1"}; !sameStrings(got, want) {
+		t.Fatalf("FallbackPathIDs after hold = %#v, want %#v", got, want)
+	}
+}
+
+func TestSelectPathSelectionExpandsFirstPathsForRisk(t *testing.T) {
 	now := int64(1000)
 	stats := map[string]PathStats{
-		"eth0": {ID: "eth0", LastSuccess: now, SmoothedRTT: 10, Failures: 1},
-		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 100, Failures: 0},
+		"eth0": {ID: "eth0", LastSuccess: now, SmoothedRTT: 80, TimeoutScore: 500},
+		"eth1": {ID: "eth1", LastSuccess: now, SmoothedRTT: 90, TimeoutScore: 300},
+		"eth2": {ID: "eth2", LastSuccess: now, SmoothedRTT: 100, TimeoutScore: 100},
+		"eth3": {ID: "eth3", LastSuccess: now, SmoothedRTT: 110, TimeoutScore: 100},
 	}
 
-	primary := SelectPrimaryPath("eth0", []string{"eth0", "eth1"}, stats, now, time.Second)
+	selection := SelectPathSelection(PathSelection{}, []string{"eth0", "eth1", "eth2", "eth3"}, stats, now, time.Second)
 
-	if primary != "eth1" {
-		t.Fatalf("primary = %q, want lower-failure path eth1", primary)
+	if got, want := selection.FirstPathIDs, []string{"eth2", "eth3"}; !sameStrings(got, want) {
+		t.Fatalf("FirstPathIDs = %#v, want %#v", got, want)
 	}
+	if got, want := selection.FallbackPathIDs, []string{"eth1", "eth0"}; !sameStrings(got, want) {
+		t.Fatalf("FallbackPathIDs = %#v, want %#v", got, want)
+	}
+}
+
+func TestPathSelectionRole(t *testing.T) {
+	selection := PathSelection{FirstPathIDs: []string{"eth0", "eth1"}, FallbackPathIDs: []string{"eth2"}}
+	if got := selection.Role("eth0"); got != PathRoleFirst {
+		t.Fatalf("eth0 role = %q, want first", got)
+	}
+	if got := selection.Role("eth2"); got != PathRoleFallback {
+		t.Fatalf("eth2 role = %q, want fallback", got)
+	}
+	if got := selection.Role("eth3"); got != "" {
+		t.Fatalf("eth3 role = %q, want empty", got)
+	}
+}
+
+func sameStrings(got []string, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

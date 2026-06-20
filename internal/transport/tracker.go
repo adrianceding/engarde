@@ -50,10 +50,28 @@ func (tracker *Tracker) Complete(id PacketID) (PendingRecord, bool) {
 	return tracker.pending.Complete(id)
 }
 
+func (tracker *Tracker) Drop(id PacketID) bool {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return tracker.pending.Drop(id)
+}
+
+func (tracker *Tracker) Get(id PacketID) (PendingRecord, bool) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return tracker.pending.Get(id)
+}
+
 func (tracker *Tracker) UpdatePaths(id PacketID, pathIDs []string) bool {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	return tracker.pending.UpdatePaths(id, pathIDs)
+}
+
+func (tracker *Tracker) RecordAttempt(id PacketID, pathIDs []string) bool {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return tracker.pending.RecordAttempt(id, pathIDs)
 }
 
 func (tracker *Tracker) SeenOrRecord(id PacketID) bool {

@@ -94,18 +94,26 @@
     margin-left: 4px;
 }
 
-.primary-badge {
+.path-role-badge {
     display: inline-block;
     margin-left: 8px;
     padding: 2px 6px;
-    border: 1px solid #00bfa5;
     border-radius: 4px;
-    color: #00897b;
     font-size: .55em;
     font-weight: 600;
     line-height: 1.4;
     text-transform: uppercase;
     vertical-align: middle;
+}
+
+.path-role-first {
+    border: 1px solid #00bfa5;
+    color: #00897b;
+}
+
+.path-role-fallback {
+    border: 1px solid #03A9F4;
+    color: #0277bd;
 }
 
 .last-received {

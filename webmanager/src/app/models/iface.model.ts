@@ -7,7 +7,7 @@ export interface IfaceModel {
     "senderAddress": string,
     "dstAddress": string,
     "last": number,
-    "primary"?: boolean,
+    "pathRole"?: string,
     "traffic"?: TrafficStats,
     "path"?: PathStatus,
 }

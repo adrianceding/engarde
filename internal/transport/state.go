@@ -10,24 +10,28 @@ type PendingRing struct {
 }
 
 type pendingSlot struct {
-	active        bool
-	id            PacketID
-	pathID        string
-	pathIDs       []string
-	sentAt        int64
-	tries         int
-	timeoutMillis int64
-	payload       []byte
+	active          bool
+	id              PacketID
+	pathID          string
+	pathIDs         []string
+	attemptPathIDs  []string
+	fallbackPathIDs []string
+	sentAt          int64
+	tries           int
+	timeoutMillis   int64
+	payload         []byte
 }
 
 type PendingRecord struct {
-	ID            PacketID
-	PathID        string
-	PathIDs       []string
-	SentAt        int64
-	Tries         int
-	TimeoutMillis int64
-	Payload       []byte
+	ID              PacketID
+	PathID          string
+	PathIDs         []string
+	AttemptPathIDs  []string
+	FallbackPathIDs []string
+	SentAt          int64
+	Tries           int
+	TimeoutMillis   int64
+	Payload         []byte
 }
 
 func NewPendingRing(capacity int) *PendingRing {
@@ -40,7 +44,11 @@ func NewPendingRing(capacity int) *PendingRing {
 func (ring *PendingRing) Put(record PendingRecord) {
 	slot := &ring.slots[record.ID.Sequence%uint64(len(ring.slots))]
 	pathIDs := normalizePathIDs(record.PathID, record.PathIDs)
-	*slot = pendingSlot{active: true, id: record.ID, pathID: record.PathID, pathIDs: pathIDs, sentAt: record.SentAt, tries: record.Tries, timeoutMillis: record.TimeoutMillis, payload: append([]byte(nil), record.Payload...)}
+	attemptPathIDs := normalizePathIDs("", record.AttemptPathIDs)
+	if len(attemptPathIDs) == 0 {
+		attemptPathIDs = append([]string(nil), pathIDs...)
+	}
+	*slot = pendingSlot{active: true, id: record.ID, pathID: record.PathID, pathIDs: pathIDs, attemptPathIDs: attemptPathIDs, fallbackPathIDs: normalizePathIDs("", record.FallbackPathIDs), sentAt: record.SentAt, tries: record.Tries, timeoutMillis: record.TimeoutMillis, payload: append([]byte(nil), record.Payload...)}
 }
 
 func (ring *PendingRing) Complete(id PacketID) (PendingRecord, bool) {
@@ -49,10 +57,17 @@ func (ring *PendingRing) Complete(id PacketID) (PendingRecord, bool) {
 		return PendingRecord{}, false
 	}
 	record := slot.record()
-	slot.active = false
-	slot.payload = nil
-	slot.pathIDs = nil
+	slot.clear()
 	return record, true
+}
+
+func (ring *PendingRing) Drop(id PacketID) bool {
+	slot := &ring.slots[id.Sequence%uint64(len(ring.slots))]
+	if !slot.active || slot.id != id {
+		return false
+	}
+	slot.clear()
+	return true
 }
 
 func (ring *PendingRing) Get(id PacketID) (PendingRecord, bool) {
@@ -69,6 +84,18 @@ func (ring *PendingRing) UpdatePaths(id PacketID, pathIDs []string) bool {
 		return false
 	}
 	slot.pathIDs = normalizePathIDs(slot.pathID, pathIDs)
+	slot.attemptPathIDs = normalizePathIDs("", pathIDs)
+	return true
+}
+
+func (ring *PendingRing) RecordAttempt(id PacketID, pathIDs []string) bool {
+	slot := &ring.slots[id.Sequence%uint64(len(ring.slots))]
+	if !slot.active || slot.id != id {
+		return false
+	}
+	attemptPathIDs := normalizePathIDs("", pathIDs)
+	slot.pathIDs = mergePathIDs(slot.pathIDs, attemptPathIDs)
+	slot.attemptPathIDs = attemptPathIDs
 	return true
 }
 
@@ -90,9 +117,7 @@ func (ring *PendingRing) Due(now int64, minTimeoutMillis int64, maxTimeoutMillis
 			continue
 		}
 		if slot.tries >= maxRetries {
-			slot.active = false
-			slot.payload = nil
-			slot.pathIDs = nil
+			slot.clear()
 			continue
 		}
 		slot.tries++
@@ -103,8 +128,16 @@ func (ring *PendingRing) Due(now int64, minTimeoutMillis int64, maxTimeoutMillis
 	return due
 }
 
+func (slot *pendingSlot) clear() {
+	slot.active = false
+	slot.payload = nil
+	slot.pathIDs = nil
+	slot.attemptPathIDs = nil
+	slot.fallbackPathIDs = nil
+}
+
 func (slot pendingSlot) record() PendingRecord {
-	return PendingRecord{ID: slot.id, PathID: slot.pathID, PathIDs: append([]string(nil), slot.pathIDs...), SentAt: slot.sentAt, Tries: slot.tries, TimeoutMillis: slot.timeoutMillis, Payload: append([]byte(nil), slot.payload...)}
+	return PendingRecord{ID: slot.id, PathID: slot.pathID, PathIDs: append([]string(nil), slot.pathIDs...), AttemptPathIDs: append([]string(nil), slot.attemptPathIDs...), FallbackPathIDs: append([]string(nil), slot.fallbackPathIDs...), SentAt: slot.sentAt, Tries: slot.tries, TimeoutMillis: slot.timeoutMillis, Payload: append([]byte(nil), slot.payload...)}
 }
 
 func normalizePathIDs(primary string, pathIDs []string) []string {
@@ -125,6 +158,32 @@ func normalizePathIDs(primary string, pathIDs []string) []string {
 		normalized = append(normalized, pathID)
 	}
 	return normalized
+}
+
+func mergePathIDs(first []string, second []string) []string {
+	merged := make([]string, 0, len(first)+len(second))
+	seen := make(map[string]struct{}, len(first)+len(second))
+	for _, id := range first {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		merged = append(merged, id)
+	}
+	for _, id := range second {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		merged = append(merged, id)
+	}
+	return merged
 }
 
 func clampTimeout(timeoutMillis int64, minTimeoutMillis int64, maxTimeoutMillis int64) int64 {
@@ -163,17 +222,35 @@ func (window *DuplicateWindow) SeenOrRecord(id PacketID) bool {
 }
 
 type PathStats struct {
-	ID          string
-	LastSeen    int64
-	LastSuccess int64
-	SmoothedRTT int64
-	RTTVariance int64
-	Failures    int
+	ID                    string
+	LastSeen              int64
+	LastSuccess           int64
+	SmoothedRTT           int64
+	RTTVariance           int64
+	Failures              int
+	TimeoutScore          int64
+	TimeoutScoreUpdatedAt int64
 }
 
 const (
-	PathSwitchRTTMarginMillis  int64 = 25
-	PathSwitchRTTMarginPercent int64 = 25
+	PathSwitchRTTMarginMillis             int64 = 25
+	PathSwitchRTTMarginPercent            int64 = 25
+	MaxFirstPathCount                           = 3
+	PathSelectionTargetRisk               int64 = 50
+	PathSelectionBaseRisk                 int64 = 10
+	PathSelectionMaxRisk                  int64 = 900
+	PathSelectionFailureRisk              int64 = 250
+	PathSelectionJitterThreshold                = 75
+	PathSelectionStaleThreshold                 = 50
+	PathSelectionRiskScale                int64 = 1000
+	PathSelectionFallbackWindowMillis     int64 = 15000
+	PathSelectionFirstCountHoldMillis     int64 = 10000
+	PathSelectionTimeoutScoreWindowMillis int64 = 30000
+)
+
+const (
+	PathRoleFirst    = "first"
+	PathRoleFallback = "fallback"
 )
 
 func (stats *PathStats) MarkSuccess(now int64, rtt int64) {
@@ -183,6 +260,8 @@ func (stats *PathStats) MarkSuccess(now int64, rtt int64) {
 	if rtt < 0 {
 		rtt = 0
 	}
+	stats.TimeoutScore = timeoutScoreAt(*stats, now) * 7 / 8
+	stats.TimeoutScoreUpdatedAt = now
 	if stats.SmoothedRTT == 0 {
 		stats.SmoothedRTT = rtt
 		stats.RTTVariance = rtt / 2
@@ -203,6 +282,11 @@ func (stats *PathStats) MarkSeen(now int64) {
 func (stats *PathStats) MarkFailure(now int64) {
 	stats.LastSeen = now
 	stats.Failures++
+	stats.TimeoutScore = (timeoutScoreAt(*stats, now)*7 + PathSelectionRiskScale) / 8
+	if stats.TimeoutScore > PathSelectionRiskScale {
+		stats.TimeoutScore = PathSelectionRiskScale
+	}
+	stats.TimeoutScoreUpdatedAt = now
 }
 
 func (stats PathStats) Eligible(now int64, timeout time.Duration) bool {
@@ -212,40 +296,100 @@ func (stats PathStats) Eligible(now int64, timeout time.Duration) bool {
 	return now-stats.LastSuccess <= timeout.Milliseconds()
 }
 
-func SelectPrimaryPath(current string, candidates []string, pathStats map[string]PathStats, now int64, timeout time.Duration) string {
-	eligible := make([]string, 0, len(candidates))
-	for _, id := range candidates {
-		stats, ok := pathStats[id]
-		if ok && stats.Eligible(now, timeout) {
-			eligible = append(eligible, id)
-		}
+func (stats PathStats) FallbackEligible(now int64, timeout time.Duration) bool {
+	if stats.LastSuccess == 0 {
+		return false
 	}
-	if len(eligible) == 0 {
-		return ""
+	if stats.Eligible(now, timeout) {
+		return true
 	}
-	sort.SliceStable(eligible, func(i, j int) bool {
-		return pathStatsLess(eligible[i], eligible[j], pathStats)
-	})
-	best := eligible[0]
-	if current == "" || current == best || !containsPathID(eligible, current) {
-		return best
-	}
-	currentStats, currentOK := pathStats[current]
-	bestStats, bestOK := pathStats[best]
-	if !currentOK || !bestOK || !currentStats.Eligible(now, timeout) {
-		return best
-	}
-	if shouldSwitchPrimary(currentStats, bestStats) {
-		return best
-	}
-	return current
+	windowMillis := fallbackWindowMillis()
+	return now-stats.LastSuccess <= windowMillis || stats.LastSeen > 0 && now-stats.LastSeen <= windowMillis
 }
 
-func pathStatsLess(leftID string, rightID string, pathStats map[string]PathStats) bool {
+type PathSelection struct {
+	FirstPathIDs            []string
+	FallbackPathIDs         []string
+	FirstPathCountChangedAt int64
+}
+
+func (selection PathSelection) Role(id string) string {
+	if containsPathID(selection.FirstPathIDs, id) {
+		return PathRoleFirst
+	}
+	if containsPathID(selection.FallbackPathIDs, id) {
+		return PathRoleFallback
+	}
+	return ""
+}
+
+func (selection PathSelection) Without(id string) PathSelection {
+	return PathSelection{FirstPathIDs: removePathID(selection.FirstPathIDs, id), FallbackPathIDs: removePathID(selection.FallbackPathIDs, id), FirstPathCountChangedAt: selection.FirstPathCountChangedAt}
+}
+
+func SelectPathSelection(current PathSelection, candidates []string, pathStats map[string]PathStats, now int64, timeout time.Duration) PathSelection {
+	firstCandidates := make([]string, 0, len(candidates))
+	fallbackCandidates := make([]string, 0, len(candidates))
+	for _, id := range candidates {
+		stats, ok := pathStats[id]
+		if !ok {
+			continue
+		}
+		if stats.Eligible(now, timeout) {
+			firstCandidates = append(firstCandidates, id)
+			continue
+		}
+		if stats.FallbackEligible(now, timeout) {
+			fallbackCandidates = append(fallbackCandidates, id)
+		}
+	}
+	sortPathIDs(firstCandidates, pathStats, now)
+	sortPathIDs(fallbackCandidates, pathStats, now)
+	if len(firstCandidates) == 0 {
+		return PathSelection{FallbackPathIDs: append([]string(nil), fallbackCandidates...), FirstPathCountChangedAt: firstPathCountChangedAt(current, 0, now)}
+	}
+	ranked := stabilizePathRanking(current, firstCandidates, pathStats)
+	desiredFirstCount := selectFirstPathCount(ranked, pathStats, now, timeout)
+	firstCount, changedAt := stabilizeFirstPathCount(current, desiredFirstCount, len(ranked), now)
+	fallbackPathIDs := mergePathIDs(ranked[firstCount:], fallbackCandidates)
+	return PathSelection{FirstPathIDs: append([]string(nil), ranked[:firstCount]...), FallbackPathIDs: fallbackPathIDs, FirstPathCountChangedAt: changedAt}
+}
+
+func sortPathIDs(ids []string, pathStats map[string]PathStats, now int64) {
+	sort.SliceStable(ids, func(i, j int) bool {
+		return pathStatsLess(ids[i], ids[j], pathStats, now)
+	})
+}
+
+func stabilizePathRanking(current PathSelection, ranked []string, pathStats map[string]PathStats) []string {
+	if len(current.FirstPathIDs) == 0 || len(ranked) == 0 {
+		return ranked
+	}
+	best := ranked[0]
+	stable := make([]string, 0, len(ranked))
+	for _, id := range current.FirstPathIDs {
+		if !containsPathID(ranked, id) || containsPathID(stable, id) {
+			continue
+		}
+		if shouldKeepPathAhead(id, best, pathStats) {
+			stable = append(stable, id)
+		}
+	}
+	for _, id := range ranked {
+		if !containsPathID(stable, id) {
+			stable = append(stable, id)
+		}
+	}
+	return stable
+}
+
+func pathStatsLess(leftID string, rightID string, pathStats map[string]PathStats, now int64) bool {
 	left := pathStats[leftID]
 	right := pathStats[rightID]
-	if left.Failures != right.Failures {
-		return left.Failures < right.Failures
+	leftScore := pathScore(left, now)
+	rightScore := pathScore(right, now)
+	if leftScore != rightScore {
+		return leftScore < rightScore
 	}
 	if left.SmoothedRTT != right.SmoothedRTT {
 		return left.SmoothedRTT < right.SmoothedRTT
@@ -253,24 +397,139 @@ func pathStatsLess(leftID string, rightID string, pathStats map[string]PathStats
 	return leftID < rightID
 }
 
-func shouldSwitchPrimary(current PathStats, candidate PathStats) bool {
-	if candidate.Failures != current.Failures {
-		return candidate.Failures < current.Failures
+func pathScore(stats PathStats, now int64) int64 {
+	score := stats.SmoothedRTT + stats.RTTVariance*4 + timeoutScoreAt(stats, now)/4 + int64(stats.Failures)*PathSelectionFailureRisk
+	if score < 0 {
+		return 0
 	}
-	return rttSignificantlyBetter(candidate.SmoothedRTT, current.SmoothedRTT)
+	return score
 }
 
-func rttSignificantlyBetter(candidateRTT int64, currentRTT int64) bool {
-	if currentRTT <= 0 || candidateRTT >= currentRTT {
+func shouldKeepPathAhead(currentID string, bestID string, pathStats map[string]PathStats) bool {
+	if currentID == bestID {
+		return true
+	}
+	current, currentOK := pathStats[currentID]
+	best, bestOK := pathStats[bestID]
+	if !currentOK || !bestOK {
 		return false
 	}
-	margin := currentRTT * PathSwitchRTTMarginPercent / 100
+	return !scoreSignificantlyBetter(pathSwitchScore(best), pathSwitchScore(current))
+}
+
+func pathSwitchScore(stats PathStats) int64 {
+	score := stats.SmoothedRTT + stats.RTTVariance*4
+	if score < 0 {
+		return 0
+	}
+	return score
+}
+
+func scoreSignificantlyBetter(candidateScore int64, currentScore int64) bool {
+	if currentScore <= 0 || candidateScore >= currentScore {
+		return false
+	}
+	margin := currentScore * PathSwitchRTTMarginPercent / 100
 	if margin < PathSwitchRTTMarginMillis {
 		margin = PathSwitchRTTMarginMillis
 	}
-	return currentRTT-candidateRTT >= margin
+	return currentScore-candidateScore >= margin
 }
 
+func selectFirstPathCount(ranked []string, pathStats map[string]PathStats, now int64, timeout time.Duration) int {
+	if len(ranked) == 0 {
+		return 0
+	}
+	limit := len(ranked)
+	if limit > MaxFirstPathCount {
+		limit = MaxFirstPathCount
+	}
+	combinedRisk := PathSelectionRiskScale
+	for i := 0; i < limit; i++ {
+		risk := pathRisk(pathStats[ranked[i]], now, timeout)
+		combinedRisk = combinedRisk * risk / PathSelectionRiskScale
+		if combinedRisk <= PathSelectionTargetRisk {
+			return i + 1
+		}
+	}
+	return limit
+}
+
+func stabilizeFirstPathCount(current PathSelection, desiredCount int, candidateCount int, now int64) (int, int64) {
+	if candidateCount == 0 {
+		return 0, 0
+	}
+	if desiredCount < 1 {
+		desiredCount = 1
+	}
+	if desiredCount > candidateCount {
+		desiredCount = candidateCount
+	}
+	currentCount := len(current.FirstPathIDs)
+	if currentCount > candidateCount {
+		currentCount = candidateCount
+	}
+	if currentCount < 1 || desiredCount > currentCount {
+		return desiredCount, now
+	}
+	if desiredCount == currentCount {
+		return desiredCount, firstPathCountChangedAt(current, desiredCount, now)
+	}
+	changedAt := firstPathCountChangedAt(current, currentCount, now)
+	if now-changedAt < PathSelectionFirstCountHoldMillis {
+		return currentCount, changedAt
+	}
+	return desiredCount, now
+}
+
+func firstPathCountChangedAt(current PathSelection, count int, now int64) int64 {
+	if len(current.FirstPathIDs) == count && current.FirstPathCountChangedAt > 0 {
+		return current.FirstPathCountChangedAt
+	}
+	return now
+}
+
+func fallbackWindowMillis() int64 {
+	return PathSelectionFallbackWindowMillis
+}
+
+func pathRisk(stats PathStats, now int64, timeout time.Duration) int64 {
+	risk := PathSelectionBaseRisk + timeoutScoreAt(stats, now) + int64(stats.Failures)*PathSelectionFailureRisk
+	if stats.SmoothedRTT > 0 && stats.RTTVariance > 0 {
+		jitterPercent := stats.RTTVariance * 100 / stats.SmoothedRTT
+		if jitterPercent > PathSelectionJitterThreshold {
+			risk += (jitterPercent - PathSelectionJitterThreshold) * 4
+		}
+	}
+	timeoutMillis := timeout.Milliseconds()
+	if timeoutMillis > 0 && stats.LastSuccess > 0 {
+		agePercent := (now - stats.LastSuccess) * 100 / timeoutMillis
+		if agePercent > PathSelectionStaleThreshold {
+			risk += (agePercent - PathSelectionStaleThreshold) * 5
+		}
+	}
+	if risk < PathSelectionBaseRisk {
+		return PathSelectionBaseRisk
+	}
+	if risk > PathSelectionMaxRisk {
+		return PathSelectionMaxRisk
+	}
+	return risk
+}
+
+func timeoutScoreAt(stats PathStats, now int64) int64 {
+	if stats.TimeoutScore <= 0 {
+		return 0
+	}
+	if stats.TimeoutScoreUpdatedAt <= 0 || now <= stats.TimeoutScoreUpdatedAt {
+		return stats.TimeoutScore
+	}
+	elapsed := now - stats.TimeoutScoreUpdatedAt
+	if elapsed >= PathSelectionTimeoutScoreWindowMillis {
+		return 0
+	}
+	return stats.TimeoutScore * (PathSelectionTimeoutScoreWindowMillis - elapsed) / PathSelectionTimeoutScoreWindowMillis
+}
 func containsPathID(ids []string, target string) bool {
 	for _, id := range ids {
 		if id == target {
@@ -278,6 +537,16 @@ func containsPathID(ids []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func removePathID(ids []string, target string) []string {
+	filtered := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id != target {
+			filtered = append(filtered, id)
+		}
+	}
+	return filtered
 }
 
 func (stats PathStats) RTO(minTimeoutMillis int64, maxTimeoutMillis int64) int64 {

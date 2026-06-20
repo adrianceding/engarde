@@ -121,7 +121,7 @@ func TestStatusIncludesLearnedClient(t *testing.T) {
 	client.traffic.Control.RecordTX(36)
 	pathNow := transport.NowMillis()
 	server.pathStats[addr.String()] = &transport.PathStats{ID: addr.String(), LastSeen: pathNow - 80, LastSuccess: pathNow - 40, SmoothedRTT: 16, RTTVariance: 4, Failures: 2}
-	server.primaryPathID = addr.String()
+	server.selection = transport.PathSelection{FirstPathIDs: []string{addr.String()}}
 	statusValue, err := server.Status()
 	if err != nil {
 		t.Fatalf("Status returned error: %v", err)
@@ -137,7 +137,7 @@ func TestStatusIncludesLearnedClient(t *testing.T) {
 	if len(status.Sockets) != 1 {
 		t.Fatalf("len(Sockets) = %d, want 1", len(status.Sockets))
 	}
-	if status.Sockets[0].Address != addr.String() || status.Sockets[0].Last == nil || !status.Sockets[0].Primary {
+	if status.Sockets[0].Address != addr.String() || status.Sockets[0].Last == nil || status.Sockets[0].PathRole != transport.PathRoleFirst {
 		t.Fatalf("socket status = %#v", status.Sockets[0])
 	}
 	if status.Sockets[0].Traffic.Data.RXPackets != 1 || status.Sockets[0].Traffic.Data.RXBytes != 100 || status.Sockets[0].Traffic.Data.TXPackets != 1 || status.Sockets[0].Traffic.Data.TXBytes != 200 {
@@ -586,42 +586,48 @@ func TestServerAdaptiveKeepaliveAckCompletesPending(t *testing.T) {
 	}
 }
 
-func TestServerAdaptiveDataUsesCachedPrimaryPath(t *testing.T) {
+func TestServerAdaptiveDataUsesCachedFirstPaths(t *testing.T) {
 	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}, ClientTimeout: 30}, "", nil)
 	clientSocket := newFakeUDPSocket()
 	server.clientSocket = clientSocket
 	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 70), Port: 5070}
 	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 71), Port: 5071}
+	thirdAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 72), Port: 5072}
 	nowUnix := time.Now().Unix()
 	server.clients[firstAddr.String()] = &connectedClient{addr: firstAddr}
 	server.clients[firstAddr.String()].last.Store(nowUnix)
 	server.clients[secondAddr.String()] = &connectedClient{addr: secondAddr}
 	server.clients[secondAddr.String()].last.Store(nowUnix)
+	server.clients[thirdAddr.String()] = &connectedClient{addr: thirdAddr}
+	server.clients[thirdAddr.String()].last.Store(nowUnix)
 	now := transport.NowMillis()
 	server.pathStats[firstAddr.String()] = &transport.PathStats{ID: firstAddr.String(), LastSuccess: now, SmoothedRTT: 100}
 	server.pathStats[secondAddr.String()] = &transport.PathStats{ID: secondAddr.String(), LastSuccess: now, SmoothedRTT: 90}
-	server.primaryPathID = firstAddr.String()
+	server.pathStats[thirdAddr.String()] = &transport.PathStats{ID: thirdAddr.String(), LastSuccess: now, SmoothedRTT: 80}
+	server.selection = transport.PathSelection{FirstPathIDs: []string{firstAddr.String(), secondAddr.String()}, FallbackPathIDs: []string{thirdAddr.String()}}
 
 	server.sendAdaptiveData([]byte("inner"))
 	time.Sleep(20 * time.Millisecond)
 
-	if clientSocket.writtenCount() != 1 {
-		t.Fatalf("client socket writes = %d, want 1", clientSocket.writtenCount())
+	if clientSocket.writtenCount() != 2 {
+		t.Fatalf("client socket writes = %d, want 2", clientSocket.writtenCount())
 	}
 	payloads := clientSocket.writtenSnapshot()
-	frame, err := transport.Decode(payloads[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(frame.Payload) != "inner" {
-		t.Fatalf("payload = %q, want inner", string(frame.Payload))
+	for _, payload := range payloads {
+		frame, err := transport.Decode(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(frame.Payload) != "inner" {
+			t.Fatalf("payload = %q, want inner", string(frame.Payload))
+		}
 	}
 }
 
-func TestServerRefreshPrimaryPathRequiresSignificantRTTImprovement(t *testing.T) {
+func TestServerRefreshPathSelectionRequiresSignificantImprovement(t *testing.T) {
 	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, KeepaliveTimeoutMillis: 1000}, ClientTimeout: 30}, "", nil)
-	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 72), Port: 5072}
-	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 73), Port: 5073}
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 73), Port: 5073}
+	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 74), Port: 5074}
 	nowUnix := time.Now().Unix()
 	server.clients[firstAddr.String()] = &connectedClient{addr: firstAddr}
 	server.clients[firstAddr.String()].last.Store(nowUnix)
@@ -630,18 +636,115 @@ func TestServerRefreshPrimaryPathRequiresSignificantRTTImprovement(t *testing.T)
 	now := transport.NowMillis()
 	server.pathStats[firstAddr.String()] = &transport.PathStats{ID: firstAddr.String(), LastSuccess: now, SmoothedRTT: 100}
 	server.pathStats[secondAddr.String()] = &transport.PathStats{ID: secondAddr.String(), LastSuccess: now, SmoothedRTT: 90}
-	server.primaryPathID = firstAddr.String()
+	server.selection = transport.PathSelection{FirstPathIDs: []string{firstAddr.String()}}
 
-	server.refreshPrimaryPath(now)
-	if server.primaryPathID != firstAddr.String() {
-		t.Fatalf("primary after small RTT change = %q, want %q", server.primaryPathID, firstAddr.String())
+	server.refreshPathSelection(now)
+	if got := server.selection.FirstPathIDs; len(got) != 1 || got[0] != firstAddr.String() {
+		t.Fatalf("first paths after small RTT change = %#v, want %q", got, firstAddr.String())
 	}
 
 	server.pathStats[secondAddr.String()].SmoothedRTT = 70
-	server.refreshPrimaryPath(now)
-	if server.primaryPathID != secondAddr.String() {
-		t.Fatalf("primary after significant RTT change = %q, want %q", server.primaryPathID, secondAddr.String())
+	server.refreshPathSelection(now)
+	if got := server.selection.FirstPathIDs; len(got) != 1 || got[0] != secondAddr.String() {
+		t.Fatalf("first paths after significant RTT change = %#v, want %q", got, secondAddr.String())
 	}
+}
+
+func TestServerRetryUsesOnlyUnsentFallbackPath(t *testing.T) {
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10, KeepaliveTimeoutMillis: 1000, MaxRetries: intPtr(2)}, ClientTimeout: 30}, "", nil)
+	clientSocket := newFakeUDPSocket()
+	server.clientSocket = clientSocket
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 75), Port: 5075}
+	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 76), Port: 5076}
+	thirdAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 77), Port: 5077}
+	nowUnix := time.Now().Unix()
+	for _, addr := range []*net.UDPAddr{firstAddr, secondAddr, thirdAddr} {
+		server.clients[addr.String()] = &connectedClient{addr: addr}
+		server.clients[addr.String()].last.Store(nowUnix)
+		server.pathStats[addr.String()] = &transport.PathStats{ID: addr.String(), LastSuccess: 100, SmoothedRTT: 50}
+	}
+	id := server.tracker.NextID()
+	server.tracker.Track(transport.PendingRecord{ID: id, PathID: firstAddr.String(), PathIDs: []string{firstAddr.String(), secondAddr.String()}, AttemptPathIDs: []string{firstAddr.String(), secondAddr.String()}, FallbackPathIDs: []string{thirdAddr.String()}, SentAt: 0, TimeoutMillis: 10, Payload: []byte("payload")})
+
+	server.retryAdaptiveData(100)
+	time.Sleep(20 * time.Millisecond)
+
+	if clientSocket.writtenCount() != 1 {
+		t.Fatalf("retry writes = %d, want 1", clientSocket.writtenCount())
+	}
+	record, ok := server.tracker.Get(id)
+	if !ok {
+		t.Fatal("pending record missing")
+	}
+	if got, want := record.PathIDs, []string{firstAddr.String(), secondAddr.String(), thirdAddr.String()}; !sameStrings(got, want) {
+		t.Fatalf("PathIDs = %#v, want %#v", got, want)
+	}
+	if got, want := record.AttemptPathIDs, []string{thirdAddr.String()}; !sameStrings(got, want) {
+		t.Fatalf("AttemptPathIDs = %#v, want %#v", got, want)
+	}
+}
+
+func TestServerRetryDropsWhenNoFallbackPath(t *testing.T) {
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10, KeepaliveTimeoutMillis: 1000, MaxRetries: intPtr(2)}, ClientTimeout: 30}, "", nil)
+	clientSocket := newFakeUDPSocket()
+	server.clientSocket = clientSocket
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 78), Port: 5078}
+	server.clients[addr.String()] = &connectedClient{addr: addr}
+	server.clients[addr.String()].last.Store(time.Now().Unix())
+	server.pathStats[addr.String()] = &transport.PathStats{ID: addr.String(), LastSuccess: 100, SmoothedRTT: 50}
+	server.selection = transport.PathSelection{FirstPathIDs: []string{addr.String()}}
+	id := server.tracker.NextID()
+	server.tracker.Track(transport.PendingRecord{ID: id, PathID: addr.String(), PathIDs: []string{addr.String()}, AttemptPathIDs: []string{addr.String()}, SentAt: 0, TimeoutMillis: 10, Payload: []byte("payload")})
+
+	server.retryAdaptiveData(100)
+	time.Sleep(20 * time.Millisecond)
+
+	if clientSocket.writtenCount() != 0 {
+		t.Fatalf("retry writes = %d, want 0", clientSocket.writtenCount())
+	}
+	if _, ok := server.tracker.Get(id); ok {
+		t.Fatal("pending record was not dropped")
+	}
+}
+
+func TestServerRetryUsesCurrentFallbackPath(t *testing.T) {
+	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10, KeepaliveTimeoutMillis: 1000, MaxRetries: intPtr(2)}, ClientTimeout: 30}, "", nil)
+	clientSocket := newFakeUDPSocket()
+	server.clientSocket = clientSocket
+	firstAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 79), Port: 5079}
+	secondAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 80), Port: 5080}
+	nowUnix := time.Now().Unix()
+	for _, addr := range []*net.UDPAddr{firstAddr, secondAddr} {
+		server.clients[addr.String()] = &connectedClient{addr: addr}
+		server.clients[addr.String()].last.Store(nowUnix)
+		server.pathStats[addr.String()] = &transport.PathStats{ID: addr.String(), LastSuccess: 100, SmoothedRTT: 50}
+	}
+	server.selection = transport.PathSelection{FirstPathIDs: []string{firstAddr.String()}, FallbackPathIDs: []string{secondAddr.String()}}
+	id := server.tracker.NextID()
+	server.tracker.Track(transport.PendingRecord{ID: id, PathID: firstAddr.String(), PathIDs: []string{firstAddr.String()}, AttemptPathIDs: []string{firstAddr.String()}, SentAt: 0, TimeoutMillis: 10, Payload: []byte("payload")})
+
+	server.retryAdaptiveData(100)
+	time.Sleep(20 * time.Millisecond)
+
+	if clientSocket.writtenCount() != 1 {
+		t.Fatalf("current fallback writes = %d, want 1", clientSocket.writtenCount())
+	}
+}
+
+func intPtr(value int) *int {
+	return &value
+}
+
+func sameStrings(got []string, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestReceiveFromClientAdaptiveInvalidFrameFallbackDependsOnConfirmation(t *testing.T) {
