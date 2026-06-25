@@ -512,6 +512,37 @@ func TestRefreshInterfacesKeepsRouteWithCurrentReceive(t *testing.T) {
 	}
 }
 
+func TestRefreshInterfacesRecreatesRouteAfterDirectReceiveTimeout(t *testing.T) {
+	client := New(config.Client{DstAddr: "127.0.0.1:1", Transfer: config.Transfer{Mode: config.TransferModeDirect, DirectReceiveTimeout: 10}}, "", nil)
+	t.Cleanup(client.closeAllRoutes)
+	oldSocket := newFakeUDPSocket()
+	route := &sendRoute{ifName: "tun0", ifIndex: 3, srcAddr: "198.18.0.1", socket: oldSocket}
+	now := time.Now().Unix()
+	route.lastRec.Store(now - 11)
+	client.routes["tun0"] = route
+	client.listInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{{Name: "tun0", Index: 3}}, nil
+	}
+	client.interfaceAddress = func(iface net.Interface) string { return "198.18.0.1" }
+	client.openUDPOnInterface = func(addr *net.UDPAddr, ifName string) (udpSocket, error) {
+		if ifName != "tun0" {
+			t.Fatalf("unexpected route creation for %s", ifName)
+		}
+		return newFakeUDPSocket(), nil
+	}
+
+	client.refreshInterfaces()
+
+	select {
+	case <-oldSocket.closed:
+	default:
+		t.Fatal("timed-out route socket was not closed")
+	}
+	if newRoute := client.routeSnapshot()["tun0"]; newRoute == nil || newRoute == route {
+		t.Fatalf("route timeout was not recreated: %#v", newRoute)
+	}
+}
+
 func TestUpdateAvailableInterfacesStopsOnContext(t *testing.T) {
 	client := New(config.Client{}, "", nil)
 	ctx, cancel := context.WithCancel(context.Background())

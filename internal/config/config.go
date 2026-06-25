@@ -86,6 +86,7 @@ type Transfer struct {
 	AckTimeoutMillis        int64  `yaml:"ackTimeoutMillis"`
 	KeepaliveIntervalMillis int64  `yaml:"keepaliveIntervalMillis"`
 	KeepaliveTimeoutMillis  int64  `yaml:"keepaliveTimeoutMillis"`
+	DirectReceiveTimeout    int64  `yaml:"directReceiveTimeout"`
 	PendingWindow           int    `yaml:"pendingWindow"`
 	DuplicateWindow         int    `yaml:"duplicateWindow"`
 	MaxRetries              *int   `yaml:"maxRetries"`
@@ -130,6 +131,9 @@ func (transfer Transfer) Validate(prefix string) error {
 	if transfer.KeepaliveTimeoutMillis < 0 {
 		return fmt.Errorf("%s.transfer.keepaliveTimeoutMillis must not be negative", prefix)
 	}
+	if transfer.DirectReceiveTimeout < 0 {
+		return fmt.Errorf("%s.transfer.directReceiveTimeout must not be negative", prefix)
+	}
 	if transfer.PendingWindow < 0 {
 		return fmt.Errorf("%s.transfer.pendingWindow must not be negative", prefix)
 	}
@@ -157,7 +161,7 @@ func (transfer Transfer) MaxRetriesValue() int {
 }
 
 func (transfer Transfer) present() bool {
-	return transfer.Mode != "" || transfer.AckTimeoutMillis != 0 || transfer.KeepaliveIntervalMillis != 0 || transfer.KeepaliveTimeoutMillis != 0 || transfer.PendingWindow != 0 || transfer.DuplicateWindow != 0 || transfer.MaxRetries != nil
+	return transfer.Mode != "" || transfer.AckTimeoutMillis != 0 || transfer.KeepaliveIntervalMillis != 0 || transfer.KeepaliveTimeoutMillis != 0 || transfer.DirectReceiveTimeout != 0 || transfer.PendingWindow != 0 || transfer.DuplicateWindow != 0 || transfer.MaxRetries != nil
 }
 
 func normalizeTransferMode(mode string) string {

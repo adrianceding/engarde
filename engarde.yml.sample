@@ -19,10 +19,13 @@ client:
   # transfer.mode direct keeps the original redundant UDP fanout. adaptive uses
   # lightweight DATA/ACK frames, keepalives, and bounded retry windows to send on
   # the best path first, then fall back to all healthy paths after adaptive ACK
-  # timeout. ackTimeoutMillis is the minimum/initial ACK timeout. adaptive DATA
-  # frames add a 36-byte header; set WireGuard MTU so inner UDP packets fit.
+  # timeout. ackTimeoutMillis is the minimum/initial ACK timeout. directReceiveTimeout
+  # is direct-mode timeout in seconds: if no packets are received for this duration,
+  # the route is re-created. 0 disables the behavior. Adaptive DATA frames add a
+  # 36-byte header; set WireGuard MTU so inner UDP packets fit.
   transfer:
     mode: direct
+    # directReceiveTimeout: 0
     ackTimeoutMillis: 50
     keepaliveIntervalMillis: 1000
     keepaliveTimeoutMillis: 5000

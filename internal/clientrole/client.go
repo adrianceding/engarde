@@ -111,6 +111,11 @@ func (route *sendRoute) isReceiveStale(now int64) bool {
 	return now-staleSince >= routeReceiveStaleSeconds
 }
 
+func (route *sendRoute) isDirectReceiveTimedOut(now int64, timeout int64) bool {
+	lastRec := route.lastRec.Load()
+	return lastRec > 0 && timeout > 0 && now-lastRec >= timeout
+}
+
 func New(cfg config.Client, version string, webFS fs.FS) *Client {
 	cfg.Transfer.ApplyDefaults()
 	client := &Client{
@@ -284,6 +289,11 @@ func (client *Client) refreshInterfaces() {
 		}
 		if address := client.interfaceAddress(iface); address != route.srcAddr {
 			log.Info("Interface '" + ifName + "' changed address, re-creating socket")
+			client.removeRoute(ifName)
+			continue
+		}
+		if client.cfg.Transfer.Mode == config.TransferModeDirect && route.isDirectReceiveTimedOut(now, client.cfg.Transfer.DirectReceiveTimeout) {
+			log.Info("Interface '" + ifName + "' reached direct receive timeout, re-creating socket")
 			client.removeRoute(ifName)
 			continue
 		}
