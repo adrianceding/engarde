@@ -83,6 +83,7 @@ client:
   listenAddr: "127.0.0.1:59401"
   dstAddr: "1.2.3.4:59501"
   writeTimeout: 10
+  relayQueueSize: 256
   udpBatch:
     enabled: true
     readSize: 32
@@ -101,6 +102,7 @@ server:
     - "203.0.113.10"
     - "198.51.100.0/24"
   writeTimeout: 10
+  relayQueueSize: 256
   udpBatch:
     enabled: true
     readSize: 32
@@ -116,6 +118,7 @@ Role selection rules:
 Important fields:
 
 - `writeTimeout`: socket write timeout in milliseconds. Use a plain integer; negative values disable the write deadline.
+- `relayQueueSize`: async relay queue size per UDP socket worker. The default is `256`; raise it to absorb bursty direct-mode fanout, or lower it to reduce memory and latency under sustained overload.
 - `udpBatch`: optional UDP batch I/O settings. It is enabled by default when omitted; set `enabled: false` to force single-packet I/O, or tune `readSize` and `writeSize` for local performance testing.
 - `transfer`: optional transfer strategy. `mode: direct` keeps the original redundant UDP fanout. `mode: adaptive` uses lightweight DATA/ACK frames, keepalives, bounded pending/duplicate windows, and a per-path adaptive ACK timeout to send on the best path first, then fall back to all healthy paths. `ackTimeoutMillis` is the minimum/initial timeout. `directReceiveTimeout` is only used in `direct` mode: if an outbound-active route receives no packets for this many seconds, it is recreated (exclude/include cycle). A value of `0` disables this behavior. Adaptive DATA frames add a 36-byte header; set WireGuard MTU so inner UDP packets fit within the framed payload limit.
 - `excludedInterfaces`: client-side interfaces that must not be used for relay traffic.

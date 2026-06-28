@@ -25,6 +25,7 @@ type Config struct {
 const (
 	DefaultUDPBatchReadSize  = 32
 	DefaultUDPBatchWriteSize = 32
+	DefaultRelayQueueSize    = 256
 	DefaultServerMaxClients  = 128
 )
 
@@ -182,6 +183,7 @@ type Client struct {
 	ListenAddr         string            `yaml:"listenAddr"`
 	DstAddr            string            `yaml:"dstAddr"`
 	WriteTimeout       int64             `yaml:"writeTimeout"`
+	RelayQueueSize     int               `yaml:"relayQueueSize"`
 	ExcludedInterfaces []string          `yaml:"excludedInterfaces"`
 	InterfaceLabels    map[string]string `yaml:"interfaceLabels"`
 	DstOverrides       []DstOverride     `yaml:"dstOverrides"`
@@ -200,6 +202,7 @@ type Server struct {
 	ListenAddr     string     `yaml:"listenAddr"`
 	DstAddr        string     `yaml:"dstAddr"`
 	WriteTimeout   int64      `yaml:"writeTimeout"`
+	RelayQueueSize int        `yaml:"relayQueueSize"`
 	ClientTimeout  int64      `yaml:"clientTimeout"`
 	AllowedClients []string   `yaml:"allowedClients"`
 	MaxClients     *int       `yaml:"maxClients"`
@@ -220,6 +223,20 @@ func (server Server) MaxClientsValue() int {
 		return DefaultServerMaxClients
 	}
 	return *server.MaxClients
+}
+
+func (client Client) RelayQueueSizeValue() int {
+	if client.RelayQueueSize > 0 {
+		return client.RelayQueueSize
+	}
+	return DefaultRelayQueueSize
+}
+
+func (server Server) RelayQueueSizeValue() int {
+	if server.RelayQueueSize > 0 {
+		return server.RelayQueueSize
+	}
+	return DefaultRelayQueueSize
 }
 
 func Load(filename string) (*Config, Role, error) {
@@ -276,11 +293,17 @@ func (cfg *Config) ApplyDefaults(role Role) {
 		if cfg.Client.WriteTimeout == 0 {
 			cfg.Client.WriteTimeout = 10
 		}
+		if cfg.Client.RelayQueueSize == 0 {
+			cfg.Client.RelayQueueSize = DefaultRelayQueueSize
+		}
 		cfg.Client.UDPBatch.ApplyDefaults()
 		cfg.Client.Transfer.ApplyDefaults()
 	case RoleServer:
 		if cfg.Server.WriteTimeout == 0 {
 			cfg.Server.WriteTimeout = 10
+		}
+		if cfg.Server.RelayQueueSize == 0 {
+			cfg.Server.RelayQueueSize = DefaultRelayQueueSize
 		}
 		if cfg.Server.ClientTimeout == 0 {
 			cfg.Server.ClientTimeout = 30
@@ -294,8 +317,14 @@ func (cfg *Config) ApplyDefaults(role Role) {
 func (cfg Config) Validate(role Role) error {
 	switch role {
 	case RoleClient:
+		if cfg.Client.RelayQueueSize < 0 {
+			return errors.New("client.relayQueueSize must not be negative")
+		}
 		return cfg.Client.Transfer.Validate("client")
 	case RoleServer:
+		if cfg.Server.RelayQueueSize < 0 {
+			return errors.New("server.relayQueueSize must not be negative")
+		}
 		if err := cfg.Server.Transfer.Validate("server"); err != nil {
 			return err
 		}
@@ -328,11 +357,11 @@ func validateAllowedClients(values []string) error {
 }
 
 func (cfg Config) clientPresent() bool {
-	return cfg.Client.Description != "" || cfg.Client.ListenAddr != "" || cfg.Client.DstAddr != "" || cfg.Client.WriteTimeout != 0 || len(cfg.Client.ExcludedInterfaces) > 0 || len(cfg.Client.InterfaceLabels) > 0 || len(cfg.Client.DstOverrides) > 0 || cfg.Client.UDPBatch.present() || cfg.Client.Transfer.present() || webPresent(cfg.Client.WebManager)
+	return cfg.Client.Description != "" || cfg.Client.ListenAddr != "" || cfg.Client.DstAddr != "" || cfg.Client.WriteTimeout != 0 || cfg.Client.RelayQueueSize != 0 || len(cfg.Client.ExcludedInterfaces) > 0 || len(cfg.Client.InterfaceLabels) > 0 || len(cfg.Client.DstOverrides) > 0 || cfg.Client.UDPBatch.present() || cfg.Client.Transfer.present() || webPresent(cfg.Client.WebManager)
 }
 
 func (cfg Config) serverPresent() bool {
-	return cfg.Server.Description != "" || cfg.Server.ListenAddr != "" || cfg.Server.DstAddr != "" || cfg.Server.WriteTimeout != 0 || cfg.Server.ClientTimeout != 0 || len(cfg.Server.AllowedClients) > 0 || cfg.Server.MaxClients != nil || cfg.Server.UDPBatch.present() || cfg.Server.Transfer.present() || webPresent(cfg.Server.WebManager)
+	return cfg.Server.Description != "" || cfg.Server.ListenAddr != "" || cfg.Server.DstAddr != "" || cfg.Server.WriteTimeout != 0 || cfg.Server.RelayQueueSize != 0 || cfg.Server.ClientTimeout != 0 || len(cfg.Server.AllowedClients) > 0 || cfg.Server.MaxClients != nil || cfg.Server.UDPBatch.present() || cfg.Server.Transfer.present() || webPresent(cfg.Server.WebManager)
 }
 
 func webPresent(web WebManager) bool {

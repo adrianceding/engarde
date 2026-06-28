@@ -10,6 +10,8 @@ client:
   dstAddr: "1.2.3.4:59501"
   # Socket write timeout in milliseconds. Use a plain integer; negative disables the timeout.
   writeTimeout: 10
+  # Async relay queue size per UDP socket worker. Increase this for bursty direct-mode fanout.
+  relayQueueSize: 256
   # UDP batch I/O is enabled by default when this block is omitted. Set enabled
   # to false to force single-packet I/O, or tune readSize/writeSize for testing.
   udpBatch:
@@ -63,6 +65,8 @@ client:
 #     - "198.51.100.0/24"
 #   # Socket write timeout in milliseconds. Use a plain integer; negative disables the timeout.
 #   writeTimeout: 10
+#   # Async relay queue size per UDP socket worker. Increase this for bursty direct-mode fanout.
+#   relayQueueSize: 256
 #   # UDP batch I/O is enabled by default when this block is omitted.
 #   udpBatch:
 #     enabled: true

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -148,6 +149,15 @@ func TestStatusIncludesLearnedClient(t *testing.T) {
 	}
 	if status.Sockets[0].Path == nil || status.Sockets[0].Path.SmoothedRTTMillis != 16 || status.Sockets[0].Path.Failures != 2 || status.Sockets[0].Path.LastSeen == nil || status.Sockets[0].Path.LastSuccess == nil {
 		t.Fatalf("path status = %#v", status.Sockets[0].Path)
+	}
+}
+
+func TestServerUsesConfiguredRelayQueueSize(t *testing.T) {
+	server := New(config.Server{RelayQueueSize: 1024}, "", nil)
+
+	queueSize := reflect.ValueOf(server.dispatcher).Elem().FieldByName("queueSize").Int()
+	if queueSize != 1024 {
+		t.Fatalf("dispatcher queueSize = %d, want 1024", queueSize)
 	}
 }
 

@@ -83,6 +83,7 @@ client:
   listenAddr: "127.0.0.1:59401"
   dstAddr: "1.2.3.4:59501"
   writeTimeout: 10
+  relayQueueSize: 256
   udpBatch:
     enabled: true
     readSize: 32
@@ -101,6 +102,7 @@ server:
     - "203.0.113.10"
     - "198.51.100.0/24"
   writeTimeout: 10
+  relayQueueSize: 256
   udpBatch:
     enabled: true
     readSize: 32
@@ -116,6 +118,7 @@ server:
 重要字段：
 
 - `writeTimeout`：socket 写超时，单位是毫秒。请使用普通整数；负数表示禁用写超时。
+- `relayQueueSize`：每个 UDP socket worker 的异步中继队列大小。默认值为 `256`；direct 模式 fanout 突发较多时可以调大，持续过载时可调小以降低内存和排队延迟。
 - `udpBatch`：可选的 UDP 批量 I/O 设置。省略时默认启用；设置 `enabled: false` 可强制使用逐包 I/O，也可以通过 `readSize` 和 `writeSize` 调整批量大小用于本地性能测试。
 - `transfer`：可选的传输策略。`mode: direct` 保持原有 UDP 冗余发包；`mode: adaptive` 使用轻量 DATA/ACK 帧、keepalive、有界 pending/duplicate 窗口和每路径自适应 ACK 超时，先走当前最佳路径，超时后回退到所有健康路径。`ackTimeoutMillis` 是最小/初始超时。`directReceiveTimeout` 只在 `direct` 下生效：某条已经发送过流量但超过该秒数未收到包的路由会触发一次重建（exclude/include）。设为 `0` 表示关闭该机制。Adaptive DATA 帧会增加 36 字节头部；请设置 WireGuard MTU，让内部 UDP 包不超过 framed payload 上限。
 - `excludedInterfaces`：client 侧不参与中继转发的网卡。

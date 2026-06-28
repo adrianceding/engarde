@@ -63,6 +63,9 @@ func TestLoadErrorsAndClientDefaults(t *testing.T) {
 	if role != RoleClient || cfg.Client.WriteTimeout != 10 {
 		t.Fatalf("client role/defaults = %q/%v", role, cfg.Client.WriteTimeout)
 	}
+	if cfg.Client.RelayQueueSizeValue() != DefaultRelayQueueSize {
+		t.Fatalf("client relayQueueSize = %d, want %d", cfg.Client.RelayQueueSizeValue(), DefaultRelayQueueSize)
+	}
 	if !cfg.Client.UDPBatch.IsEnabled() || cfg.Client.UDPBatch.ReadSize != DefaultUDPBatchReadSize || cfg.Client.UDPBatch.WriteSize != DefaultUDPBatchWriteSize {
 		t.Fatalf("client udp batch defaults = %#v", cfg.Client.UDPBatch)
 	}
@@ -161,6 +164,9 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.Server.MaxClientsValue() != DefaultServerMaxClients {
 		t.Fatalf("MaxClients = %v, want %v", cfg.Server.MaxClientsValue(), DefaultServerMaxClients)
 	}
+	if cfg.Server.RelayQueueSizeValue() != DefaultRelayQueueSize {
+		t.Fatalf("server relayQueueSize = %d, want %d", cfg.Server.RelayQueueSizeValue(), DefaultRelayQueueSize)
+	}
 	if !cfg.Server.UDPBatch.IsEnabled() || cfg.Server.UDPBatch.ReadSize != DefaultUDPBatchReadSize || cfg.Server.UDPBatch.WriteSize != DefaultUDPBatchWriteSize {
 		t.Fatalf("server udp batch defaults = %#v", cfg.Server.UDPBatch)
 	}
@@ -238,6 +244,52 @@ func TestLoadTransferAllowsZeroMaxRetries(t *testing.T) {
 	}
 	if cfg.Client.Transfer.MaxRetriesValue() != 0 {
 		t.Fatalf("maxRetries = %d, want 0", cfg.Client.Transfer.MaxRetriesValue())
+	}
+}
+
+func TestLoadRelayQueueSizeOverrides(t *testing.T) {
+	dir := t.TempDir()
+	clientPath := filepath.Join(dir, "client.yml")
+	if err := os.WriteFile(clientPath, []byte("client:\n  listenAddr: \"127.0.0.1:1\"\n  dstAddr: \"127.0.0.1:2\"\n  relayQueueSize: 512\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	clientCfg, role, err := Load(clientPath)
+	if err != nil {
+		t.Fatalf("Load client returned error: %v", err)
+	}
+	if role != RoleClient {
+		t.Fatalf("client role = %q, want %q", role, RoleClient)
+	}
+	if clientCfg.Client.RelayQueueSizeValue() != 512 {
+		t.Fatalf("client relayQueueSize = %d, want 512", clientCfg.Client.RelayQueueSizeValue())
+	}
+
+	serverPath := filepath.Join(dir, "server.yml")
+	if err := os.WriteFile(serverPath, []byte("server:\n  listenAddr: \"0.0.0.0:59501\"\n  dstAddr: \"127.0.0.1:59301\"\n  relayQueueSize: 1024\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	serverCfg, role, err := Load(serverPath)
+	if err != nil {
+		t.Fatalf("Load server returned error: %v", err)
+	}
+	if role != RoleServer {
+		t.Fatalf("server role = %q, want %q", role, RoleServer)
+	}
+	if serverCfg.Server.RelayQueueSizeValue() != 1024 {
+		t.Fatalf("server relayQueueSize = %d, want 1024", serverCfg.Server.RelayQueueSizeValue())
+	}
+}
+
+func TestLoadRejectsInvalidRelayQueueSize(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "engarde.yml")
+	content := []byte("server:\n  listenAddr: \"0.0.0.0:59501\"\n  dstAddr: \"127.0.0.1:59301\"\n  relayQueueSize: -1\n")
+	if err := os.WriteFile(configPath, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "server.relayQueueSize") {
+		t.Fatalf("Load invalid relayQueueSize error = %v", err)
 	}
 }
 

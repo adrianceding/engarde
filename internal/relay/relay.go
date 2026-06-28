@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	DefaultQueueSize              = 16
+	DefaultQueueSize              = 256
 	DefaultWriteBufferBytes       = 4 * 1024 * 1024
 	DefaultWriteBufferTargetBytes = 4 * 1024 * 1024
 	DefaultMaxWriteBufferBytes    = 64 * 1024 * 1024

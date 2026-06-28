@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -132,6 +133,15 @@ func TestClientActionsPreserveLegacyStatuses(t *testing.T) {
 	}
 	if status := client.ResetExclusions(); status != "ok" {
 		t.Fatalf("ResetExclusions = %q, want ok", status)
+	}
+}
+
+func TestClientUsesConfiguredRelayQueueSize(t *testing.T) {
+	client := New(config.Client{RelayQueueSize: 512}, "", nil)
+
+	queueSize := reflect.ValueOf(client.dispatcher).Elem().FieldByName("queueSize").Int()
+	if queueSize != 512 {
+		t.Fatalf("dispatcher queueSize = %d, want 512", queueSize)
 	}
 }
 

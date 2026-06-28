@@ -149,7 +149,7 @@ func New(cfg config.Client, version string, webFS fs.FS) *Client {
 		tracker:   transport.NewTracker(cfg.Transfer.PendingWindow, cfg.Transfer.DuplicateWindow),
 		pathStats: make(map[string]*transport.PathStats),
 	}
-	client.dispatcher = relay.NewDispatcherWithBatch(cfg.WriteTimeout, relay.DefaultQueueSize, cfg.UDPBatch.IsEnabled(), cfg.UDPBatch.EffectiveWriteSize(), func(result relay.Result) {
+	client.dispatcher = relay.NewDispatcherWithBatch(cfg.WriteTimeout, cfg.RelayQueueSizeValue(), cfg.UDPBatch.IsEnabled(), cfg.UDPBatch.EffectiveWriteSize(), func(result relay.Result) {
 		client.handleDispatcherError(result)
 	})
 	return client
