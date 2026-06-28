@@ -158,6 +158,9 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.Server.ClientTimeout != 30 {
 		t.Fatalf("ClientTimeout = %v, want 30", cfg.Server.ClientTimeout)
 	}
+	if cfg.Server.MaxClientsValue() != DefaultServerMaxClients {
+		t.Fatalf("MaxClients = %v, want %v", cfg.Server.MaxClientsValue(), DefaultServerMaxClients)
+	}
 	if !cfg.Server.UDPBatch.IsEnabled() || cfg.Server.UDPBatch.ReadSize != DefaultUDPBatchReadSize || cfg.Server.UDPBatch.WriteSize != DefaultUDPBatchWriteSize {
 		t.Fatalf("server udp batch defaults = %#v", cfg.Server.UDPBatch)
 	}
@@ -248,6 +251,48 @@ func TestLoadRejectsInvalidTransfer(t *testing.T) {
 
 	if _, _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "server.transfer.mode") {
 		t.Fatalf("Load invalid transfer error = %v", err)
+	}
+}
+
+func TestLoadServerAllowedClientsAndMaxClients(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "engarde.yml")
+	content := []byte("server:\n  listenAddr: \"0.0.0.0:59501\"\n  dstAddr: \"127.0.0.1:59301\"\n  allowedClients:\n    - 192.0.2.10\n    - 198.51.100.0/24\n  maxClients: 0\n")
+	if err := os.WriteFile(configPath, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, role, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if role != RoleServer {
+		t.Fatalf("role = %q, want %q", role, RoleServer)
+	}
+	if cfg.Server.MaxClientsValue() != 0 {
+		t.Fatalf("MaxClients = %v, want explicit unlimited", cfg.Server.MaxClientsValue())
+	}
+	if strings.Join(cfg.Server.AllowedClients, ",") != "192.0.2.10,198.51.100.0/24" {
+		t.Fatalf("AllowedClients = %#v", cfg.Server.AllowedClients)
+	}
+}
+
+func TestLoadRejectsInvalidAllowedClientsAndMaxClients(t *testing.T) {
+	dir := t.TempDir()
+	invalidAllowed := filepath.Join(dir, "invalid-allowed.yml")
+	if err := os.WriteFile(invalidAllowed, []byte("server:\n  listenAddr: \"0.0.0.0:59501\"\n  dstAddr: \"127.0.0.1:59301\"\n  allowedClients:\n    - bad-cidr\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Load(invalidAllowed); err == nil || !strings.Contains(err.Error(), "server.allowedClients") {
+		t.Fatalf("Load invalid allowedClients error = %v", err)
+	}
+
+	invalidMax := filepath.Join(dir, "invalid-max.yml")
+	if err := os.WriteFile(invalidMax, []byte("server:\n  listenAddr: \"0.0.0.0:59501\"\n  dstAddr: \"127.0.0.1:59301\"\n  maxClients: -1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Load(invalidMax); err == nil || !strings.Contains(err.Error(), "server.maxClients") {
+		t.Fatalf("Load invalid maxClients error = %v", err)
 	}
 }
 

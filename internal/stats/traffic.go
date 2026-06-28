@@ -8,10 +8,12 @@ import (
 )
 
 type Counters struct {
-	rxPackets atomic.Uint64
-	rxBytes   atomic.Uint64
-	txPackets atomic.Uint64
-	txBytes   atomic.Uint64
+	rxPackets   atomic.Uint64
+	rxBytes     atomic.Uint64
+	txPackets   atomic.Uint64
+	txBytes     atomic.Uint64
+	dropPackets atomic.Uint64
+	dropBytes   atomic.Uint64
 }
 
 func (counters *Counters) RecordRX(bytes int) {
@@ -30,12 +32,22 @@ func (counters *Counters) RecordTX(bytes int) {
 	counters.txBytes.Add(uint64(bytes))
 }
 
+func (counters *Counters) RecordDrop(bytes int) {
+	if bytes < 0 {
+		bytes = 0
+	}
+	counters.dropPackets.Add(1)
+	counters.dropBytes.Add(uint64(bytes))
+}
+
 func (counters *Counters) Snapshot() control.TrafficCounters {
 	return control.TrafficCounters{
-		RXPackets: counters.rxPackets.Load(),
-		RXBytes:   counters.rxBytes.Load(),
-		TXPackets: counters.txPackets.Load(),
-		TXBytes:   counters.txBytes.Load(),
+		RXPackets:   counters.rxPackets.Load(),
+		RXBytes:     counters.rxBytes.Load(),
+		TXPackets:   counters.txPackets.Load(),
+		TXBytes:     counters.txBytes.Load(),
+		DropPackets: counters.dropPackets.Load(),
+		DropBytes:   counters.dropBytes.Load(),
 	}
 }
 

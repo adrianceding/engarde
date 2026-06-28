@@ -3,6 +3,8 @@ export interface TrafficCounters {
     rxBytes: number,
     txPackets: number,
     txBytes: number,
+    dropPackets: number,
+    dropBytes: number,
 }
 
 export interface TrafficStats {

@@ -14,6 +14,7 @@ type fakeWriter struct {
 	mu           sync.Mutex
 	deadline     time.Time
 	writes       int
+	writeBuffer  int
 	deadlineErr  error
 	writeErr     error
 	writtenBytes []byte
@@ -57,7 +58,12 @@ func (writer *fakeWriter) SetWriteDeadline(deadline time.Time) error {
 	return writer.deadlineErr
 }
 
-func (writer *fakeWriter) SetWriteBuffer(int) error { return nil }
+func (writer *fakeWriter) SetWriteBuffer(size int) error {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	writer.writeBuffer = size
+	return nil
+}
 
 func (writer *fakeWriter) WriteToUDP(payload []byte, addr *net.UDPAddr) (int, error) {
 	if writer.block != nil {
@@ -77,6 +83,12 @@ func (writer *fakeWriter) writeCount() int {
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	return writer.writes
+}
+
+func (writer *fakeWriter) bufferSize() int {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.writeBuffer
 }
 
 func (writer *fakeBatchWriter) batchWriteCount() int {
@@ -107,6 +119,17 @@ func waitForWrites(t *testing.T, writer *fakeWriter, want int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("writes = %d, want at least %d", writer.writeCount(), want)
+}
+
+func TestSetWriteBufferForTargetsCapsSize(t *testing.T) {
+	writer := &fakeWriter{}
+
+	if err := SetWriteBufferForTargets(writer, 10000); err != nil {
+		t.Fatalf("SetWriteBufferForTargets returned error: %v", err)
+	}
+	if got := writer.bufferSize(); got != DefaultMaxWriteBufferBytes {
+		t.Fatalf("write buffer = %d, want cap %d", got, DefaultMaxWriteBufferBytes)
+	}
 }
 
 func TestDispatcherWritesAllTargets(t *testing.T) {
@@ -322,6 +345,45 @@ func TestDispatcherDoesNotBlockOnFullTargetQueue(t *testing.T) {
 	if blocked.writeCount() != 0 {
 		t.Fatalf("blocked writes = %d, want 0 while blocked", blocked.writeCount())
 	}
+}
+
+func TestDispatcherReportsFanoutQueueOverflow(t *testing.T) {
+	blocked := &fakeWriter{block: make(chan struct{})}
+	fast := &fakeWriter{}
+	errorsCh := make(chan Result, 1)
+	targets := []Target{
+		{ID: "blocked", Conn: blocked, Addr: &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1}},
+		{ID: "fast", Conn: fast, Addr: &net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 2}},
+	}
+	dispatcher := NewDispatcher(10, 1, func(result Result) { errorsCh <- result })
+	t.Cleanup(func() {
+		close(blocked.block)
+		dispatcher.Close()
+	})
+
+	dispatcher.Fanout([]byte("first"), targets)
+	waitForWrites(t, fast, 1)
+	dispatcher.Fanout([]byte("second"), targets)
+	waitForWrites(t, fast, 2)
+	dispatcher.Fanout([]byte("third"), targets)
+
+	result := readResult(t, errorsCh)
+	if result.ID != "blocked" {
+		t.Fatalf("overflow result ID = %q, want blocked", result.ID)
+	}
+	if !errors.Is(result.Err, ErrQueueFull) {
+		t.Fatalf("overflow error = %v, want ErrQueueFull", result.Err)
+	}
+	if result.Packets != 1 || result.Bytes != len("third") {
+		t.Fatalf("overflow result size = %d packets/%d bytes, want 1/%d", result.Packets, result.Bytes, len("third"))
+	}
+	dispatcher.mu.Lock()
+	_, targetStillActive := dispatcher.targets["blocked"]
+	dispatcher.mu.Unlock()
+	if !targetStillActive {
+		t.Fatal("queue overflow removed target; want target retained")
+	}
+	waitForWrites(t, fast, 3)
 }
 
 func TestDispatcherBatchesTargetsSharingConnection(t *testing.T) {

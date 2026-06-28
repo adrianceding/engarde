@@ -69,9 +69,13 @@ func (tracker *Tracker) UpdatePaths(id PacketID, pathIDs []string) bool {
 }
 
 func (tracker *Tracker) RecordAttempt(id PacketID, pathIDs []string) bool {
+	return tracker.RecordAttemptAt(id, pathIDs, 0)
+}
+
+func (tracker *Tracker) RecordAttemptAt(id PacketID, pathIDs []string, sentAt int64) bool {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	return tracker.pending.RecordAttempt(id, pathIDs)
+	return tracker.pending.RecordAttemptAt(id, pathIDs, sentAt)
 }
 
 func (tracker *Tracker) SeenOrRecord(id PacketID) bool {

@@ -96,6 +96,10 @@ server:
   listenAddr: "0.0.0.0:59501"
   dstAddr: "127.0.0.1:59301"
   clientTimeout: 30
+  maxClients: 128
+  allowedClients:
+    - "203.0.113.10"
+    - "198.51.100.0/24"
   writeTimeout: 10
   udpBatch:
     enabled: true
@@ -113,12 +117,16 @@ Important fields:
 
 - `writeTimeout`: socket write timeout in milliseconds. Use a plain integer; negative values disable the write deadline.
 - `udpBatch`: optional UDP batch I/O settings. It is enabled by default when omitted; set `enabled: false` to force single-packet I/O, or tune `readSize` and `writeSize` for local performance testing.
-- `transfer`: optional transfer strategy. `mode: direct` keeps the original redundant UDP fanout. `mode: adaptive` uses lightweight DATA/ACK frames, keepalives, bounded pending/duplicate windows, and a per-path adaptive ACK timeout to send on the best path first, then fall back to all healthy paths. `ackTimeoutMillis` is the minimum/initial timeout. `directReceiveTimeout` is only used in `direct` mode: if a route receives no packets for this many seconds, it is recreated (exclude/include cycle). A value of `0` disables this behavior and keeps existing logic. Adaptive DATA frames add a 36-byte header; set WireGuard MTU so inner UDP packets fit within the framed payload limit.
+- `transfer`: optional transfer strategy. `mode: direct` keeps the original redundant UDP fanout. `mode: adaptive` uses lightweight DATA/ACK frames, keepalives, bounded pending/duplicate windows, and a per-path adaptive ACK timeout to send on the best path first, then fall back to all healthy paths. `ackTimeoutMillis` is the minimum/initial timeout. `directReceiveTimeout` is only used in `direct` mode: if an outbound-active route receives no packets for this many seconds, it is recreated (exclude/include cycle). A value of `0` disables this behavior. Adaptive DATA frames add a 36-byte header; set WireGuard MTU so inner UDP packets fit within the framed payload limit.
 - `excludedInterfaces`: client-side interfaces that must not be used for relay traffic.
 - `interfaceLabels`: human-friendly labels shown in the web UI.
 - `dstOverrides`: client-side per-interface remote relay address overrides.
 - `clientTimeout`: server-side active-client timeout in seconds.
+- `allowedClients`: server-side source IP/CIDR allowlist for client relay packets. When omitted, sources are accepted until `maxClients` is reached.
+- `maxClients`: maximum active clients learned by the server. The default is `128`; set `0` to allow unlimited clients.
 - `webManager`: optional embedded web UI and JSON API listener.
+
+The web/API traffic counters expose attempted TX plus drops. Queue-full and write-failure drops are counted separately as `dropPackets` and `dropBytes`. UDP write buffer requests are capped internally to avoid unbounded growth when many clients are active.
 
 Example `webManager` block:
 

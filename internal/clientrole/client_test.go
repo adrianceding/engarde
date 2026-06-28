@@ -204,6 +204,24 @@ func TestRemoveRouteClearsPathStats(t *testing.T) {
 	}
 }
 
+func TestDispatcherQueueFullDoesNotRemoveRoute(t *testing.T) {
+	client := New(config.Client{}, "", nil)
+	client.wgSocket = newFakeUDPSocket()
+	socket := newFakeUDPSocket()
+	t.Cleanup(client.dispatcher.Close)
+	client.routes["eth0"] = &sendRoute{ifName: "eth0", socket: socket}
+
+	client.handleDispatcherError(relay.Result{ID: "eth0", Err: relay.ErrQueueFull, Packets: 1, Bytes: 64})
+
+	if !client.hasRoute("eth0") {
+		t.Fatal("ErrQueueFull removed route; want route retained")
+	}
+	traffic := client.routes["eth0"].traffic.Snapshot()
+	if traffic.Data.DropPackets != 1 || traffic.Data.DropBytes != 64 {
+		t.Fatalf("drop traffic = %#v, want 1 packet/64 bytes", traffic.Data)
+	}
+}
+
 func TestRetryDoesNotRecreateRemovedRoutePathStats(t *testing.T) {
 	client := New(config.Client{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10}}, "", nil)
 	id := client.tracker.NextID()
@@ -540,6 +558,65 @@ func TestRefreshInterfacesRecreatesRouteAfterDirectReceiveTimeout(t *testing.T) 
 	}
 	if newRoute := client.routeSnapshot()["tun0"]; newRoute == nil || newRoute == route {
 		t.Fatalf("route timeout was not recreated: %#v", newRoute)
+	}
+}
+
+func TestRefreshInterfacesRecreatesOutboundActiveRouteWithoutReceive(t *testing.T) {
+	client := New(config.Client{DstAddr: "127.0.0.1:1", Transfer: config.Transfer{Mode: config.TransferModeDirect, DirectReceiveTimeout: 10}}, "", nil)
+	t.Cleanup(client.closeAllRoutes)
+	oldSocket := newFakeUDPSocket()
+	route := &sendRoute{ifName: "tun0", ifIndex: 3, srcAddr: "198.18.0.1", socket: oldSocket}
+	now := time.Now().Unix()
+	route.lastSent.Store(now - 11)
+	route.staleSince.Store(now - 11)
+	client.routes["tun0"] = route
+	client.listInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{{Name: "tun0", Index: 3}}, nil
+	}
+	client.interfaceAddress = func(iface net.Interface) string { return "198.18.0.1" }
+	client.openUDPOnInterface = func(addr *net.UDPAddr, ifName string) (udpSocket, error) {
+		if ifName != "tun0" {
+			t.Fatalf("unexpected route creation for %s", ifName)
+		}
+		return newFakeUDPSocket(), nil
+	}
+
+	client.refreshInterfaces()
+
+	select {
+	case <-oldSocket.closed:
+	default:
+		t.Fatal("outbound-active route without receive was not closed")
+	}
+	if newRoute := client.routeSnapshot()["tun0"]; newRoute == nil || newRoute == route {
+		t.Fatalf("route timeout was not recreated: %#v", newRoute)
+	}
+}
+
+func TestRefreshInterfacesKeepsIdleRouteWithoutReceive(t *testing.T) {
+	client := New(config.Client{DstAddr: "127.0.0.1:1", Transfer: config.Transfer{Mode: config.TransferModeDirect, DirectReceiveTimeout: 10}}, "", nil)
+	t.Cleanup(client.closeAllRoutes)
+	socket := newFakeUDPSocket()
+	route := &sendRoute{ifName: "tun0", ifIndex: 3, srcAddr: "198.18.0.1", socket: socket}
+	client.routes["tun0"] = route
+	client.listInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{{Name: "tun0", Index: 3}}, nil
+	}
+	client.interfaceAddress = func(iface net.Interface) string { return "198.18.0.1" }
+	client.openUDPOnInterface = func(addr *net.UDPAddr, ifName string) (udpSocket, error) {
+		t.Fatalf("unexpected route creation for %s", ifName)
+		return nil, nil
+	}
+
+	client.refreshInterfaces()
+
+	if client.routeSnapshot()["tun0"] != route {
+		t.Fatal("idle never-received route was recreated")
+	}
+	select {
+	case <-socket.closed:
+		t.Fatal("idle never-received route was closed")
+	default:
 	}
 }
 

@@ -17,6 +17,8 @@ type pendingSlot struct {
 	attemptPathIDs  []string
 	fallbackPathIDs []string
 	sentAt          int64
+	lastSentAt      int64
+	sentAtByPath    map[string]int64
 	tries           int
 	timeoutMillis   int64
 	payload         []byte
@@ -29,9 +31,23 @@ type PendingRecord struct {
 	AttemptPathIDs  []string
 	FallbackPathIDs []string
 	SentAt          int64
+	LastSentAt      int64
+	SentAtByPath    map[string]int64
 	Tries           int
 	TimeoutMillis   int64
 	Payload         []byte
+}
+
+func (record PendingRecord) SentAtForPath(pathID string) int64 {
+	if record.SentAtByPath != nil {
+		if sentAt, ok := record.SentAtByPath[pathID]; ok {
+			return sentAt
+		}
+	}
+	if containsPathID(record.AttemptPathIDs, pathID) && record.LastSentAt > 0 {
+		return record.LastSentAt
+	}
+	return record.SentAt
 }
 
 func NewPendingRing(capacity int) *PendingRing {
@@ -48,7 +64,20 @@ func (ring *PendingRing) Put(record PendingRecord) {
 	if len(attemptPathIDs) == 0 {
 		attemptPathIDs = append([]string(nil), pathIDs...)
 	}
-	*slot = pendingSlot{active: true, id: record.ID, pathID: record.PathID, pathIDs: pathIDs, attemptPathIDs: attemptPathIDs, fallbackPathIDs: normalizePathIDs("", record.FallbackPathIDs), sentAt: record.SentAt, tries: record.Tries, timeoutMillis: record.TimeoutMillis, payload: append([]byte(nil), record.Payload...)}
+	lastSentAt := record.LastSentAt
+	if lastSentAt == 0 {
+		lastSentAt = record.SentAt
+	}
+	sentAtByPath := cloneSentAtByPath(record.SentAtByPath)
+	if sentAtByPath == nil && len(attemptPathIDs) > 0 {
+		sentAtByPath = make(map[string]int64, len(attemptPathIDs))
+	}
+	for _, pathID := range attemptPathIDs {
+		if _, ok := sentAtByPath[pathID]; !ok {
+			sentAtByPath[pathID] = lastSentAt
+		}
+	}
+	*slot = pendingSlot{active: true, id: record.ID, pathID: record.PathID, pathIDs: pathIDs, attemptPathIDs: attemptPathIDs, fallbackPathIDs: normalizePathIDs("", record.FallbackPathIDs), sentAt: record.SentAt, lastSentAt: lastSentAt, sentAtByPath: sentAtByPath, tries: record.Tries, timeoutMillis: record.TimeoutMillis, payload: append([]byte(nil), record.Payload...)}
 }
 
 func (ring *PendingRing) Complete(id PacketID) (PendingRecord, bool) {
@@ -89,6 +118,10 @@ func (ring *PendingRing) UpdatePaths(id PacketID, pathIDs []string) bool {
 }
 
 func (ring *PendingRing) RecordAttempt(id PacketID, pathIDs []string) bool {
+	return ring.RecordAttemptAt(id, pathIDs, 0)
+}
+
+func (ring *PendingRing) RecordAttemptAt(id PacketID, pathIDs []string, sentAt int64) bool {
 	slot := &ring.slots[id.Sequence%uint64(len(ring.slots))]
 	if !slot.active || slot.id != id {
 		return false
@@ -96,6 +129,19 @@ func (ring *PendingRing) RecordAttempt(id PacketID, pathIDs []string) bool {
 	attemptPathIDs := normalizePathIDs("", pathIDs)
 	slot.pathIDs = mergePathIDs(slot.pathIDs, attemptPathIDs)
 	slot.attemptPathIDs = attemptPathIDs
+	if sentAt == 0 {
+		sentAt = slot.lastSentAt
+	}
+	if sentAt == 0 {
+		sentAt = slot.sentAt
+	}
+	slot.lastSentAt = sentAt
+	if slot.sentAtByPath == nil && len(attemptPathIDs) > 0 {
+		slot.sentAtByPath = make(map[string]int64, len(attemptPathIDs))
+	}
+	for _, pathID := range attemptPathIDs {
+		slot.sentAtByPath[pathID] = sentAt
+	}
 	return true
 }
 
@@ -113,7 +159,11 @@ func (ring *PendingRing) Due(now int64, minTimeoutMillis int64, maxTimeoutMillis
 	for i := range ring.slots {
 		slot := &ring.slots[i]
 		timeoutMillis := clampTimeout(slot.timeoutMillis, minTimeoutMillis, maxTimeoutMillis)
-		if !slot.active || now-slot.sentAt < timeoutMillis {
+		lastSentAt := slot.lastSentAt
+		if lastSentAt == 0 {
+			lastSentAt = slot.sentAt
+		}
+		if !slot.active || now-lastSentAt < timeoutMillis {
 			continue
 		}
 		if slot.tries >= maxRetries {
@@ -121,7 +171,7 @@ func (ring *PendingRing) Due(now int64, minTimeoutMillis int64, maxTimeoutMillis
 			continue
 		}
 		slot.tries++
-		slot.sentAt = now
+		slot.lastSentAt = now
 		slot.timeoutMillis = clampTimeout(timeoutMillis*2, minTimeoutMillis, maxTimeoutMillis)
 		due = append(due, RetryRecord{PendingRecord: slot.record()})
 	}
@@ -134,10 +184,22 @@ func (slot *pendingSlot) clear() {
 	slot.pathIDs = nil
 	slot.attemptPathIDs = nil
 	slot.fallbackPathIDs = nil
+	slot.sentAtByPath = nil
 }
 
 func (slot pendingSlot) record() PendingRecord {
-	return PendingRecord{ID: slot.id, PathID: slot.pathID, PathIDs: append([]string(nil), slot.pathIDs...), AttemptPathIDs: append([]string(nil), slot.attemptPathIDs...), FallbackPathIDs: append([]string(nil), slot.fallbackPathIDs...), SentAt: slot.sentAt, Tries: slot.tries, TimeoutMillis: slot.timeoutMillis, Payload: append([]byte(nil), slot.payload...)}
+	return PendingRecord{ID: slot.id, PathID: slot.pathID, PathIDs: append([]string(nil), slot.pathIDs...), AttemptPathIDs: append([]string(nil), slot.attemptPathIDs...), FallbackPathIDs: append([]string(nil), slot.fallbackPathIDs...), SentAt: slot.sentAt, LastSentAt: slot.lastSentAt, SentAtByPath: cloneSentAtByPath(slot.sentAtByPath), Tries: slot.tries, TimeoutMillis: slot.timeoutMillis, Payload: append([]byte(nil), slot.payload...)}
+}
+
+func cloneSentAtByPath(values map[string]int64) map[string]int64 {
+	if len(values) == 0 {
+		return nil
+	}
+	clone := make(map[string]int64, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
 }
 
 func normalizePathIDs(primary string, pathIDs []string) []string {

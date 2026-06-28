@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -14,8 +15,11 @@ const (
 	DefaultQueueSize              = 16
 	DefaultWriteBufferBytes       = 4 * 1024 * 1024
 	DefaultWriteBufferTargetBytes = 4 * 1024 * 1024
+	DefaultMaxWriteBufferBytes    = 64 * 1024 * 1024
 	DefaultWriteBatchSize         = udp.DefaultBatchSize
 )
+
+var ErrQueueFull = errors.New("relay target queue full")
 
 type UDPWriter interface {
 	SetWriteDeadline(time.Time) error
@@ -30,7 +34,11 @@ func SetWriteBufferForTargets(conn UDPWriter, targetCount int) error {
 	if targetCount < 1 {
 		targetCount = 1
 	}
-	return conn.SetWriteBuffer(DefaultWriteBufferBytes + (targetCount-1)*DefaultWriteBufferTargetBytes)
+	size := DefaultWriteBufferBytes + (targetCount-1)*DefaultWriteBufferTargetBytes
+	if size > DefaultMaxWriteBufferBytes {
+		size = DefaultMaxWriteBufferBytes
+	}
+	return conn.SetWriteBuffer(size)
 }
 
 type Target struct {
@@ -40,8 +48,10 @@ type Target struct {
 }
 
 type Result struct {
-	ID  string
-	Err error
+	ID      string
+	Err     error
+	Packets int
+	Bytes   int
 }
 
 type Dispatcher struct {
@@ -190,7 +200,11 @@ func (dispatcher *Dispatcher) FanoutBatch(payloads [][]byte, targets []Target) {
 		}
 	}
 	for _, group := range groups {
-		group.worker.enqueue(queuedBatch{packets: group.packets})
+		if !group.worker.enqueue(queuedBatch{packets: group.packets}) {
+			for _, packet := range group.packets {
+				dispatcher.reportTargetError(packet, ErrQueueFull)
+			}
+		}
 	}
 }
 
@@ -372,7 +386,19 @@ func (dispatcher *Dispatcher) failTarget(packet queuedPacket, err error) {
 	dispatcher.mu.Unlock()
 
 	if ok && dispatcher.onError != nil {
-		dispatcher.onError(Result{ID: packet.id, Err: err})
+		dispatcher.onError(Result{ID: packet.id, Err: err, Packets: 1, Bytes: len(packet.payload)})
+	}
+}
+
+func (dispatcher *Dispatcher) reportTargetError(packet queuedPacket, err error) {
+	if dispatcher.onError == nil {
+		return
+	}
+	dispatcher.mu.Lock()
+	_, ok := dispatcher.targets[packet.id]
+	dispatcher.mu.Unlock()
+	if ok {
+		dispatcher.onError(Result{ID: packet.id, Err: err, Packets: 1, Bytes: len(packet.payload)})
 	}
 }
 

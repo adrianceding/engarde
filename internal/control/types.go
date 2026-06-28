@@ -21,10 +21,12 @@ type WebInterface struct {
 }
 
 type TrafficCounters struct {
-	RXPackets uint64 `json:"rxPackets"`
-	RXBytes   uint64 `json:"rxBytes"`
-	TXPackets uint64 `json:"txPackets"`
-	TXBytes   uint64 `json:"txBytes"`
+	RXPackets   uint64 `json:"rxPackets"`
+	RXBytes     uint64 `json:"rxBytes"`
+	TXPackets   uint64 `json:"txPackets"`
+	TXBytes     uint64 `json:"txBytes"`
+	DropPackets uint64 `json:"dropPackets"`
+	DropBytes   uint64 `json:"dropBytes"`
 }
 
 type TrafficStats struct {

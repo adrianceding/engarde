@@ -100,8 +100,8 @@ export class AppComponent {
 
   emptyTraffic(): TrafficStats {
     return {
-      data: { rxPackets: 0, rxBytes: 0, txPackets: 0, txBytes: 0 },
-      control: { rxPackets: 0, rxBytes: 0, txPackets: 0, txBytes: 0 },
+      data: { rxPackets: 0, rxBytes: 0, txPackets: 0, txBytes: 0, dropPackets: 0, dropBytes: 0 },
+      control: { rxPackets: 0, rxBytes: 0, txPackets: 0, txBytes: 0, dropPackets: 0, dropBytes: 0 },
     };
   }
 

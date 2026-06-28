@@ -96,6 +96,10 @@ server:
   listenAddr: "0.0.0.0:59501"
   dstAddr: "127.0.0.1:59301"
   clientTimeout: 30
+  maxClients: 128
+  allowedClients:
+    - "203.0.113.10"
+    - "198.51.100.0/24"
   writeTimeout: 10
   udpBatch:
     enabled: true
@@ -113,12 +117,16 @@ server:
 
 - `writeTimeout`：socket 写超时，单位是毫秒。请使用普通整数；负数表示禁用写超时。
 - `udpBatch`：可选的 UDP 批量 I/O 设置。省略时默认启用；设置 `enabled: false` 可强制使用逐包 I/O，也可以通过 `readSize` 和 `writeSize` 调整批量大小用于本地性能测试。
-- `transfer`：可选的传输策略。`mode: direct` 保持原有 UDP 冗余发包；`mode: adaptive` 使用轻量 DATA/ACK 帧、keepalive、有界 pending/duplicate 窗口和每路径自适应 ACK 超时，先走当前最佳路径，超时后回退到所有健康路径。`ackTimeoutMillis` 是最小/初始超时。`directReceiveTimeout` 只在 `direct` 下生效：某条路由超过该秒数未收到包时会触发一次重建（exclude/include）。设为 `0` 表示关闭该机制，保留原逻辑。Adaptive DATA 帧会增加 36 字节头部；请设置 WireGuard MTU，让内部 UDP 包不超过 framed payload 上限。
+- `transfer`：可选的传输策略。`mode: direct` 保持原有 UDP 冗余发包；`mode: adaptive` 使用轻量 DATA/ACK 帧、keepalive、有界 pending/duplicate 窗口和每路径自适应 ACK 超时，先走当前最佳路径，超时后回退到所有健康路径。`ackTimeoutMillis` 是最小/初始超时。`directReceiveTimeout` 只在 `direct` 下生效：某条已经发送过流量但超过该秒数未收到包的路由会触发一次重建（exclude/include）。设为 `0` 表示关闭该机制。Adaptive DATA 帧会增加 36 字节头部；请设置 WireGuard MTU，让内部 UDP 包不超过 framed payload 上限。
 - `excludedInterfaces`：client 侧不参与中继转发的网卡。
 - `interfaceLabels`：在 Web UI 中显示的网卡友好名称。
 - `dstOverrides`：client 侧按网卡覆盖远端中继地址。
 - `clientTimeout`：server 侧活跃客户端超时时间，单位是秒。
+- `allowedClients`：server 侧客户端中继包来源 IP/CIDR 白名单。省略时会接受来源，直到达到 `maxClients`。
+- `maxClients`：server 最多学习的活跃客户端数。默认值为 `128`；设为 `0` 表示不限制。
 - `webManager`：可选的嵌入式 Web UI 和 JSON API 监听配置。
+
+Web/API 流量统计会显示 attempted TX 和 drop。队列满、写失败导致的丢包会分别计入 `dropPackets` 和 `dropBytes`。内部 UDP 写缓冲区请求有上限，避免活跃客户端过多时无限增长。
 
 `webManager` 示例：
 

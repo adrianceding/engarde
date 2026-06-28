@@ -207,6 +207,68 @@ func TestRemoveClient(t *testing.T) {
 	}
 }
 
+func TestDispatcherQueueFullDoesNotRemoveClient(t *testing.T) {
+	server := New(config.Server{}, "", nil)
+	server.wgSocket = newFakeUDPSocket()
+	t.Cleanup(server.dispatcher.Close)
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 41), Port: 5005}
+	server.clients[addr.String()] = &connectedClient{addr: addr}
+
+	server.handleDispatcherError(relay.Result{ID: addr.String(), Err: relay.ErrQueueFull, Packets: 1, Bytes: 64})
+
+	if !server.hasClient(addr.String()) {
+		t.Fatal("ErrQueueFull removed client; want client retained")
+	}
+	traffic := server.clients[addr.String()].traffic.Snapshot()
+	if traffic.Data.DropPackets != 1 || traffic.Data.DropBytes != 64 {
+		t.Fatalf("drop traffic = %#v, want 1 packet/64 bytes", traffic.Data)
+	}
+}
+
+func TestDirectReceiveRejectsDisallowedClient(t *testing.T) {
+	server := New(config.Server{AllowedClients: []string{"192.0.2.0/24"}, ClientTimeout: 30}, "", nil)
+	server.wgAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 51820}
+	allowed := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 5000}
+	disallowed := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 10), Port: 5000}
+	writeBatch := make([]udp.Packet, 0, 2)
+
+	server.handleDirectFromClient(udp.Packet{Payload: []byte("allowed")}, allowed, 100, &writeBatch)
+	server.handleDirectFromClient(udp.Packet{Payload: []byte("disallowed")}, disallowed, 100, &writeBatch)
+
+	if !server.hasClient(allowed.String()) {
+		t.Fatal("allowed client was not learned")
+	}
+	if server.hasClient(disallowed.String()) {
+		t.Fatal("disallowed client was learned")
+	}
+	if len(writeBatch) != 1 || string(writeBatch[0].Payload) != "allowed" {
+		t.Fatalf("writeBatch = %#v, want only allowed payload", writeBatch)
+	}
+}
+
+func TestDirectReceiveHonorsMaxClients(t *testing.T) {
+	maxClients := 1
+	server := New(config.Server{MaxClients: &maxClients, ClientTimeout: 30}, "", nil)
+	server.wgAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 51820}
+	first := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 5000}
+	second := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 11), Port: 5001}
+	writeBatch := make([]udp.Packet, 0, 3)
+
+	server.handleDirectFromClient(udp.Packet{Payload: []byte("first")}, first, 100, &writeBatch)
+	server.handleDirectFromClient(udp.Packet{Payload: []byte("second")}, second, 101, &writeBatch)
+	server.handleDirectFromClient(udp.Packet{Payload: []byte("first-again")}, first, 102, &writeBatch)
+
+	if !server.hasClient(first.String()) {
+		t.Fatal("first client was not learned")
+	}
+	if server.hasClient(second.String()) {
+		t.Fatal("second client was learned despite maxClients")
+	}
+	if len(writeBatch) != 2 || string(writeBatch[0].Payload) != "first" || string(writeBatch[1].Payload) != "first-again" {
+		t.Fatalf("writeBatch = %#v, want only first client payloads", writeBatch)
+	}
+}
+
 func TestRetryDoesNotRecreateRemovedClientPathStats(t *testing.T) {
 	server := New(config.Server{Transfer: config.Transfer{Mode: config.TransferModeAdaptive, AckTimeoutMillis: 10}}, "", nil)
 	id := server.tracker.NextID()

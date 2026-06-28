@@ -62,8 +62,9 @@ type Client struct {
 	wgAddrMu sync.RWMutex
 	wgAddr   *net.UDPAddr
 
-	routesMu sync.RWMutex
-	routes   map[string]*sendRoute
+	routesMu             sync.RWMutex
+	routes               map[string]*sendRoute
+	routeTargetsSnapshot []routeTargetSnapshot
 
 	dispatcher *relay.Dispatcher
 	tracker    *transport.Tracker
@@ -85,6 +86,11 @@ type sendRoute struct {
 	staleSince atomic.Int64
 	closing    atomic.Bool
 	traffic    stats.Traffic
+}
+
+type routeTargetSnapshot struct {
+	route  *sendRoute
+	target relay.Target
 }
 
 func (route *sendRoute) markSent(now int64) {
@@ -112,8 +118,15 @@ func (route *sendRoute) isReceiveStale(now int64) bool {
 }
 
 func (route *sendRoute) isDirectReceiveTimedOut(now int64, timeout int64) bool {
+	if timeout <= 0 {
+		return false
+	}
 	lastRec := route.lastRec.Load()
-	return lastRec > 0 && timeout > 0 && now-lastRec >= timeout
+	if lastRec > 0 {
+		return now-lastRec >= timeout
+	}
+	staleSince := route.staleSince.Load()
+	return staleSince > 0 && now-staleSince >= timeout
 }
 
 func New(cfg config.Client, version string, webFS fs.FS) *Client {
@@ -137,10 +150,19 @@ func New(cfg config.Client, version string, webFS fs.FS) *Client {
 		pathStats: make(map[string]*transport.PathStats),
 	}
 	client.dispatcher = relay.NewDispatcherWithBatch(cfg.WriteTimeout, relay.DefaultQueueSize, cfg.UDPBatch.IsEnabled(), cfg.UDPBatch.EffectiveWriteSize(), func(result relay.Result) {
-		log.WithError(result.Err).Warn("Error writing to '" + result.ID + "', re-creating socket")
-		client.removeRoute(result.ID)
+		client.handleDispatcherError(result)
 	})
 	return client
+}
+
+func (client *Client) handleDispatcherError(result relay.Result) {
+	client.recordDataDrop(result.ID, result.Packets, result.Bytes)
+	if errors.Is(result.Err, relay.ErrQueueFull) {
+		log.WithError(result.Err).Warn("Queue full for '" + result.ID + "', dropping packet")
+		return
+	}
+	log.WithError(result.Err).Warn("Error writing to '" + result.ID + "', re-creating socket")
+	client.removeRoute(result.ID)
 }
 
 func (client *Client) Run(ctx context.Context) error {
@@ -343,6 +365,7 @@ func (client *Client) createSendRoute(ifName string, ifIndex int, sourceAddr str
 		return
 	}
 	client.routes[ifName] = route
+	client.rebuildRouteTargetsSnapshotLocked()
 	client.routesMu.Unlock()
 	client.updateWireGuardWriteBuffer()
 	go client.writeBack(route)
@@ -541,7 +564,7 @@ func (client *Client) retryAdaptiveData(now int64) {
 		client.markRouteSent(target.ID)
 		client.recordDataTX([]relay.Target{target}, stats.AdaptiveDataPayloadSize(record.Payload))
 		client.dispatcher.Send(record.Payload, target)
-		client.tracker.RecordAttempt(record.ID, []string{target.ID})
+		client.tracker.RecordAttemptAt(record.ID, []string{target.ID}, now)
 	}
 }
 
@@ -585,14 +608,14 @@ func (client *Client) writeBackAdaptive(route *sendRoute, packets []udp.Packet, 
 		case transport.FrameProbeAck, transport.FrameKeepaliveAck:
 			route.traffic.Control.RecordRX(len(packet.Payload))
 			if record, ok := client.tracker.Complete(frame.ID); ok {
-				client.markPathSuccess(route.ifName, now, now-record.SentAt)
+				client.markPathSuccess(route.ifName, now, now-record.SentAtForPath(route.ifName))
 			} else {
 				client.markPathSuccess(route.ifName, now, now-frame.SentAt)
 			}
 		case transport.FrameAck:
 			route.traffic.Control.RecordRX(len(packet.Payload))
 			if record, ok := client.tracker.Complete(frame.ID); ok {
-				client.markPathSuccess(route.ifName, now, now-record.SentAt)
+				client.markPathSuccess(route.ifName, now, now-record.SentAtForPath(route.ifName))
 			} else {
 				client.markPathSuccess(route.ifName, now, now-frame.SentAt)
 			}
@@ -763,18 +786,32 @@ func (client *Client) routeIDsSorted() []string {
 }
 
 func (client *Client) routeTargetsSorted(markSent bool) []relay.Target {
+	client.ensureRouteTargetsSnapshot()
 	client.routesMu.RLock()
 	defer client.routesMu.RUnlock()
-	targets := make([]relay.Target, 0, len(client.routes))
+	targets := make([]relay.Target, 0, len(client.routeTargetsSnapshot))
 	now := time.Now().Unix()
-	for ifName, route := range client.routes {
+	for _, snapshot := range client.routeTargetsSnapshot {
 		if markSent {
-			route.markSent(now)
+			snapshot.route.markSent(now)
 		}
-		targets = append(targets, relay.Target{ID: ifName, Conn: route.socket, Addr: route.dstAddr})
+		targets = append(targets, snapshot.target)
 	}
-	sort.Slice(targets, func(i, j int) bool { return targets[i].ID < targets[j].ID })
 	return targets
+}
+
+func (client *Client) ensureRouteTargetsSnapshot() {
+	client.routesMu.RLock()
+	needsRebuild := len(client.routeTargetsSnapshot) != len(client.routes)
+	client.routesMu.RUnlock()
+	if !needsRebuild {
+		return
+	}
+	client.routesMu.Lock()
+	if len(client.routeTargetsSnapshot) != len(client.routes) {
+		client.rebuildRouteTargetsSnapshotLocked()
+	}
+	client.routesMu.Unlock()
 }
 
 func (client *Client) markRouteSent(ifName string) {
@@ -800,6 +837,25 @@ func (client *Client) recordDataTX(targets []relay.Target, payloadSize int) {
 		if route != nil {
 			route.traffic.Data.RecordTX(payloadSize)
 		}
+	}
+}
+
+func (client *Client) recordDataDrop(id string, packets int, bytes int) {
+	client.routesMu.RLock()
+	route := client.routes[id]
+	client.routesMu.RUnlock()
+	if route == nil {
+		return
+	}
+	if packets <= 0 {
+		packets = 1
+	}
+	for i := 0; i < packets; i++ {
+		dropBytes := 0
+		if i == 0 {
+			dropBytes = bytes
+		}
+		route.traffic.Data.RecordDrop(dropBytes)
 	}
 }
 
@@ -959,6 +1015,7 @@ func (client *Client) removeRoute(ifName string) {
 	route, ok := client.routes[ifName]
 	if ok {
 		delete(client.routes, ifName)
+		client.rebuildRouteTargetsSnapshotLocked()
 	}
 	client.routesMu.Unlock()
 	if ok {
@@ -981,12 +1038,22 @@ func (client *Client) closeAllRoutes() {
 	client.routesMu.Lock()
 	routes := client.routes
 	client.routes = make(map[string]*sendRoute)
+	client.routeTargetsSnapshot = nil
 	client.routesMu.Unlock()
 	client.dispatcher.Close()
 	for _, route := range routes {
 		route.closing.Store(true)
 		route.socket.Close()
 	}
+}
+
+func (client *Client) rebuildRouteTargetsSnapshotLocked() {
+	snapshot := make([]routeTargetSnapshot, 0, len(client.routes))
+	for ifName, route := range client.routes {
+		snapshot = append(snapshot, routeTargetSnapshot{route: route, target: relay.Target{ID: ifName, Conn: route.socket, Addr: route.dstAddr}})
+	}
+	sort.Slice(snapshot, func(i, j int) bool { return snapshot[i].target.ID < snapshot[j].target.ID })
+	client.routeTargetsSnapshot = snapshot
 }
 
 func (client *Client) updateWireGuardWriteBuffer() {

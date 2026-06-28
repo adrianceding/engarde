@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,12 +41,16 @@ type Server struct {
 	version string
 	webFS   fs.FS
 
+	allowedClientIPs  []net.IP
+	allowedClientNets []*net.IPNet
+
 	wgSocket     udpSocket
 	clientSocket udpSocket
 	wgAddr       *net.UDPAddr
 
-	clientsMu sync.RWMutex
-	clients   map[string]*connectedClient
+	clientsMu             sync.RWMutex
+	clients               map[string]*connectedClient
+	clientTargetsSnapshot []clientTargetSnapshot
 
 	dispatcher *relay.Dispatcher
 	tracker    *transport.Tracker
@@ -62,21 +67,39 @@ type connectedClient struct {
 	traffic stats.Traffic
 }
 
+type clientTargetSnapshot struct {
+	client *connectedClient
+	target relay.Target
+}
+
 func New(cfg config.Server, version string, webFS fs.FS) *Server {
 	cfg.Transfer.ApplyDefaults()
+	cfg.ApplyDefaults()
+	allowedClientIPs, allowedClientNets := parseAllowedClients(cfg.AllowedClients)
 	server := &Server{
-		cfg:       cfg,
-		version:   version,
-		webFS:     webFS,
-		clients:   make(map[string]*connectedClient),
-		tracker:   transport.NewTracker(cfg.Transfer.PendingWindow, cfg.Transfer.DuplicateWindow),
-		pathStats: make(map[string]*transport.PathStats),
+		cfg:               cfg,
+		version:           version,
+		webFS:             webFS,
+		allowedClientIPs:  allowedClientIPs,
+		allowedClientNets: allowedClientNets,
+		clients:           make(map[string]*connectedClient),
+		tracker:           transport.NewTracker(cfg.Transfer.PendingWindow, cfg.Transfer.DuplicateWindow),
+		pathStats:         make(map[string]*transport.PathStats),
 	}
 	server.dispatcher = relay.NewDispatcherWithBatch(cfg.WriteTimeout, relay.DefaultQueueSize, cfg.UDPBatch.IsEnabled(), cfg.UDPBatch.EffectiveWriteSize(), func(result relay.Result) {
-		log.WithError(result.Err).Warn("Error writing to client '" + result.ID + "', terminating it")
-		server.removeClient(result.ID)
+		server.handleDispatcherError(result)
 	})
 	return server
+}
+
+func (server *Server) handleDispatcherError(result relay.Result) {
+	server.recordClientDataDrop(result.ID, result.Packets, result.Bytes)
+	if errors.Is(result.Err, relay.ErrQueueFull) {
+		log.WithError(result.Err).Warn("Queue full for client '" + result.ID + "', dropping packet")
+		return
+	}
+	log.WithError(result.Err).Warn("Error writing to client '" + result.ID + "', terminating it")
+	server.removeClient(result.ID)
 }
 
 func (server *Server) Run(ctx context.Context) error {
@@ -187,16 +210,17 @@ func (server *Server) receiveFromClient(ctx context.Context) error {
 			if addr == nil {
 				continue
 			}
-			if !containsUDPAddr(learnedAddrs, addr) {
-				server.learnClientAt(addr, now)
-				learnedAddrs = append(learnedAddrs, addr)
-			}
 			if server.adaptiveEnabled() {
+				if !containsUDPAddr(learnedAddrs, addr) {
+					server.learnClientAt(addr, now)
+					learnedAddrs = append(learnedAddrs, addr)
+				}
 				server.handleAdaptiveFromClient(readBatch[i], addr, now, nowMillis, &writeBatch)
 				continue
 			}
-			server.recordClientDataRX(addr.String(), len(readBatch[i].Payload))
-			writeBatch = append(writeBatch, udp.Packet{Payload: readBatch[i].Payload, Addr: server.wgAddr})
+			if server.handleDirectFromClient(readBatch[i], addr, now, &writeBatch) && !containsUDPAddr(learnedAddrs, addr) {
+				learnedAddrs = append(learnedAddrs, addr)
+			}
 		}
 		if _, err := udp.WriteBatchChunks(server.wgSocket, writeBatch, server.cfg.UDPBatch.IsEnabled(), server.cfg.UDPBatch.EffectiveWriteSize()); err != nil {
 			log.WithError(err).Warn("Error writing to WireGuard")
@@ -208,6 +232,57 @@ func (server *Server) receiveFromClient(ctx context.Context) error {
 			log.WithError(err).Warn("Error reading from client")
 		}
 	}
+}
+
+func parseAllowedClients(values []string) ([]net.IP, []*net.IPNet) {
+	ips := make([]net.IP, 0, len(values))
+	networks := make([]*net.IPNet, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if ip := net.ParseIP(value); ip != nil {
+			ips = append(ips, ip)
+			continue
+		}
+		if _, network, err := net.ParseCIDR(value); err == nil {
+			networks = append(networks, network)
+		}
+	}
+	return ips, networks
+}
+
+func (server *Server) clientAllowed(addr *net.UDPAddr) bool {
+	if addr == nil || addr.IP == nil {
+		return false
+	}
+	if len(server.allowedClientIPs) == 0 && len(server.allowedClientNets) == 0 {
+		return true
+	}
+	for _, ip := range server.allowedClientIPs {
+		if ip.Equal(addr.IP) {
+			return true
+		}
+	}
+	for _, network := range server.allowedClientNets {
+		if network.Contains(addr.IP) {
+			return true
+		}
+	}
+	return false
+}
+
+func (server *Server) handleDirectFromClient(packet udp.Packet, addr *net.UDPAddr, now int64, writeBatch *[]udp.Packet) bool {
+	if !server.clientAllowed(addr) {
+		return false
+	}
+	if !server.learnClientAt(addr, now) {
+		return false
+	}
+	server.recordClientDataRX(addr.String(), len(packet.Payload))
+	*writeBatch = append(*writeBatch, udp.Packet{Payload: packet.Payload, Addr: server.wgAddr})
+	return true
 }
 
 func (server *Server) receiveFromWireGuard(ctx context.Context) {
@@ -300,14 +375,14 @@ func (server *Server) handleAdaptiveFromClient(packet udp.Packet, addr *net.UDPA
 	case transport.FrameProbeAck, transport.FrameKeepaliveAck:
 		server.recordClientControlRX(addr.String(), len(packet.Payload))
 		if record, ok := server.tracker.Complete(frame.ID); ok {
-			server.markPathSuccess(addr.String(), nowMillis, nowMillis-record.SentAt)
+			server.markPathSuccess(addr.String(), nowMillis, nowMillis-record.SentAtForPath(addr.String()))
 		} else {
 			server.markPathSuccess(addr.String(), nowMillis, nowMillis-frame.SentAt)
 		}
 	case transport.FrameAck:
 		server.recordClientControlRX(addr.String(), len(packet.Payload))
 		if record, ok := server.tracker.Complete(frame.ID); ok {
-			server.markPathSuccess(addr.String(), nowMillis, nowMillis-record.SentAt)
+			server.markPathSuccess(addr.String(), nowMillis, nowMillis-record.SentAtForPath(addr.String()))
 		} else {
 			server.markPathSuccess(addr.String(), nowMillis, nowMillis-frame.SentAt)
 		}
@@ -381,7 +456,7 @@ func (server *Server) retryAdaptiveData(now int64) {
 		}
 		server.recordDataTX([]relay.Target{target}, stats.AdaptiveDataPayloadSize(record.Payload))
 		server.dispatcher.Send(record.Payload, target)
-		server.tracker.RecordAttempt(record.ID, []string{target.ID})
+		server.tracker.RecordAttemptAt(record.ID, []string{target.ID}, now)
 	}
 }
 
@@ -567,6 +642,23 @@ func (server *Server) recordClientDataTX(id string, payloadSize int) {
 	}
 }
 
+func (server *Server) recordClientDataDrop(id string, packets int, bytes int) {
+	client := server.clientByID(id)
+	if client == nil {
+		return
+	}
+	if packets <= 0 {
+		packets = 1
+	}
+	for i := 0; i < packets; i++ {
+		dropBytes := 0
+		if i == 0 {
+			dropBytes = bytes
+		}
+		client.traffic.Data.RecordDrop(dropBytes)
+	}
+}
+
 func (server *Server) recordClientControlRX(id string, payloadSize int) {
 	if client := server.clientByID(id); client != nil {
 		client.traffic.Control.RecordRX(payloadSize)
@@ -704,27 +796,40 @@ func (server *Server) maxAckTimeoutMillis() int64 {
 	return server.minAckTimeoutMillis()
 }
 
-func (server *Server) learnClient(addr *net.UDPAddr) {
-	server.learnClientAt(addr, time.Now().Unix())
+func (server *Server) learnClient(addr *net.UDPAddr) bool {
+	return server.learnClientAt(addr, time.Now().Unix())
 }
 
-func (server *Server) learnClientAt(addr *net.UDPAddr, now int64) {
+func (server *Server) learnClientAt(addr *net.UDPAddr, now int64) bool {
 	key := addr.String()
 	server.clientsMu.RLock()
 	client, ok := server.clients[key]
 	server.clientsMu.RUnlock()
 	if ok {
 		client.last.Store(now)
-		return
+		return true
+	}
+
+	server.clientsMu.Lock()
+	if client, ok := server.clients[key]; ok {
+		server.clientsMu.Unlock()
+		client.last.Store(now)
+		return true
+	}
+	maxClients := server.cfg.MaxClientsValue()
+	if maxClients > 0 && len(server.clients) >= maxClients {
+		server.clientsMu.Unlock()
+		return false
 	}
 
 	log.Info("New client connected: '" + key + "'")
 	client = &connectedClient{addr: addr}
 	client.last.Store(now)
-	server.clientsMu.Lock()
 	server.clients[key] = client
+	server.rebuildClientTargetsSnapshotLocked()
 	server.clientsMu.Unlock()
 	server.updateWireGuardWriteBuffer()
+	return true
 }
 
 func containsUDPAddr(addrs []*net.UDPAddr, addr *net.UDPAddr) bool {
@@ -755,13 +860,16 @@ func (server *Server) hasClient(id string) bool {
 }
 
 func (server *Server) clientTargetsSorted(now int64) []relay.Target {
+	server.ensureClientTargetsSnapshot()
 	targets := make([]relay.Target, 0)
 	expired := make([]string, 0)
 	cutoff := now - server.cfg.ClientTimeout
 	server.clientsMu.RLock()
-	for address, client := range server.clients {
+	for _, snapshot := range server.clientTargetsSnapshot {
+		address := snapshot.target.ID
+		client := snapshot.client
 		if client.last.Load() > cutoff {
-			targets = append(targets, relay.Target{ID: address, Conn: server.clientSocket, Addr: client.addr})
+			targets = append(targets, snapshot.target)
 			continue
 		}
 		expired = append(expired, address)
@@ -772,8 +880,21 @@ func (server *Server) clientTargetsSorted(now int64) []relay.Target {
 		log.Info("Client '" + address + "' timed out")
 		server.removeExpiredClient(address, cutoff)
 	}
-	sort.Slice(targets, func(i, j int) bool { return targets[i].ID < targets[j].ID })
 	return targets
+}
+
+func (server *Server) ensureClientTargetsSnapshot() {
+	server.clientsMu.RLock()
+	needsRebuild := len(server.clientTargetsSnapshot) != len(server.clients)
+	server.clientsMu.RUnlock()
+	if !needsRebuild {
+		return
+	}
+	server.clientsMu.Lock()
+	if len(server.clientTargetsSnapshot) != len(server.clients) {
+		server.rebuildClientTargetsSnapshotLocked()
+	}
+	server.clientsMu.Unlock()
 }
 
 func (server *Server) clientIDsSorted(now int64) []string {
@@ -808,6 +929,7 @@ func (server *Server) removeExpiredClient(address string, cutoff int64) {
 	removed := false
 	if client.last.Load() <= cutoff {
 		delete(server.clients, address)
+		server.rebuildClientTargetsSnapshotLocked()
 		removed = true
 	}
 	server.clientsMu.Unlock()
@@ -823,6 +945,7 @@ func (server *Server) removeClient(address string) {
 	_, removed := server.clients[address]
 	if removed {
 		delete(server.clients, address)
+		server.rebuildClientTargetsSnapshotLocked()
 	}
 	server.clientsMu.Unlock()
 	if removed {
@@ -830,6 +953,15 @@ func (server *Server) removeClient(address string) {
 		server.removePathStats(address)
 		server.updateWireGuardWriteBuffer()
 	}
+}
+
+func (server *Server) rebuildClientTargetsSnapshotLocked() {
+	snapshot := make([]clientTargetSnapshot, 0, len(server.clients))
+	for address, client := range server.clients {
+		snapshot = append(snapshot, clientTargetSnapshot{client: client, target: relay.Target{ID: address, Conn: server.clientSocket, Addr: client.addr}})
+	}
+	sort.Slice(snapshot, func(i, j int) bool { return snapshot[i].target.ID < snapshot[j].target.ID })
+	server.clientTargetsSnapshot = snapshot
 }
 
 func (server *Server) removePathStats(id string) {

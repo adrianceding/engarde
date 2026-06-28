@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -24,6 +25,7 @@ type Config struct {
 const (
 	DefaultUDPBatchReadSize  = 32
 	DefaultUDPBatchWriteSize = 32
+	DefaultServerMaxClients  = 128
 )
 
 const (
@@ -194,14 +196,30 @@ type DstOverride struct {
 }
 
 type Server struct {
-	Description   string     `yaml:"description"`
-	ListenAddr    string     `yaml:"listenAddr"`
-	DstAddr       string     `yaml:"dstAddr"`
-	WriteTimeout  int64      `yaml:"writeTimeout"`
-	ClientTimeout int64      `yaml:"clientTimeout"`
-	UDPBatch      UDPBatch   `yaml:"udpBatch"`
-	Transfer      Transfer   `yaml:"transfer"`
-	WebManager    WebManager `yaml:"webManager"`
+	Description    string     `yaml:"description"`
+	ListenAddr     string     `yaml:"listenAddr"`
+	DstAddr        string     `yaml:"dstAddr"`
+	WriteTimeout   int64      `yaml:"writeTimeout"`
+	ClientTimeout  int64      `yaml:"clientTimeout"`
+	AllowedClients []string   `yaml:"allowedClients"`
+	MaxClients     *int       `yaml:"maxClients"`
+	UDPBatch       UDPBatch   `yaml:"udpBatch"`
+	Transfer       Transfer   `yaml:"transfer"`
+	WebManager     WebManager `yaml:"webManager"`
+}
+
+func (server *Server) ApplyDefaults() {
+	if server.MaxClients == nil {
+		maxClients := DefaultServerMaxClients
+		server.MaxClients = &maxClients
+	}
+}
+
+func (server Server) MaxClientsValue() int {
+	if server.MaxClients == nil {
+		return DefaultServerMaxClients
+	}
+	return *server.MaxClients
 }
 
 func Load(filename string) (*Config, Role, error) {
@@ -267,6 +285,7 @@ func (cfg *Config) ApplyDefaults(role Role) {
 		if cfg.Server.ClientTimeout == 0 {
 			cfg.Server.ClientTimeout = 30
 		}
+		cfg.Server.ApplyDefaults()
 		cfg.Server.UDPBatch.ApplyDefaults()
 		cfg.Server.Transfer.ApplyDefaults()
 	}
@@ -277,7 +296,33 @@ func (cfg Config) Validate(role Role) error {
 	case RoleClient:
 		return cfg.Client.Transfer.Validate("client")
 	case RoleServer:
-		return cfg.Server.Transfer.Validate("server")
+		if err := cfg.Server.Transfer.Validate("server"); err != nil {
+			return err
+		}
+		if cfg.Server.MaxClients == nil {
+			return errors.New("server.maxClients must be set")
+		}
+		if *cfg.Server.MaxClients < 0 {
+			return errors.New("server.maxClients must not be negative")
+		}
+		return validateAllowedClients(cfg.Server.AllowedClients)
+	}
+	return nil
+}
+
+func validateAllowedClients(values []string) error {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return errors.New("server.allowedClients contains an empty entry")
+		}
+		if ip := net.ParseIP(value); ip != nil {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(value); err == nil {
+			continue
+		}
+		return fmt.Errorf("server.allowedClients contains invalid IP/CIDR %q", value)
 	}
 	return nil
 }
@@ -287,7 +332,7 @@ func (cfg Config) clientPresent() bool {
 }
 
 func (cfg Config) serverPresent() bool {
-	return cfg.Server.Description != "" || cfg.Server.ListenAddr != "" || cfg.Server.DstAddr != "" || cfg.Server.WriteTimeout != 0 || cfg.Server.ClientTimeout != 0 || cfg.Server.UDPBatch.present() || cfg.Server.Transfer.present() || webPresent(cfg.Server.WebManager)
+	return cfg.Server.Description != "" || cfg.Server.ListenAddr != "" || cfg.Server.DstAddr != "" || cfg.Server.WriteTimeout != 0 || cfg.Server.ClientTimeout != 0 || len(cfg.Server.AllowedClients) > 0 || cfg.Server.MaxClients != nil || cfg.Server.UDPBatch.present() || cfg.Server.Transfer.present() || webPresent(cfg.Server.WebManager)
 }
 
 func webPresent(web WebManager) bool {

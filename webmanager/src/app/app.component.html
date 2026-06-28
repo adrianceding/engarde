@@ -43,6 +43,10 @@
                   <div class="stat-label">Data out</div>
                   <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.txPackets, traffic(iface).data.txBytes) }}</div>
                 </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data drop</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.dropPackets, traffic(iface).data.dropBytes) }}</div>
+                </div>
                 <div class="stat-block stat-control">
                   <div class="stat-label">Control in</div>
                   <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.rxPackets, traffic(iface).control.rxBytes) }}</div>
@@ -50,6 +54,10 @@
                 <div class="stat-block stat-control">
                   <div class="stat-label">Control out</div>
                   <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.txPackets, traffic(iface).control.txBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control drop</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.dropPackets, traffic(iface).control.dropBytes) }}</div>
                 </div>
               </div>
               @if (iface.path) {
@@ -96,6 +104,10 @@
                   <div class="stat-label">Data out</div>
                   <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.txPackets, traffic(iface).data.txBytes) }}</div>
                 </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data drop</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.dropPackets, traffic(iface).data.dropBytes) }}</div>
+                </div>
                 <div class="stat-block stat-control">
                   <div class="stat-label">Control in</div>
                   <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.rxPackets, traffic(iface).control.rxBytes) }}</div>
@@ -103,6 +115,10 @@
                 <div class="stat-block stat-control">
                   <div class="stat-label">Control out</div>
                   <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.txPackets, traffic(iface).control.txBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control drop</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.dropPackets, traffic(iface).control.dropBytes) }}</div>
                 </div>
               </div>
             </mat-card-content>
@@ -141,6 +157,10 @@
                   <div class="stat-label">Data out</div>
                   <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.txPackets, traffic(iface).data.txBytes) }}</div>
                 </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data drop</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.dropPackets, traffic(iface).data.dropBytes) }}</div>
+                </div>
                 <div class="stat-block stat-control">
                   <div class="stat-label">Control in</div>
                   <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.rxPackets, traffic(iface).control.rxBytes) }}</div>
@@ -148,6 +168,10 @@
                 <div class="stat-block stat-control">
                   <div class="stat-label">Control out</div>
                   <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.txPackets, traffic(iface).control.txBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control drop</div>
+                  <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.dropPackets, traffic(iface).control.dropBytes) }}</div>
                 </div>
               </div>
             </mat-card-content>
@@ -196,6 +220,10 @@
                 <div class="stat-label">Data out</div>
                 <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.txPackets, traffic(iface).data.txBytes) }}</div>
               </div>
+              <div class="stat-block stat-data">
+                <div class="stat-label">Data drop</div>
+                <div class="stat-value">{{ formatPacketBytes(traffic(iface).data.dropPackets, traffic(iface).data.dropBytes) }}</div>
+              </div>
               <div class="stat-block stat-control">
                 <div class="stat-label">Control in</div>
                 <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.rxPackets, traffic(iface).control.rxBytes) }}</div>
@@ -203,6 +231,10 @@
               <div class="stat-block stat-control">
                 <div class="stat-label">Control out</div>
                 <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.txPackets, traffic(iface).control.txBytes) }}</div>
+              </div>
+              <div class="stat-block stat-control">
+                <div class="stat-label">Control drop</div>
+                <div class="stat-value">{{ formatPacketBytes(traffic(iface).control.dropPackets, traffic(iface).control.dropBytes) }}</div>
               </div>
             </div>
             @if (iface.path) {

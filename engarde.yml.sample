@@ -20,8 +20,8 @@ client:
   # lightweight DATA/ACK frames, keepalives, and bounded retry windows to send on
   # the best path first, then fall back to all healthy paths after adaptive ACK
   # timeout. ackTimeoutMillis is the minimum/initial ACK timeout. directReceiveTimeout
-  # is direct-mode timeout in seconds: if no packets are received for this duration,
-  # the route is re-created. 0 disables the behavior. Adaptive DATA frames add a
+  # is direct-mode timeout in seconds: if an outbound-active route receives no
+  # packets for this duration, it is re-created. 0 disables the behavior. Adaptive DATA frames add a
   # 36-byte header; set WireGuard MTU so inner UDP packets fit.
   transfer:
     mode: direct
@@ -55,6 +55,12 @@ client:
 #   listenAddr: "0.0.0.0:59501"
 #   dstAddr: "127.0.0.1:59301"
 #   clientTimeout: 30
+#   # Source IP/CIDR allowlist for client relay packets. Omit to accept sources
+#   # until maxClients is reached. maxClients defaults to 128; 0 means unlimited.
+#   maxClients: 128
+#   allowedClients:
+#     - "203.0.113.10"
+#     - "198.51.100.0/24"
 #   # Socket write timeout in milliseconds. Use a plain integer; negative disables the timeout.
 #   writeTimeout: 10
 #   # UDP batch I/O is enabled by default when this block is omitted.

@@ -130,6 +130,67 @@ func TestPendingRingDueUsesRecordTimeoutAndBackoff(t *testing.T) {
 	}
 }
 
+func TestPendingRingDuePreservesOriginalSentAtForRetryRTT(t *testing.T) {
+	ring := NewPendingRing(2)
+	id := PacketID{Session: 1, Sequence: 1}
+	ring.Put(PendingRecord{ID: id, PathID: "eth0", SentAt: 100, TimeoutMillis: 50, Payload: []byte("first")})
+
+	due := ring.Due(200, 50, 1000, 2)
+	if len(due) != 1 {
+		t.Fatalf("due = %#v, want one retry", due)
+	}
+	record, ok := ring.Get(id)
+	if !ok {
+		t.Fatal("record missing after retry")
+	}
+	if record.SentAt != 100 {
+		t.Fatalf("SentAt after retry = %d, want original 100", record.SentAt)
+	}
+}
+
+func TestPendingRingRecordsInitialSentAtForAllAttemptPaths(t *testing.T) {
+	ring := NewPendingRing(2)
+	id := PacketID{Session: 1, Sequence: 1}
+	ring.Put(PendingRecord{ID: id, PathID: "eth0", PathIDs: []string{"eth0", "eth1"}, AttemptPathIDs: []string{"eth0", "eth1"}, SentAt: 100, Payload: []byte("first")})
+
+	record, ok := ring.Get(id)
+	if !ok {
+		t.Fatal("record missing")
+	}
+	if got := record.SentAtForPath("eth0"); got != 100 {
+		t.Fatalf("eth0 sentAt = %d, want 100", got)
+	}
+	if got := record.SentAtForPath("eth1"); got != 100 {
+		t.Fatalf("eth1 sentAt = %d, want 100", got)
+	}
+}
+
+func TestPendingRingRecordsSentAtPerAttemptPath(t *testing.T) {
+	ring := NewPendingRing(2)
+	id := PacketID{Session: 1, Sequence: 1}
+	ring.Put(PendingRecord{ID: id, PathID: "eth0", SentAt: 100, TimeoutMillis: 50, Payload: []byte("first")})
+
+	if due := ring.Due(200, 50, 1000, 2); len(due) != 1 {
+		t.Fatalf("due = %#v, want one retry", due)
+	}
+	if !ring.RecordAttemptAt(id, []string{"eth1"}, 210) {
+		t.Fatal("RecordAttemptAt returned false")
+	}
+	record, ok := ring.Get(id)
+	if !ok {
+		t.Fatal("record missing after retry")
+	}
+	if got := record.SentAtForPath("eth0"); got != 100 {
+		t.Fatalf("eth0 sentAt = %d, want 100", got)
+	}
+	if got := record.SentAtForPath("eth1"); got != 210 {
+		t.Fatalf("eth1 sentAt = %d, want 210", got)
+	}
+	if record.SentAt != 100 || record.LastSentAt != 210 {
+		t.Fatalf("record timing = %#v, want original 100 and last 210", record)
+	}
+}
+
 func TestDuplicateWindowSuppressesRecentDuplicates(t *testing.T) {
 	window := NewDuplicateWindow(2)
 	first := PacketID{Session: 1, Sequence: 1}
