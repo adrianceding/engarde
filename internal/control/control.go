@@ -16,6 +16,9 @@ import (
 var newHTTPServer = func(addr string, handler http.Handler) *http.Server {
 	return &http.Server{Addr: addr, Handler: handler}
 }
+var listenAndServeHTTPServer = func(server *http.Server) error {
+	return server.ListenAndServe()
+}
 var shutdownHTTPServer = func(server *http.Server, ctx context.Context) error {
 	return server.Shutdown(ctx)
 }
@@ -35,8 +38,17 @@ type ClientActions interface {
 func Run(ctx context.Context, listenAddr, username, password string, webFS fs.FS, status StatusProvider, actions ClientActions) error {
 	server := newHTTPServer(listenAddr, NewMux(webFS, status, actions, username, password))
 
+	stopShutdownWatcher := make(chan struct{})
+	shutdownWatcherDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		defer close(shutdownWatcherDone)
+		select {
+		case <-ctx.Done():
+		case <-stopShutdownWatcher:
+			if ctx.Err() == nil {
+				return
+			}
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := shutdownHTTPServer(server, shutdownCtx); err != nil {
@@ -45,7 +57,10 @@ func Run(ctx context.Context, listenAddr, username, password string, webFS fs.FS
 	}()
 
 	log.Info("Management webserver listening on " + listenAddr)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	err := listenAndServeHTTPServer(server)
+	close(stopShutdownWatcher)
+	<-shutdownWatcherDone
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil

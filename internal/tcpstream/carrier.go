@@ -17,6 +17,7 @@ type Carrier struct {
 	done          chan struct{}
 	readDone      chan struct{}
 	processDone   chan struct{}
+	detached      chan struct{}
 	closeOnce     sync.Once
 	finishOnce    sync.Once
 	stateMu       sync.Mutex
@@ -62,6 +63,7 @@ func newCarrier(conn net.Conn, maxPayload uint32, queueBytes, chunkSize int, wri
 		done:         make(chan struct{}),
 		readDone:     make(chan struct{}),
 		processDone:  make(chan struct{}),
+		detached:     make(chan struct{}),
 		onFrame:      onFrame,
 		onClose:      onClose,
 		observer:     observer,
@@ -78,6 +80,11 @@ func (carrier *Carrier) Done() <-chan struct{} {
 	return carrier.done
 }
 
+// Detached is closed after the carrier's close callback has completed.
+func (carrier *Carrier) Detached() <-chan struct{} {
+	return carrier.detached
+}
+
 func (carrier *Carrier) preservesInbound() bool {
 	carrier.stateMu.Lock()
 	defer carrier.stateMu.Unlock()
@@ -91,13 +98,17 @@ func (carrier *Carrier) reportSkip(frame Frame) {
 }
 
 func (carrier *Carrier) enqueue(frame Frame, block bool) bool {
+	if !carrier.beginEnqueue() {
+		return false
+	}
+	return carrier.enqueueBegun(frame, block)
+}
+
+func (carrier *Carrier) enqueueBegun(frame Frame, block bool) bool {
 	item := queuedFrame{frame: frame}
 	if block {
 		item.completion = frameCompletionPool.Get().(chan bool)
 		defer frameCompletionPool.Put(item.completion)
-	}
-	if !carrier.beginEnqueue() {
-		return false
 	}
 	sent := false
 	if block {
@@ -365,6 +376,7 @@ func (carrier *Carrier) finishClose() {
 			carrier.stateMu.Unlock()
 			carrier.onClose(carrier, preserveRead)
 		}
+		close(carrier.detached)
 	})
 }
 

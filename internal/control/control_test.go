@@ -213,22 +213,51 @@ func TestFileServerErrorsAndStaticFile(t *testing.T) {
 
 func TestRunStartsAndStops(t *testing.T) {
 	originalNewHTTPServer := newHTTPServer
+	originalListenAndServeHTTPServer := listenAndServeHTTPServer
 	originalShutdownHTTPServer := shutdownHTTPServer
-	t.Cleanup(func() { newHTTPServer = originalNewHTTPServer; shutdownHTTPServer = originalShutdownHTTPServer })
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	addr := strings.TrimPrefix(server.URL, "http://")
-	server.Close()
+	t.Cleanup(func() {
+		newHTTPServer = originalNewHTTPServer
+		listenAndServeHTTPServer = originalListenAndServeHTTPServer
+		shutdownHTTPServer = originalShutdownHTTPServer
+	})
+	created := make(chan *http.Server, 1)
+	serveStarted := make(chan struct{})
+	serveResult := make(chan error, 1)
+	shutdownCalled := make(chan struct{})
+	newHTTPServer = func(addr string, handler http.Handler) *http.Server {
+		server := &http.Server{Addr: addr, Handler: handler}
+		created <- server
+		return server
+	}
+	listenAndServeHTTPServer = func(*http.Server) error {
+		close(serveStarted)
+		return <-serveResult
+	}
+	shutdownHTTPServer = func(*http.Server, context.Context) error {
+		close(shutdownCalled)
+		serveResult <- http.ErrServerClosed
+		return nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Run(ctx, addr, "", "", testFS(), staticStatus{value: ServerStatus{}}, nil) }()
-	for i := 0; i < 100; i++ {
-		_, err := http.Get("http://" + addr + "/api/v1/get-list")
-		if err == nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	go func() { done <- Run(ctx, "127.0.0.1:0", "", "", testFS(), staticStatus{value: ServerStatus{}}, nil) }()
+	var server *http.Server
+	select {
+	case server = <-created:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP server was not created")
+	}
+	select {
+	case <-serveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP server did not start serving")
 	}
 	cancel()
+	select {
+	case <-shutdownCalled:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP server shutdown was not requested")
+	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -236,6 +265,9 @@ func TestRunStartsAndStops(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Run did not stop")
+	}
+	if server.Addr != "127.0.0.1:0" || server.Handler == nil {
+		t.Fatalf("HTTP server addr/handler = %q/%v, want configured server", server.Addr, server.Handler)
 	}
 }
 

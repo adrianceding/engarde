@@ -2,7 +2,6 @@ package tcpstream
 
 import (
 	"net"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -20,10 +19,8 @@ func (conn *writeStartedConn) Write(payload []byte) (int, error) {
 }
 
 func TestCarrierWriteFailureReleasesPendingEnqueues(t *testing.T) {
-	testCarrierReleasesPendingEnqueues(t, func(carrier *Carrier, peer net.Conn) {
-		if err := peer.Close(); err != nil {
-			t.Fatal(err)
-		}
+	testCarrierReleasesPendingEnqueues(t, func(_ *Carrier, peer net.Conn) error {
+		return peer.Close()
 	})
 }
 
@@ -125,18 +122,49 @@ func TestCarrierAlternatesReadyAcknowledgementAndData(t *testing.T) {
 }
 
 func TestCarrierCloseReleasesPendingEnqueuesAtCapacityOne(t *testing.T) {
-	testCarrierReleasesPendingEnqueues(t, func(carrier *Carrier, _ net.Conn) {
-		closed := make(chan error, 1)
-		go func() { closed <- carrier.Close() }()
-		select {
-		case err := <-closed:
-			if err != nil {
-				t.Fatal(err)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("Carrier.Close blocked behind a full enqueue")
-		}
+	testCarrierReleasesPendingEnqueues(t, func(carrier *Carrier, _ net.Conn) error {
+		return carrier.Close()
 	})
+}
+
+func TestCarrierDetachedWaitsForCloseCallbackCompletion(t *testing.T) {
+	carrierConn, peer := net.Pipe()
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	carrier := newCarrier(
+		carrierConn,
+		MaxPayloadSize,
+		1024,
+		1024,
+		time.Second,
+		func(*Carrier, Frame) error { return nil },
+		func(*Carrier, bool) {
+			close(callbackStarted)
+			<-releaseCallback
+		},
+		CarrierObserver{},
+	)
+	carrier.start()
+	t.Cleanup(func() { _ = peer.Close() })
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- carrier.Close() }()
+	waitForCarrierLoop(t, "carrier close callback start", callbackStarted)
+	select {
+	case <-carrier.Detached():
+		t.Fatal("Detached closed before the close callback returned")
+	default:
+	}
+	close(releaseCallback)
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Carrier.Close did not return after the close callback was released")
+	}
+	waitForCarrierLoop(t, "carrier detached", carrier.Detached())
 }
 
 func TestCarrierPeerEOFWaitsToDetachUntilLastFrameProcessing(t *testing.T) {
@@ -259,11 +287,8 @@ func TestCarrierWriteFailureStillProcessesCompletedInboundFrame(t *testing.T) {
 	waitForCarrierLoop(t, "carrier process", carrier.processDone)
 }
 
-func testCarrierReleasesPendingEnqueues(t *testing.T, stop func(*Carrier, net.Conn)) {
+func testCarrierReleasesPendingEnqueues(t *testing.T, stop func(*Carrier, net.Conn) error) {
 	t.Helper()
-	previousProcs := runtime.GOMAXPROCS(1)
-	defer runtime.GOMAXPROCS(previousProcs)
-
 	carrierConn, peer := net.Pipe()
 	started := make(chan struct{})
 	finished := make(chan struct{})
@@ -286,7 +311,7 @@ func testCarrierReleasesPendingEnqueues(t *testing.T, stop func(*Carrier, net.Co
 	var streamID StreamID
 	streamID[0] = 1
 	frame := Frame{Type: FrameData, Direction: DirectionClientToServer, StreamID: streamID, Payload: []byte("payload")}
-	results := make(chan bool, 3)
+	results := make(chan bool, 2)
 	go func() { results <- carrier.enqueue(frame, true) }()
 	select {
 	case <-started:
@@ -294,13 +319,17 @@ func testCarrierReleasesPendingEnqueues(t *testing.T, stop func(*Carrier, net.Co
 		t.Fatal("first carrier write did not start")
 	}
 
-	go func() { results <- carrier.enqueue(frame, true) }()
-	waitForQueueLength(t, carrier.queue, 1)
-	go func() { results <- carrier.enqueue(frame, true) }()
-	runtime.Gosched()
-
-	stop(carrier, peer)
-	for range 3 {
+	if !carrier.enqueue(frame, false) {
+		t.Fatal("carrier rejected the frame that should fill its queue")
+	}
+	if !carrier.beginEnqueue() {
+		t.Fatal("carrier rejected the third enqueue before shutdown")
+	}
+	stopResult := make(chan error, 1)
+	go func() { stopResult <- stop(carrier, peer) }()
+	waitForCarrierLoop(t, "carrier stop", carrier.Done())
+	results <- carrier.enqueueBegun(frame, true)
+	for range 2 {
 		select {
 		case success := <-results:
 			if success {
@@ -310,6 +339,14 @@ func testCarrierReleasesPendingEnqueues(t *testing.T, stop func(*Carrier, net.Co
 			t.Fatal("pending enqueue was not released")
 		}
 	}
+	select {
+	case err := <-stopResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("carrier stop did not finish after pending enqueues were released")
+	}
 	if err := carrier.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -317,15 +354,4 @@ func testCarrierReleasesPendingEnqueues(t *testing.T, stop func(*Carrier, net.Co
 		t.Fatalf("pending queue length = %d, want 0", len(carrier.queue))
 	}
 	waitForCarrierLoop(t, "carrier close callback", finished)
-}
-
-func waitForQueueLength(t *testing.T, queue chan queuedFrame, want int) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for len(queue) != want && time.Now().Before(deadline) {
-		runtime.Gosched()
-	}
-	if got := len(queue); got != want {
-		t.Fatalf("queue length = %d, want %d", got, want)
-	}
 }
