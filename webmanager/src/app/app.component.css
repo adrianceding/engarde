@@ -1,0 +1,500 @@
+
+
+.card {
+    margin: 1vw;
+    padding: max(1vw, 20px);
+}
+.card-action {
+    float: right;
+}
+.card-active {
+    border: .5px solid #00bfa5;
+}
+.card-container {
+    display: flex;
+    flex-flow: row wrap;
+}
+
+.interface-card-container {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin: 0 16px;
+}
+
+.interface-card-container > .no-results {
+    grid-column: 1 / -1;
+}
+
+.interface-card {
+    margin: 0;
+    padding: 16px;
+    position: relative;
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(25, 35, 45, .08);
+    overflow: hidden;
+}
+
+.interface-card-heading {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    min-height: 28px;
+    padding-right: 36px;
+    margin-bottom: 8px;
+}
+
+.interface-identity {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.interface-card .title {
+    font-size: 1.15em;
+    font-weight: 600;
+    line-height: 1.25;
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.interface-address {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+    color: #53606d;
+    font-family: monospace;
+    font-size: .78em;
+}
+
+.interface-address .iface-name {
+    margin: 0;
+    font-size: 1em;
+}
+
+.sender-address {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.last-received-compact {
+    flex: 0 0 auto;
+    color: #68737d;
+    font-size: .72em;
+    white-space: nowrap;
+}
+
+.interface-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex: 0 0 auto;
+    padding: 3px 7px;
+    border-radius: 4px;
+    font-size: .7em;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+.status-active {
+    color: #00796b;
+    background: #e0f2f1;
+}
+
+.status-idle {
+    color: #8a6200;
+    background: #fff8e1;
+}
+
+.status-excluded {
+    color: #c62828;
+    background: #ffebee;
+}
+
+.interface-card mat-card-content {
+    padding: 0;
+}
+
+.interface-card .stats-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
+    margin-top: 12px;
+}
+
+.interface-card .stat-block {
+    border-left-width: 3px;
+    padding: 6px 7px;
+    background: #fafbfc;
+}
+
+.interface-card .stat-label {
+    font-size: .65em;
+}
+
+.interface-card .stat-value {
+    font-size: .78em;
+    line-height: 1.2;
+    margin-top: 3px;
+    overflow-wrap: anywhere;
+}
+
+.interface-card mat-card-actions {
+    min-height: 32px;
+    padding: 0;
+    position: absolute;
+    right: 6px;
+    top: 6px;
+}
+
+.interface-card .card-action {
+    width: 32px;
+    height: 32px;
+    min-height: 32px;
+    padding: 0;
+    color: #78909c;
+}
+
+.interface-card .action-symbol {
+    display: block;
+    width: 18px;
+    height: 18px;
+    font-family: sans-serif;
+    font-size: 20px;
+    font-weight: 400;
+    line-height: 17px;
+    text-align: center;
+}
+
+.interface-card .card-action:hover {
+    color: #c62828;
+}
+
+.interface-card .include-action {
+    color: #00897b;
+}
+
+.card-excluded {
+    border: .5px solid #F44336;
+
+}
+
+.card-idle {
+    border: .5px solid #FFC107;
+}
+.card-server {
+    border: .5px solid #03A9F4;
+
+}
+
+.interface-overview {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 10px;
+    margin: 0 10px 18px;
+}
+
+.interface-summary-item {
+    min-width: 0;
+}
+
+.interface-destination strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: monospace;
+}
+
+.interface-summary-item.overview-active {
+    border-left-color: #00bfa5;
+}
+
+.interface-summary-item.overview-idle {
+    border-left-color: #ffc107;
+}
+
+.interface-summary-item.overview-excluded {
+    border-left-color: #f44336;
+}
+
+.interface-summary-item.overview-included {
+    border-left-color: #03a9f4;
+}
+
+.interface-section-heading {
+    margin: 22px 24px 10px;
+    border-bottom: 1px solid #e4e8eb;
+    padding-bottom: 8px;
+}
+
+.interface-section-heading .main-text {
+    margin: 0;
+    font-size: 1.05em;
+    font-style: normal;
+    font-weight: 600;
+}
+
+.section-count {
+    display: inline-block;
+    min-width: 18px;
+    margin-left: 6px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: #53606d;
+    background: #edf1f3;
+    font-size: .72em;
+    line-height: 1.4;
+    text-align: center;
+    vertical-align: 1px;
+}
+
+.section-description {
+    margin: 2px 0 0;
+    color: #68737d;
+    font-size: .78em;
+}
+
+.secondary-text {
+    font-size: .9em;
+}
+
+
+.main-text {
+    font-weight: 500;
+    line-height: 32px;
+    margin: 12px 10px 6px;
+}
+.alert {
+    color: red;
+}
+
+.subtitle {
+    font-weight: 300;
+    margin-left: 30px;
+    line-height: 50px;
+    font-style: italic;
+}
+
+.subtitle.main-text {
+    line-height: 32px;
+    margin-left: 10px;
+}
+
+.subtitle span {
+    display: inline-block;
+    line-height: 20px;
+}
+
+.version {
+    font-weight: 300;
+    font-size: .7em;
+    margin-left: 30px;
+    line-height: 50px;
+    font-style: italic;
+}
+
+.title {
+    font-size: 1.5em;
+    font-weight: 300;
+    margin-bottom: 1vh;
+}
+
+.filler {
+    flex: 1 1 auto;
+}
+
+.port {
+    color: #bbb;
+}
+
+.iface-name {
+    font-size: 0.6em;
+    color: #999;
+    font-weight: 300;
+    margin-left: 4px;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(150px, 1fr));
+    gap: 10px;
+    margin-top: 18px;
+}
+
+.stat-block {
+    border: 1px solid #e0e0e0;
+    border-left-width: 4px;
+    border-radius: 4px;
+    padding: 8px 10px;
+    min-width: 0;
+}
+
+.stat-data {
+    border-left-color: #00bfa5;
+}
+
+.stat-control {
+    border-left-color: #03A9F4;
+}
+
+.stat-label {
+    color: #666;
+    font-size: .75em;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.stat-value {
+    font-size: .9em;
+    font-weight: 300;
+    margin-top: 4px;
+    overflow-wrap: anywhere;
+}
+
+.stats-muted {
+    opacity: .75;
+}
+
+.no-results {
+    margin-left: 30px;
+}
+
+.tcp-overview {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+    margin: 0 10px 12px;
+}
+
+.tcp-summary-item {
+    border-left: 4px solid #03A9F4;
+    padding: 6px 8px;
+}
+
+.tcp-summary-item span,
+.tcp-summary-item strong {
+    display: block;
+}
+
+.tcp-summary-item span {
+    color: #666;
+    font-size: .75em;
+    text-transform: uppercase;
+}
+
+.tcp-summary-item strong {
+    margin-top: 4px;
+    font-weight: 500;
+}
+
+.tcp-stream-table {
+    margin: 0 30px 24px;
+    overflow-x: auto;
+}
+
+.tcp-stream-row {
+    display: grid;
+    grid-template-columns: minmax(130px, .8fr) 80px minmax(220px, 2fr) 90px 90px;
+    gap: 12px;
+    min-width: 680px;
+    padding: 9px 10px;
+    border-bottom: 1px solid #e0e0e0;
+    align-items: center;
+}
+
+.tcp-stream-header {
+    color: #666;
+    font-size: .75em;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.stream-id,
+.stream-destination {
+    font-family: monospace;
+    overflow-wrap: anywhere;
+}
+
+@media(max-width: 600px) {
+    .card {
+        margin: 40px;
+    }
+    .stats-grid {
+        grid-template-columns: 1fr;
+    }
+    body {
+        margin: 5px;
+    }
+}
+
+@media(max-width: 1279px) {
+    .interface-card-container {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .tcp-overview,
+    .interface-overview {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+
+@media(max-width: 900px) {
+    .interface-card .stats-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media(max-width: 699px) {
+    .interface-card-container {
+        grid-template-columns: 1fr;
+        margin: 0 10px;
+    }
+
+    .interface-card {
+        margin: 0;
+    }
+
+    .interface-overview {
+        margin-bottom: 16px;
+    }
+
+    .interface-section-heading {
+        margin-left: 10px;
+        margin-right: 10px;
+    }
+
+    .tcp-overview,
+    .interface-overview {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media(max-width: 480px) {
+    .tcp-overview,
+    .interface-overview {
+        grid-template-columns: 1fr;
+    }
+
+    .interface-card-heading {
+        flex-wrap: wrap;
+    }
+}
+
+@media(max-width: 800px) {
+    .version {
+        display: none;
+    }
+}

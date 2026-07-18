@@ -1,0 +1,11 @@
+<div class="dialog">
+  <h2 mat-dialog-title class="dialog-title">{{title}}</h2>
+  <mat-dialog-content class="dialog-content" [innerHTML]="content"></mat-dialog-content>
+  <div mat-dialog-actions align="end" class="dialog-actions">
+    @for (action of thingsToBeDone; track action; let i = $index) {
+      <div>
+        <button mat-button (click)="doStuff(action.whatToDo)" tabindex="{{i}}">{{action.label}}</button>
+      </div>
+    }
+  </div>
+</div>

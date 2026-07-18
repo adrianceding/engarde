@@ -1,0 +1,198 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.0'
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.3'
+
+      - name: Run production Go test gate
+        run: make test-production
+
+      - name: Cross-build all supported release targets
+        run: make
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose configuration
+        run: |
+          ENGARDE_SERVER_CONFIG="$PWD/examples/config/tcp-socks5-server.yml" docker compose config --quiet
+          ENGARDE_CLIENT_CONFIG="$PWD/examples/config/tcp-socks5-client.yml" docker compose --profile client config --quiet
+
+      - name: Build and smoke-test Docker image
+        run: make docker-test DOCKER_IMAGE=engarde:ci DOCKER_VERSION="$GITHUB_SHA"
+
+  platform-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.3'
+
+      - name: Run native Go tests
+        shell: bash
+        run: |
+          log="$(mktemp)"
+          if go test -timeout=5m -count=1 ./... 2>&1 | tee "$log"; then
+            exit 0
+          fi
+          message="$(grep -E '(^|[[:space:]])--- FAIL:|_test\.go:[0-9]+:|^panic:|^FAIL([[:space:]]|$)' "$log" || true)"
+          if [[ -z "$message" ]]; then
+            message="$(tail -n 40 "$log")"
+          fi
+          message="${message//'%'/'%25'}"
+          message="${message//$'\r'/'%0D'}"
+          message="${message//$'\n'/'%0A'}"
+          echo "::error title=Native Go tests failed::$message"
+          exit 1
+
+  publish-image:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - test
+      - docker
+      - platform-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+
+      - name: Validate release tag
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          if [[ -z "$IMAGE_TAGS" ]]; then
+            echo "::error::Release tag '$GITHUB_REF_NAME' is not a valid semantic version (expected vMAJOR.MINOR.PATCH)."
+            exit 1
+          fi
+
+      - name: Build and publish multi-platform image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/386,linux/amd64,linux/arm/v7,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha,scope=engarde-release
+          cache-to: type=gha,mode=max,scope=engarde-release
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - test
+      - docker
+      - platform-test
+      - publish-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.0'
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.3'
+
+      - name: Build all release artifacts
+        run: make
+
+      - name: Package release artifacts
+        run: |
+          mkdir -p release
+          find dist -type f \( -name 'engarde' -o -name 'engarde.exe' \) -print0 |
+            while IFS= read -r -d '' artifact; do
+              os="$(echo "$artifact" | cut -d/ -f2)"
+              arch="$(echo "$artifact" | cut -d/ -f3)"
+              name="$(basename "$artifact")"
+              extension=""
+              if [[ "$name" == *.exe ]]; then
+                name="${name%.exe}"
+                extension=".exe"
+              fi
+              cp "$artifact" "release/${name}-${os}-${arch}${extension}"
+            done
+          (cd release && sha256sum * > SHA256SUMS.txt)
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

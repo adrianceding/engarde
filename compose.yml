@@ -1,0 +1,35 @@
+x-engarde: &engarde
+  image: ${ENGARDE_IMAGE:-ghcr.io/adrianceding/engarde:latest}
+  restart: unless-stopped
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  server:
+    <<: *engarde
+    network_mode: host
+    volumes:
+      - type: bind
+        source: ${ENGARDE_SERVER_CONFIG:-./server.yml}
+        target: /etc/engarde/engarde.yml
+        read_only: true
+        bind:
+          create_host_path: false
+
+  client:
+    <<: *engarde
+    profiles:
+      - client
+    network_mode: host
+    cap_add:
+      - NET_RAW
+    volumes:
+      - type: bind
+        source: ${ENGARDE_CLIENT_CONFIG:-./client.yml}
+        target: /etc/engarde/engarde.yml
+        read_only: true
+        bind:
+          create_host_path: false

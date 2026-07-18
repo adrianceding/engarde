@@ -1,0 +1,19 @@
+client:
+  description: "TCP SOCKS5 client"
+  listenAddr: "127.0.0.1:59401"
+  dstAddr: "203.0.113.20:59501"
+  socks5Auth:
+    username: "client"
+    password: "replace-with-a-local-secret"
+  peerAuth:
+    username: "edge-a"
+    password: "replace-with-a-long-random-secret"
+  # Interface filters are optional whole-name shell globs. An empty include
+  # list allows every interface, and exclusions take priority.
+  # includeInterfaces:
+  #   - "eth*"
+  # excludedInterfaces:
+  #   - "br-*"
+  transfer:
+    keepaliveIntervalMillis: 1000
+    keepaliveTimeoutMillis: 5000

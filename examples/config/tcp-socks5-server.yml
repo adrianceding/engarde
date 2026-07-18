@@ -1,0 +1,9 @@
+server:
+  description: "TCP SOCKS5 dynamic server"
+  listenAddr: "0.0.0.0:59501"
+  peerAuth:
+    users:
+      edge-a: "replace-with-a-long-random-secret"
+  transfer:
+    keepaliveIntervalMillis: 1000
+    keepaliveTimeoutMillis: 5000

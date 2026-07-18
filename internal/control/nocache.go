@@ -1,0 +1,38 @@
+package control
+
+import (
+	"net/http"
+	"time"
+)
+
+var epoch = time.Unix(0, 0).Format(time.RFC1123)
+
+var noCacheHeaders = map[string]string{
+	"Expires":         epoch,
+	"Cache-Control":   "no-cache, private, max-age=0",
+	"Pragma":          "no-cache",
+	"X-Accel-Expires": "0",
+}
+
+var etagHeaders = []string{
+	"ETag",
+	"If-Modified-Since",
+	"If-Match",
+	"If-None-Match",
+	"If-Range",
+	"If-Unmodified-Since",
+}
+
+func NoCache(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		for _, header := range etagHeaders {
+			if r.Header.Get(header) != "" {
+				r.Header.Del(header)
+			}
+		}
+		for header, value := range noCacheHeaders {
+			w.Header().Set(header, value)
+		}
+		handler(w, r)
+	}
+}

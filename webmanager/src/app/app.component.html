@@ -1,0 +1,286 @@
+@if (type && !errorMessage) {
+  <div>
+    <app-actionbar [logo]="'../assets/engarde-detail.png'" [title]="'ENGARDE-'+type.toUpperCase()" [color]="'#03A9F4'" [textColor]="'white'">
+      <div class="subtitle"><span>{{ description }}</span></div>
+      <div class="filler"></div>
+      @if (version) {
+        <div class="version">ver. {{ version }}</div>
+      }
+    </app-actionbar>
+    @if (type == 'client') {
+      <div [@scaleIn]>
+        <p class="subtitle main-text">SOCKS5 over TCP</p>
+        <div class="tcp-overview">
+          <div class="tcp-summary-item"><span>Streams</span><strong>{{ streams }}</strong></div>
+          <div class="tcp-summary-item"><span>Carriers</span><strong>{{ carriers }}</strong></div>
+          <div class="tcp-summary-item"><span>Sessions</span><strong>{{ sessions }}</strong></div>
+          <div class="tcp-summary-item"><span>Frontend auth</span><strong>{{ frontendAuthEnabled ? 'Required' : 'Disabled' }}</strong></div>
+          <div class="tcp-summary-item"><span>Peer auth</span><strong>{{ peerAuthEnabled ? 'Required' : 'Disabled' }}</strong></div>
+        </div>
+        <div class="interface-overview" aria-label="Interface status summary">
+          <div class="tcp-summary-item interface-summary-item">
+            <span>Network interfaces</span>
+            <strong>{{ ifaces?.length || 0 }} total</strong>
+          </div>
+          <div class="tcp-summary-item interface-summary-item interface-destination">
+            <span>Destination</span>
+            <strong [title]="destinationAddress()">{{ destinationAddress() }}</strong>
+          </div>
+          <div class="tcp-summary-item interface-summary-item overview-active">
+            <span>Active</span>
+            <strong>{{ interfaceCount('active') }}</strong>
+          </div>
+          <div class="tcp-summary-item interface-summary-item overview-idle">
+            <span>Idle</span>
+            <strong>{{ interfaceCount('idle') }}</strong>
+          </div>
+          <div class="tcp-summary-item interface-summary-item overview-excluded">
+            <span>Excluded</span>
+            <strong>{{ interfaceCount('excluded') }}</strong>
+          </div>
+          <div class="tcp-summary-item interface-summary-item overview-included">
+            <span>Included</span>
+            <strong>{{ interfaceCount('active') + interfaceCount('idle') }}</strong>
+          </div>
+        </div>
+        <!-- INCLUDED INTERFACES -->
+        <div class="interface-section-heading">
+          <div>
+            <p class="subtitle main-text">Interfaces <span class="section-count">{{ interfaceCount('active') + interfaceCount('idle') }}</span></p>
+            <p class="section-description">Active and idle interfaces remain in a stable order as connectivity changes.</p>
+          </div>
+        </div>
+        <div class="card-container interface-card-container">
+        @for (iface of ifaces | callback: filterIncluded |sortBy: 'name'; track trackByName($index, iface)) {
+          @let trafficStats = traffic(iface);
+            <mat-card class="card interface-card" [ngClass]="{'card-active': iface.status == 'active', 'card-idle': iface.status == 'idle'}">
+              <div class="interface-card-heading">
+                <div class="interface-identity">
+                  <mat-card-title class="title">{{iface.label || iface.name}}</mat-card-title>
+                  <div class="interface-address">
+                    @if (iface.label) { <span class="iface-name">{{iface.name}}</span> }
+                    <span class="sender-address" [title]="iface.senderAddress">{{iface.senderAddress || 'No address'}}</span>
+                  </div>
+                  @if (iface.last !== null) {
+                    <span class="last-received-compact" [ngClass]="{alert: iface.last >= 10}" title="Last received packet">
+                      {{ iface.last }}s ago
+                    </span>
+                  }
+                </div>
+                @if (iface.status == 'active') {
+                  <span class="interface-status status-active"><span class="status-dot"></span>Active</span>
+                } @else {
+                  <span class="interface-status status-idle"><span class="status-dot"></span>Idle</span>
+                }
+              </div>
+              <mat-card-content>
+              <div class="stats-grid" [ngClass]="{'stats-muted': iface.status == 'idle'}">
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data in</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.data.rxPackets, trafficStats.data.rxBytes) }}</div>
+                </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data out</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.data.txPackets, trafficStats.data.txBytes) }}</div>
+                </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data drop</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.data.dropPackets, trafficStats.data.dropBytes) }}</div>
+                </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data skipped</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.data.skippedPackets, trafficStats.data.skippedBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control in</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.control.rxPackets, trafficStats.control.rxBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control out</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.control.txPackets, trafficStats.control.txBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control drop</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.control.dropPackets, trafficStats.control.dropBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control skipped</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.control.skippedPackets, trafficStats.control.skippedBytes) }}</div>
+                </div>
+              </div>
+            </mat-card-content>
+            <mat-card-actions>
+              <button mat-icon-button class="card-action" matTooltip="Exclude interface" [attr.aria-label]="'Exclude ' + (iface.label || iface.name)" (click)="toggleExclude(iface.name)">
+                <span class="action-symbol" aria-hidden="true">&times;</span>
+              </button>
+            </mat-card-actions>
+          </mat-card>
+        }
+        @if ((ifaces | callback: filterIncluded)?.length == 0) {
+          <p class="no-results">There are no included interfaces.</p>
+        }
+      </div>
+      <!-- EXCLUDED INTERFACES -->
+      <div class="interface-section-heading">
+        <div>
+          <p class="subtitle main-text">Excluded interfaces <span class="section-count">{{ interfaceCount('excluded') }}</span></p>
+          <p class="section-description">Excluded from carrier traffic until included again.</p>
+        </div>
+      </div>
+      <div class="card-container interface-card-container">
+        @for (iface of ifaces | callback: filterExcluded |sortBy: 'name'; track trackByName($index, iface)) {
+          @let trafficStats = traffic(iface);
+          <mat-card class="card interface-card card-excluded">
+            <div class="interface-card-heading">
+              <div class="interface-identity">
+                <mat-card-title class="title">{{iface.label || iface.name}}</mat-card-title>
+                <div class="interface-address">
+                  @if (iface.label) { <span class="iface-name">{{iface.name}}</span> }
+                  <span class="sender-address" [title]="iface.senderAddress">{{iface.senderAddress || 'No address'}}</span>
+                </div>
+              </div>
+              <span class="interface-status status-excluded"><span class="status-dot"></span>Excluded</span>
+            </div>
+            <mat-card-content>
+              <div class="stats-grid stats-muted">
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data in</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.data.rxPackets, trafficStats.data.rxBytes) }}</div>
+                </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data out</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.data.txPackets, trafficStats.data.txBytes) }}</div>
+                </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data drop</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.data.dropPackets, trafficStats.data.dropBytes) }}</div>
+                </div>
+                <div class="stat-block stat-data">
+                  <div class="stat-label">Data skipped</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.data.skippedPackets, trafficStats.data.skippedBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control in</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.control.rxPackets, trafficStats.control.rxBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control out</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.control.txPackets, trafficStats.control.txBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control drop</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.control.dropPackets, trafficStats.control.dropBytes) }}</div>
+                </div>
+                <div class="stat-block stat-control">
+                  <div class="stat-label">Control skipped</div>
+                  <div class="stat-value">{{ formatPacketBytes(trafficStats.control.skippedPackets, trafficStats.control.skippedBytes) }}</div>
+                </div>
+              </div>
+            </mat-card-content>
+            <mat-card-actions>
+              <button mat-icon-button class="card-action include-action" matTooltip="Include interface" [attr.aria-label]="'Include ' + (iface.label || iface.name)" (click)="toggleExclude(iface.name)">
+                <span class="action-symbol" aria-hidden="true">+</span>
+              </button>
+            </mat-card-actions>
+          </mat-card>
+        }
+        @if ((ifaces | callback: filterExcluded)?.length == 0) {
+          <p class="no-results">There are no excluded interfaces.</p>
+        }
+      </div>
+      <p>
+        <button mat-button (click)="resetExcludes()">Reset all exclusions</button>
+      </p>
+    </div>
+  }
+  @if (type == 'server') {
+    <div>
+      <p class="subtitle main-text">SOCKS5 relay</p>
+      <div class="tcp-overview">
+        <div class="tcp-summary-item"><span>Streams</span><strong>{{ streams }}</strong></div>
+        <div class="tcp-summary-item"><span>Carriers</span><strong>{{ carriers }}</strong></div>
+        <div class="tcp-summary-item"><span>Sessions</span><strong>{{ sessions }}</strong></div>
+        <div class="tcp-summary-item"><span>Peer auth</span><strong>{{ peerAuthEnabled ? 'Required' : 'Disabled' }}</strong></div>
+      </div>
+      <p class="subtitle main-text">Active streams</p>
+      <div class="tcp-stream-table" role="table" aria-label="Active TCP streams">
+        <div class="tcp-stream-row tcp-stream-header" role="row">
+          <span>Stream</span><span>Protocol</span><span>Destination</span><span>Carriers</span><span>State</span>
+        </div>
+        @for (stream of tcpStreams; track trackByStreamId($index, stream)) {
+          <div class="tcp-stream-row" role="row">
+            <span class="stream-id">{{ stream.id }}</span>
+            <span>v{{ stream.protocolVersion }}</span>
+            <span class="stream-destination">{{ stream.destination }}</span>
+            <span>{{ stream.carriers }}</span>
+            <span>{{ stream.state }}</span>
+          </div>
+        }
+        @if (tcpStreams.length == 0) {
+          <p class="no-results">There are no active TCP streams.</p>
+        }
+      </div>
+      <p class="subtitle main-text">Active sockets
+        <button mat-button (mouseenter)="hintAnimationActive = true" (mouseleave)="hintAnimationActive = false">?</button>
+      </p>
+      @if (hintAnimationActive) {
+        <p [@slideOut]="hintAnimationActive" class="subtitle secondary-text">Data is being currently transmitted to these addresses.</p>
+      }
+      <div class="card-container">
+        @for (iface of sockets |sortBy: 'address'; track trackByAddress($index, iface)) {
+          @let trafficStats = traffic(iface);
+          <mat-card class="card card-server">
+            <mat-card-title class="title">{{ iface.address }}</mat-card-title>
+            <mat-card-content>
+            <div class="stats-grid">
+              <div class="stat-block stat-data">
+                <div class="stat-label">Data in</div>
+                <div class="stat-value">{{ formatPacketBytes(trafficStats.data.rxPackets, trafficStats.data.rxBytes) }}</div>
+              </div>
+              <div class="stat-block stat-data">
+                <div class="stat-label">Data out</div>
+                <div class="stat-value">{{ formatPacketBytes(trafficStats.data.txPackets, trafficStats.data.txBytes) }}</div>
+              </div>
+              <div class="stat-block stat-data">
+                <div class="stat-label">Data drop</div>
+                <div class="stat-value">{{ formatPacketBytes(trafficStats.data.dropPackets, trafficStats.data.dropBytes) }}</div>
+              </div>
+              <div class="stat-block stat-data">
+                <div class="stat-label">Data skipped</div>
+                <div class="stat-value">{{ formatPacketBytes(trafficStats.data.skippedPackets, trafficStats.data.skippedBytes) }}</div>
+              </div>
+              <div class="stat-block stat-control">
+                <div class="stat-label">Control in</div>
+                <div class="stat-value">{{ formatPacketBytes(trafficStats.control.rxPackets, trafficStats.control.rxBytes) }}</div>
+              </div>
+              <div class="stat-block stat-control">
+                <div class="stat-label">Control out</div>
+                <div class="stat-value">{{ formatPacketBytes(trafficStats.control.txPackets, trafficStats.control.txBytes) }}</div>
+              </div>
+              <div class="stat-block stat-control">
+                <div class="stat-label">Control drop</div>
+                <div class="stat-value">{{ formatPacketBytes(trafficStats.control.dropPackets, trafficStats.control.dropBytes) }}</div>
+              </div>
+              <div class="stat-block stat-control">
+                <div class="stat-label">Control skipped</div>
+                <div class="stat-value">{{ formatPacketBytes(trafficStats.control.skippedPackets, trafficStats.control.skippedBytes) }}</div>
+              </div>
+            </div>
+          </mat-card-content>
+        </mat-card>
+      }
+    </div>
+  </div>
+}
+</div>
+} @else {
+  <app-actionbar [title]="'ENGARDE'" [color]="'#03A9F4'" [textColor]="'white'">
+    <div class="subtitle"> WEBUI</div>
+  </app-actionbar>
+  @if (loaded == true) {
+    <div class="main-text">
+      <div class="title">ERROR: {{errorMessage.statusText || errorMessage}}</div>
+      <div class="subtitle">There's a problem reaching engarde right now. The page will be update as soon as it's solved.</div>
+    </div>
+  }
+}

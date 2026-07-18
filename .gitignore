@@ -1,0 +1,17 @@
+# Go build output
+/dist/
+/engarde
+/engarde.exe
+
+# Generated embedded web assets
+/internal/assets/browser/*
+!/internal/assets/browser/README.md
+
+# Local/editor noise
+.idea/
+.DS_Store
+*.tmp
+
+# Local role configuration (may contain credentials)
+/server.yml
+/client.yml

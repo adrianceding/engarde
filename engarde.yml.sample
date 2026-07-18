@@ -1,0 +1,104 @@
+---
+# One file starts one role. Keep either a complete client section or a complete
+# server section, never both. A minimal client/server pair is available at:
+#   examples/config/tcp-socks5-{client,server}.yml
+
+# This active example is a TCP SOCKS5 client. It accepts SOCKS5 CONNECT requests
+# locally and carries each requested destination to the Engarde server.
+client:
+  description: "My Engarde SOCKS5 client"
+  listenAddr: "127.0.0.1:59401"
+
+  # Address of the Engarde server, not the SOCKS5 request destination.
+  dstAddr: "203.0.113.20:59501"
+
+  # Optional local RFC 1929 authentication. Omit this section to allow SOCKS5
+  # no-auth. Non-loopback listeners require allowUnsafeFrontend: true.
+  socks5Auth:
+    username: "client"
+    password: "replace-with-a-local-secret"
+
+  # Optional Engarde Session authentication. The server must contain the same
+  # user under server.peerAuth.users.
+  peerAuth:
+    username: "edge-a"
+    password: "replace-with-a-long-random-secret"
+
+  transfer:
+    keepaliveIntervalMillis: 1000
+    keepaliveTimeoutMillis: 5000
+    tcp:
+      chunkSize: 16384
+      carrierQueueBytes: 1048576
+      reorderWindowBytes: 4194304
+      dialTimeoutMillis: 5000
+      openTimeoutMillis: 5000
+      writeTimeoutMillis: 10000
+      # Zero leaves resource counts unlimited.
+      maxStreams: 0
+      # The following limits are server-only. The client opens one virtual
+      # carrier per healthy interface Session for each logical stream.
+      maxCarriersPerStream: 0
+      maxPendingConnections: 0
+      maxPendingStreams: 0
+      maxSessions: 0
+
+  # Optional whole-name shell globs. An empty include list makes every
+  # interface eligible. Replace [] with patterns such as "eth*" or "wlan*"
+  # to enable allowlist filtering. Exclusions take priority over inclusions.
+  includeInterfaces: []
+  excludedInterfaces:
+    - "br-*"
+    - "docker*"
+    - "VirtualBox Host-Only Network"
+  interfaceLabels:
+    eth0: "Main ISP"
+    eth1: "Backup ISP"
+  dstOverrides:
+    - ifName: "eth1"
+      dstAddr: "198.51.100.20:59501"
+
+  webManager:
+    listenAddr: "127.0.0.1:9001"
+    username: "engarde"
+    password: "replace-with-a-management-secret"
+
+# Remove or comment the client section before enabling this server template.
+# Every server is a dynamic SOCKS5 TCP exit. Configure allowedClients, peerAuth,
+# or the explicit allowUnsafeDynamicDestination override.
+# server:
+#   description: "My Engarde SOCKS5 server"
+#   listenAddr: "0.0.0.0:59501"
+#
+#   allowedClients:
+#     - "203.0.113.10"
+#     - "198.51.100.0/24"
+#
+#   peerAuth:
+#     users:
+#       edge-a: "replace-with-a-long-random-secret"
+#       edge-b: "replace-with-another-long-random-secret"
+#
+#   # Avoid this outside an isolated test environment.
+#   # allowUnsafeDynamicDestination: true
+#
+#   transfer:
+#     keepaliveIntervalMillis: 1000
+#     keepaliveTimeoutMillis: 5000
+#     tcp:
+#       chunkSize: 16384
+#       carrierQueueBytes: 1048576
+#       reorderWindowBytes: 4194304
+#       dialTimeoutMillis: 5000
+#       openTimeoutMillis: 5000
+#       writeTimeoutMillis: 10000
+#       maxStreams: 0
+#       maxCarriersPerStream: 0
+#       maxPendingConnections: 0
+#       maxPendingStreams: 0
+#       maxSessions: 0
+#
+#   webManager:
+#     listenAddr: "127.0.0.1:9001"
+#     username: "engarde"
+#     password: "replace-with-a-management-secret"

@@ -1,0 +1,20 @@
+[Unit]
+Description=engarde multipath TCP SOCKS5 relay
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=engarde
+Group=engarde
+ExecStart=/usr/local/bin/engarde /etc/engarde/engarde.yml
+Restart=on-failure
+RestartSec=5s
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
