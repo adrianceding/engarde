@@ -23,7 +23,7 @@ if [ "$soak_race" = "1" ]; then
     race_args=(-race)
 fi
 
-echo "==> TCP SOCKS5 production soak for $soak_duration (race=$soak_race)"
+echo "==> TCP SOCKS5 diagnostic soak for $soak_duration (race=$soak_race)"
 CGO_ENABLED=1 ENGARDE_SOAK_DURATION="$soak_duration" \
     go test "${race_args[@]}" -timeout="$soak_timeout" -count=1 \
     -run='^TestTCPSOCKS5ProductionSoak$' -v ./internal/clientrole

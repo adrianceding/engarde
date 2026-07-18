@@ -30,6 +30,14 @@ var dialTCPDestination = func(ctx context.Context, address string, timeout time.
 
 var tcpFlowCarrierCount = func(flow *tcpstream.Flow) int { return flow.CarrierCount() }
 
+type tcpServerTimer interface {
+	Stop() bool
+}
+
+var newTCPServerOpenTimer = func(delay time.Duration, callback func()) tcpServerTimer {
+	return time.AfterFunc(delay, callback)
+}
+
 const (
 	tcpServerClosedTTL = time.Minute
 	// Keep disconnected peer counters available across several status polls.
@@ -103,7 +111,7 @@ type tcpServerStream struct {
 	destination string
 	principal   string
 	flow        *tcpstream.Flow
-	openTimer   *time.Timer
+	openTimer   tcpServerTimer
 	started     bool
 	err         error
 }
@@ -811,7 +819,7 @@ func (runtime *tcpServerRuntime) getOrCreate(streamID tcpstream.StreamID, versio
 	openTimeout := time.Duration(runtime.server.cfg.Transfer.TCP.OpenTimeoutMillis) * time.Millisecond
 	if openTimeout > 0 {
 		stream.attachMu.Lock()
-		stream.openTimer = time.AfterFunc(openTimeout, func() {
+		stream.openTimer = newTCPServerOpenTimer(openTimeout, func() {
 			runtime.expireUnstartedStream(stream)
 		})
 		stream.attachMu.Unlock()

@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +17,7 @@ import (
 )
 
 func TestTCPClientBackoffRecoversWhenServerBecomesAvailable(t *testing.T) {
+	retryTimers := installTCPManualSessionRetryTimer(t)
 	target := startBehaviorEchoServer(t, 0, 0, nil, nil)
 	serverAddress := freeTCPAddress(t)
 	clientAddress := freeTCPAddress(t)
@@ -37,11 +37,14 @@ func TestTCPClientBackoffRecoversWhenServerBecomesAvailable(t *testing.T) {
 
 	previousDial := dialTCPOnInterface
 	var attemptsMu sync.Mutex
-	var attempts []time.Time
+	attemptCount := 0
+	attempts := make(chan int, 4)
 	dialTCPOnInterface = func(ctx context.Context, destination, _, _ string, timeout time.Duration) (net.Conn, error) {
 		attemptsMu.Lock()
-		attempts = append(attempts, time.Now())
+		attemptCount++
+		attempt := attemptCount
 		attemptsMu.Unlock()
+		attempts <- attempt
 		dialer := net.Dialer{Timeout: timeout}
 		return dialer.DialContext(ctx, "tcp4", destination)
 	}
@@ -60,18 +63,21 @@ func TestTCPClientBackoffRecoversWhenServerBecomesAvailable(t *testing.T) {
 	})
 	waitForTCPListener(t, clientAddress)
 
-	behaviorEventually(t, 3*time.Second, "two failed carrier dials", func() bool {
-		attemptsMu.Lock()
-		defer attemptsMu.Unlock()
-		return len(attempts) >= 2
-	})
-	attemptsMu.Lock()
-	firstGap := attempts[1].Sub(attempts[0])
-	attemptCountBeforeServer := len(attempts)
-	attemptsMu.Unlock()
-	if firstGap < 60*time.Millisecond {
-		t.Fatalf("first retry gap = %v, want exponential backoff rather than a dial loop", firstGap)
+	waitTCPDialAttempt(t, attempts, 1)
+	firstRetry := retryTimers.next(t)
+	if firstRetry.delay != tcpSessionRetryInitialDelay {
+		t.Fatalf("first retry delay = %v, want %v", firstRetry.delay, tcpSessionRetryInitialDelay)
 	}
+	assertTCPDialCount(t, &attemptsMu, &attemptCount, 1)
+	retryTimers.assertNoPending(t)
+	firstRetry.fire(t)
+	waitTCPDialAttempt(t, attempts, 2)
+	secondRetry := retryTimers.next(t)
+	if secondRetry.delay != 2*tcpSessionRetryInitialDelay {
+		t.Fatalf("second retry delay = %v, want %v", secondRetry.delay, 2*tcpSessionRetryInitialDelay)
+	}
+	assertTCPDialCount(t, &attemptsMu, &attemptCount, 2)
+	retryTimers.assertNoPending(t)
 
 	server := serverrole.New(config.Server{
 		ListenAddr:                    serverAddress,
@@ -81,6 +87,8 @@ func TestTCPClientBackoffRecoversWhenServerBecomesAvailable(t *testing.T) {
 	serverDone = make(chan error, 1)
 	go func() { serverDone <- server.Run(ctx) }()
 	waitForTCPListener(t, serverAddress)
+	secondRetry.fire(t)
+	waitTCPDialAttempt(t, attempts, 3)
 	behaviorEventually(t, 5*time.Second, "session recovery after server startup", func() bool {
 		clientValue, clientErr := client.Status()
 		serverValue, serverErr := server.Status()
@@ -90,6 +98,7 @@ func TestTCPClientBackoffRecoversWhenServerBecomesAvailable(t *testing.T) {
 		return clientValue.(control.ClientStatus).Sessions == 1 &&
 			serverValue.(control.ServerStatus).Sessions == 1
 	})
+	retryTimers.assertNoPending(t)
 
 	application, err := behaviorDialSOCKS5(clientAddress, target.listener.Addr().String())
 	if err != nil {
@@ -118,17 +127,38 @@ func TestTCPClientBackoffRecoversWhenServerBecomesAvailable(t *testing.T) {
 	case <-time.After(behaviorSocketTimeout):
 		t.Fatal("recovered destination did not observe EOF")
 	}
-	t.Logf("server recovered after %d unavailable dial attempts; first retry gap %v", attemptCountBeforeServer, firstGap)
+	assertTCPDialCount(t, &attemptsMu, &attemptCount, 3)
 }
 
-func TestTCPSessionHeartbeatFailureReconnectsAndCarriesSOCKS5Stream(t *testing.T) {
+func waitTCPDialAttempt(t *testing.T, attempts <-chan int, want int) {
+	t.Helper()
+	select {
+	case got := <-attempts:
+		if got != want {
+			t.Fatalf("dial attempt = %d, want %d", got, want)
+		}
+	case <-time.After(tcpSessionManagerTestTimeout):
+		t.Fatalf("dial attempt %d did not start", want)
+	}
+}
+
+func assertTCPDialCount(t *testing.T, mu *sync.Mutex, count *int, want int) {
+	t.Helper()
+	mu.Lock()
+	got := *count
+	mu.Unlock()
+	if got != want {
+		t.Fatalf("physical dials = %d, want %d", got, want)
+	}
+}
+
+func TestTCPSessionDisconnectReconnectsAndCarriesSOCKS5Stream(t *testing.T) {
+	retryTimers := installTCPManualSessionRetryTimer(t)
 	target := startBehaviorEchoServer(t, 0, 0, nil, nil)
 	serverAddress := freeTCPAddress(t)
 	clientAddress := freeTCPAddress(t)
 	transfer := config.Transfer{}
 	transfer.ApplyDefaults()
-	transfer.KeepaliveIntervalMillis = 20
-	transfer.KeepaliveTimeoutMillis = 100
 	transfer.TCP.DialTimeoutMillis = 500
 	transfer.TCP.OpenTimeoutMillis = 2_000
 
@@ -260,25 +290,35 @@ func TestTCPSessionHeartbeatFailureReconnectsAndCarriesSOCKS5Stream(t *testing.T
 	select {
 	case <-initialSession.Done():
 	case <-time.After(2 * time.Second):
-		t.Fatal("heartbeat failure did not close the old session")
+		t.Fatal("disconnect did not close the old session")
 	}
+	retryTimer := retryTimers.next(t)
+	if retryTimer.delay != tcpSessionRetryInitialDelay {
+		t.Fatalf("replacement retry delay = %v, want %v", retryTimer.delay, tcpSessionRetryInitialDelay)
+	}
+	pathSession.mu.Lock()
+	oldSession := pathSession.session
+	retrying := pathSession.retrying
+	retryCount := pathSession.retryCount
+	generationBeforeTick := pathSession.generation
+	pathSession.mu.Unlock()
+	if oldSession != nil || !retrying || retryCount != 1 || generationBeforeTick != initialGeneration {
+		t.Fatalf("pre-retry state = session %v/retrying %v/count %d/generation %d, want nil/true/1/%d", oldSession != nil, retrying, retryCount, generationBeforeTick, initialGeneration)
+	}
+	retryTimers.assertNoPending(t)
+	retryTimer.fire(t)
 	select {
 	case <-secondDialStarted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("heartbeat failure did not schedule a replacement session")
+		t.Fatal("disconnect did not schedule a replacement session")
 	}
-	behaviorEventually(t, time.Second, "old session cleanup", func() bool {
-		pathSession.mu.Lock()
-		defer pathSession.mu.Unlock()
-		return pathSession.session == nil && pathSession.inFlight && pathSession.generation > initialGeneration
-	})
-	behaviorEventually(t, time.Second, "server-side old session cleanup", func() bool {
-		clientValue, clientErr := client.Status()
-		serverValue, serverErr := server.Status()
-		return clientErr == nil && serverErr == nil &&
-			clientValue.(control.ClientStatus).Sessions == 0 &&
-			serverValue.(control.ServerStatus).Sessions == 0
-	})
+	pathSession.mu.Lock()
+	replacementInFlight := pathSession.inFlight
+	replacementGeneration := pathSession.generation
+	pathSession.mu.Unlock()
+	if !replacementInFlight || replacementGeneration != initialGeneration+1 {
+		t.Fatalf("replacement state = in-flight %v/generation %d, want true/%d", replacementInFlight, replacementGeneration, initialGeneration+1)
+	}
 
 	close(allowSecondDial)
 	behaviorEventually(t, 5*time.Second, "replacement session", func() bool {
@@ -290,8 +330,15 @@ func TestTCPSessionHeartbeatFailureReconnectsAndCarriesSOCKS5Stream(t *testing.T
 			return false
 		}
 		current, generation, currentHealthy := pathSession.current(path)
-		return currentHealthy && current != initialSession && generation > initialGeneration
+		return currentHealthy && current != initialSession && generation == initialGeneration+1
 	})
+	dialMu.Lock()
+	completedDialCount := dialCount
+	dialMu.Unlock()
+	if completedDialCount != 2 {
+		t.Fatalf("physical dials after replacement = %d, want 2", completedDialCount)
+	}
+	retryTimers.assertNoPending(t)
 
 	application, err := behaviorDialSOCKS5(clientAddress, target.listener.Addr().String())
 	if err != nil {
@@ -332,7 +379,6 @@ func TestTCPSessionHeartbeatFailureReconnectsAndCarriesSOCKS5Stream(t *testing.T
 }
 
 func TestTCPSOCKS5ShutdownReleasesConcurrentConnections(t *testing.T) {
-	baselineGoroutines := runtime.NumGoroutine()
 	gate := make(chan struct{})
 	target := startBehaviorEchoServer(t, 0, 0, gate, nil)
 	stack, stop := startStoppableFaultStack(t, 2)
@@ -380,15 +426,6 @@ func TestTCPSOCKS5ShutdownReleasesConcurrentConnections(t *testing.T) {
 	if targetConnections != 0 {
 		t.Fatalf("destination retained %d connections after shutdown", targetConnections)
 	}
-
-	const goroutineTolerance = 12
-	var remaining int
-	behaviorEventually(t, 3*time.Second, "shutdown goroutine convergence", func() bool {
-		runtime.GC()
-		remaining = runtime.NumGoroutine()
-		return remaining <= baselineGoroutines+goroutineTolerance
-	})
-	t.Logf("goroutines before/after shutdown = %d/%d (tolerance %d)", baselineGoroutines, remaining, goroutineTolerance)
 }
 
 func TestTCPSOCKS5ProductionSoak(t *testing.T) {

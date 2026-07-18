@@ -95,6 +95,14 @@ func (writer errorWriter) Write([]byte) (int, error) {
 	return 0, writer.err
 }
 
+type errorReader struct {
+	err error
+}
+
+func (reader errorReader) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
 type failAfterWriter struct {
 	writer    io.Writer
 	remaining int
@@ -857,18 +865,18 @@ func TestReadConnectRejectsTruncatedInput(t *testing.T) {
 	}
 }
 
-func TestReadConnectTimeout(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
-
-	_, err := ReadConnect(serverConn, 20*time.Millisecond)
+func TestReadConnectPropagatesTimeoutError(t *testing.T) {
+	conn := &scriptedConn{reader: errorReader{err: os.ErrDeadlineExceeded}}
+	_, err := ReadConnect(conn, time.Second)
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("ReadConnect error = %v, want deadline exceeded", err)
 	}
 	var netErr net.Error
 	if !errors.As(err, &netErr) || !netErr.Timeout() {
 		t.Fatalf("ReadConnect error = %v, want timeout", err)
+	}
+	if len(conn.deadlineCalls) != 1 || conn.deadlineCalls[0].IsZero() {
+		t.Fatalf("deadline calls = %v, want one non-zero deadline", conn.deadlineCalls)
 	}
 }
 
@@ -1098,15 +1106,13 @@ func TestWriteReplyErrors(t *testing.T) {
 	})
 }
 
-func TestWriteReplyTimeout(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
-
-	err := WriteReply(serverConn, ReplySucceeded, 20*time.Millisecond)
+func TestWriteReplyPropagatesTimeoutError(t *testing.T) {
+	conn := &scriptedConn{writer: errorWriter{err: os.ErrDeadlineExceeded}}
+	err := WriteReply(conn, ReplySucceeded, time.Second)
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("WriteReply error = %v, want deadline exceeded", err)
 	}
+	assertDeadlineCleared(t, conn.writeDeadlineCalls)
 }
 
 func TestReplyForError(t *testing.T) {

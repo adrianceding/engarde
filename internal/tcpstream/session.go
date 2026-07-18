@@ -11,6 +11,13 @@ import (
 
 const smuxProtocolVersion = 2
 
+var newSessionOpenTimer = func(delay time.Duration) (<-chan time.Time, func()) {
+	timer := time.NewTimer(delay)
+	return timer.C, func() { timer.Stop() }
+}
+
+var sessionOpenNow = time.Now
+
 type SessionConfig struct {
 	KeepaliveInterval time.Duration
 	KeepaliveTimeout  time.Duration
@@ -163,7 +170,7 @@ func (session *Session) OpenDestination(streamID StreamID, destination Destinati
 	}
 	var deadline time.Time
 	if timeout > 0 {
-		deadline = time.Now().Add(timeout)
+		deadline = sessionOpenNow().Add(timeout)
 	}
 	stream, err := session.openStream(timeout)
 	if err != nil {
@@ -225,12 +232,12 @@ func (session *Session) openStream(timeout time.Duration) (*smux.Stream, error) 
 		stream, err := session.mux.OpenStream()
 		opened <- result{stream: stream, err: err}
 	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+	ticks, stopTimer := newSessionOpenTimer(timeout)
+	defer stopTimer()
 	select {
 	case opened := <-opened:
 		return opened.stream, opened.err
-	case <-timer.C:
+	case <-ticks:
 		// A blocked smux control write makes the entire physical Session
 		// unusable, so fail all virtual streams and let the path reconnect.
 		_ = session.mux.Close()

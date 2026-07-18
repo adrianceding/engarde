@@ -25,9 +25,34 @@ type behaviorStack struct {
 	client        *Client
 	server        *serverrole.Server
 	clientAddress string
+	interfaces    *behaviorInterfaceSet
 	cancel        context.CancelFunc
 	clientDone    <-chan error
 	serverDone    <-chan error
+}
+
+type behaviorInterfaceSet struct {
+	mu         sync.Mutex
+	interfaces []net.Interface
+}
+
+func (set *behaviorInterfaceSet) snapshot() []net.Interface {
+	set.mu.Lock()
+	defer set.mu.Unlock()
+	return append([]net.Interface(nil), set.interfaces...)
+}
+
+func (set *behaviorInterfaceSet) remove(name string) bool {
+	set.mu.Lock()
+	defer set.mu.Unlock()
+	for index, iface := range set.interfaces {
+		if iface.Name != name {
+			continue
+		}
+		set.interfaces = append(set.interfaces[:index], set.interfaces[index+1:]...)
+		return true
+	}
+	return false
 }
 
 type behaviorEchoResult struct {
@@ -36,10 +61,11 @@ type behaviorEchoResult struct {
 }
 
 type behaviorEchoServer struct {
-	listener net.Listener
-	progress chan struct{}
-	results  chan behaviorEchoResult
-	accepted atomic.Int32
+	listener       net.Listener
+	progress       chan int
+	results        chan behaviorEchoResult
+	accepted       atomic.Int32
+	acceptedEvents chan struct{}
 
 	progressAt      int
 	throttle        time.Duration
@@ -57,8 +83,9 @@ type behaviorEchoServer struct {
 }
 
 func TestTCPSOCKS5PipelinedLargeTransferSurvivesCarrierLoss(t *testing.T) {
-	faultInjected := make(chan struct{})
-	target := startBehaviorEchoServer(t, 128*1024, 200*time.Microsecond, nil, faultInjected)
+	resumeDestination := make(chan struct{})
+	const faultAfterBytes = 128 * 1024
+	target := startBehaviorEchoServer(t, faultAfterBytes, 0, nil, resumeDestination)
 	stack := startBehaviorStack(t, 2, func(transfer *config.Transfer) {
 		transfer.TCP.ChunkSize = 1024
 		transfer.TCP.CarrierQueueBytes = 64 * 1024
@@ -103,34 +130,29 @@ func TestTCPSOCKS5PipelinedLargeTransferSurvivesCarrierLoss(t *testing.T) {
 		got, readErr := io.ReadAll(application)
 		readDone <- behaviorEchoResult{payload: got, err: readErr}
 	}()
-	writeDone := make(chan error, 1)
-	go func() {
-		if writeErr := behaviorWriteAll(application, payload[earlyBytes:]); writeErr != nil {
-			writeDone <- writeErr
-			return
-		}
-		writeDone <- behaviorCloseWrite(application)
-	}()
+	if err := behaviorWriteAll(application, payload[earlyBytes:faultAfterBytes]); err != nil {
+		t.Fatalf("application prefix write: %v", err)
+	}
 
 	select {
-	case <-target.progress:
+	case received := <-target.progress:
+		if received != faultAfterBytes {
+			t.Fatalf("destination progress = %d bytes, want exactly %d", received, faultAfterBytes)
+		}
 	case result := <-target.results:
 		t.Fatalf("destination ended before carrier fault injection: %v", result.err)
 	case <-time.After(behaviorSocketTimeout):
 		t.Fatal("destination did not receive the transfer prefix")
 	}
-	if err := behaviorCloseCarrier(stack.client, "path-b"); err != nil {
+	if err := behaviorDropPath(stack, "path-b"); err != nil {
 		t.Fatal(err)
 	}
-	close(faultInjected)
-
-	select {
-	case err := <-writeDone:
-		if err != nil {
-			t.Fatalf("application write/CloseWrite: %v", err)
-		}
-	case <-time.After(behaviorSocketTimeout):
-		t.Fatal("application write did not complete")
+	close(resumeDestination)
+	if err := behaviorWriteAll(application, payload[faultAfterBytes:]); err != nil {
+		t.Fatalf("application post-fault write: %v", err)
+	}
+	if err := behaviorCloseWrite(application); err != nil {
+		t.Fatalf("application CloseWrite: %v", err)
 	}
 	var applicationResult behaviorEchoResult
 	select {
@@ -240,10 +262,9 @@ func TestTCPSOCKS5ConcurrentStreamsRemainIsolated(t *testing.T) {
 			results <- streamResult{index: index, err: err}
 		}(index)
 	}
+	acceptedEvents := target.captureAcceptEvents(streamCount)
 	close(start)
-	behaviorEventually(t, behaviorSocketTimeout, "all destination connections", func() bool {
-		return target.accepted.Load() == streamCount
-	})
+	behaviorWaitEvents(t, acceptedEvents, streamCount, "all destination connections")
 	behaviorWaitStackCounts(t, stack, streamCount, -1, streamCount, -1)
 	close(gate)
 
@@ -287,6 +308,7 @@ func TestTCPSOCKS5ConcurrentStreamsRemainIsolated(t *testing.T) {
 }
 
 func TestTCPSOCKS5NoInterfacesReturnsGeneralFailureAndCloses(t *testing.T) {
+	openTimers := installTCPManualFlowOpenTimer(t)
 	transfer := config.Transfer{}
 	transfer.ApplyDefaults()
 	transfer.TCP.OpenTimeoutMillis = 100
@@ -326,13 +348,48 @@ func TestTCPSOCKS5NoInterfacesReturnsGeneralFailureAndCloses(t *testing.T) {
 	if err := behaviorWriteAll(conn, request); err != nil {
 		t.Fatal(err)
 	}
-	reply, err := behaviorReadSOCKS5Reply(conn)
+	type replyResult struct {
+		reply socks5.Reply
+		err   error
+	}
+	replyDone := make(chan replyResult, 1)
+	go func() {
+		reply, replyErr := behaviorReadSOCKS5Reply(conn)
+		replyDone <- replyResult{reply: reply, err: replyErr}
+	}()
+	openTimer := openTimers.next(t)
+	if openTimer.delay != 100*time.Millisecond {
+		t.Fatalf("flow open timeout = %v, want 100ms", openTimer.delay)
+	}
+	select {
+	case result := <-replyDone:
+		t.Fatalf("SOCKS5 request completed before open timeout fired: reply %d/error %v", result.reply, result.err)
+	default:
+	}
+	statusValue, err := client.Status()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reply != socks5.ReplyGeneralFailure {
-		t.Fatalf("SOCKS5 CONNECT reply = %d, want general failure", reply)
+	status := statusValue.(control.ClientStatus)
+	if status.Streams != 1 || status.Carriers != 0 || status.Sessions != 0 {
+		t.Fatalf("pre-timeout status = streams %d/carriers %d/sessions %d, want 1/0/0", status.Streams, status.Carriers, status.Sessions)
 	}
+	openTimers.assertNoPending(t)
+	openTimer.fire(t)
+
+	var completed replyResult
+	select {
+	case completed = <-replyDone:
+	case <-time.After(behaviorSocketTimeout):
+		t.Fatal("SOCKS5 request did not complete after open timeout fired")
+	}
+	if completed.err != nil {
+		t.Fatal(completed.err)
+	}
+	if completed.reply != socks5.ReplyGeneralFailure {
+		t.Fatalf("SOCKS5 CONNECT reply = %d, want general failure", completed.reply)
+	}
+	openTimers.assertNoPending(t)
 	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -384,9 +441,8 @@ func startBehaviorStack(t *testing.T, pathCount int, configure func(*config.Tran
 	for index := range pathCount {
 		interfaces[index] = net.Interface{Index: index + 1, Name: fmt.Sprintf("path-%c", 'a'+index)}
 	}
-	client.listInterfaces = func() ([]net.Interface, error) {
-		return append([]net.Interface(nil), interfaces...), nil
-	}
+	interfaceSet := &behaviorInterfaceSet{interfaces: interfaces}
+	client.listInterfaces = func() ([]net.Interface, error) { return interfaceSet.snapshot(), nil }
 	client.interfaceAddress = func(net.Interface) string { return "127.0.0.1" }
 
 	previousDial := dialTCPOnInterface
@@ -407,6 +463,7 @@ func startBehaviorStack(t *testing.T, pathCount int, configure func(*config.Tran
 		client:        client,
 		server:        server,
 		clientAddress: clientAddress,
+		interfaces:    interfaceSet,
 		cancel:        cancel,
 		clientDone:    clientDone,
 		serverDone:    serverDone,
@@ -447,7 +504,7 @@ func startBehaviorEchoServerWithTimeout(t *testing.T, progressAt int, throttle, 
 	}
 	server := &behaviorEchoServer{
 		listener:        listener,
-		progress:        make(chan struct{}, 1),
+		progress:        make(chan int, 1),
 		results:         make(chan behaviorEchoResult, 64),
 		progressAt:      progressAt,
 		throttle:        throttle,
@@ -473,10 +530,24 @@ func (server *behaviorEchoServer) acceptLoop() {
 		server.accepted.Add(1)
 		server.mu.Lock()
 		server.connections[conn] = struct{}{}
+		acceptedEvents := server.acceptedEvents
 		server.connectionWG.Add(1)
 		server.mu.Unlock()
+		if acceptedEvents != nil {
+			acceptedEvents <- struct{}{}
+		}
 		go server.echo(conn)
 	}
+}
+
+func (server *behaviorEchoServer) captureAcceptEvents(count int) <-chan struct{} {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.accepted.Load() != 0 || server.acceptedEvents != nil {
+		panic("accept event capture must be installed before the first connection")
+	}
+	server.acceptedEvents = make(chan struct{}, count)
+	return server.acceptedEvents
 }
 
 func (server *behaviorEchoServer) echo(conn net.Conn) {
@@ -520,7 +591,7 @@ func (server *behaviorEchoServer) echo(conn net.Conn) {
 			if server.progressAt > 0 && len(received) >= server.progressAt {
 				server.progressed.Do(func() {
 					pause = true
-					server.progress <- struct{}{}
+					server.progress <- len(received)
 				})
 			}
 			if pause && server.progressRelease != nil {
@@ -748,6 +819,53 @@ func behaviorPayload(size, seed int) []byte {
 	return payload
 }
 
+func behaviorDropPath(stack *behaviorStack, interfaceName string) error {
+	runtime := stack.client.getTCPRuntime()
+	if runtime == nil {
+		return errors.New("TCP runtime was not initialized")
+	}
+	runtime.mu.Lock()
+	var carrier *tcpstream.Carrier
+	var flow *tcpstream.Flow
+	for streamID, carriers := range runtime.carriers {
+		if current := carriers[interfaceName]; current != nil {
+			if carrier != nil {
+				runtime.mu.Unlock()
+				return fmt.Errorf("multiple carriers registered for %s", interfaceName)
+			}
+			carrier = current
+			flow = runtime.flows[streamID]
+		}
+	}
+	runtime.mu.Unlock()
+	if carrier == nil || flow == nil {
+		return fmt.Errorf("carrier for %s was not registered", interfaceName)
+	}
+	if !stack.interfaces.remove(interfaceName) {
+		return fmt.Errorf("interface %s was not configured", interfaceName)
+	}
+
+	runtime.refresh()
+	select {
+	case <-carrier.Detached():
+	case <-time.After(behaviorSocketTimeout):
+		return fmt.Errorf("carrier for %s did not detach after its path was removed", interfaceName)
+	}
+	if count := flow.CarrierCount(); count != 1 {
+		return fmt.Errorf("flow carrier count after removing path %s = %d, want 1", interfaceName, count)
+	}
+	runtime.mu.Lock()
+	_, pathExists := runtime.paths[interfaceName]
+	_, sessionExists := runtime.sessions[interfaceName]
+	runtime.mu.Unlock()
+	if pathExists || sessionExists {
+		return fmt.Errorf("removed path %s remained registered: path=%v session=%v", interfaceName, pathExists, sessionExists)
+	}
+	return nil
+}
+
+// behaviorCloseCarrier is retained for the opt-in soak diagnostic, where a
+// virtual carrier is expected to be recreated on the same physical session.
 func behaviorCloseCarrier(client *Client, interfaceName string) error {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -786,6 +904,19 @@ func behaviorWaitStackCounts(t *testing.T, stack *behaviorStack, clientStreams, 
 			(serverStreams < 0 || serverStatus.Streams == serverStreams) &&
 			(serverCarriers < 0 || serverStatus.Carriers == serverCarriers)
 	})
+}
+
+func behaviorWaitEvents(t *testing.T, events <-chan struct{}, count int, description string) {
+	t.Helper()
+	timer := time.NewTimer(behaviorSocketTimeout)
+	defer timer.Stop()
+	for index := 0; index < count; index++ {
+		select {
+		case <-events:
+		case <-timer.C:
+			t.Fatalf("timed out waiting for %s: observed %d of %d events", description, index, count)
+		}
+	}
 }
 
 func behaviorEventually(t *testing.T, timeout time.Duration, description string, condition func() bool) {

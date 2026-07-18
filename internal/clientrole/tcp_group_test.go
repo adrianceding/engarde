@@ -75,6 +75,7 @@ func TestTCPPathSessionReconnectReopensLiveFlow(t *testing.T) {
 		"path-a": {index: 1, address: "192.0.2.1", destination: "198.51.100.1:59501"},
 		"path-b": {index: 2, address: "192.0.2.2", destination: "198.51.100.1:59501"},
 	}
+	retryTimers := installTCPManualSessionRetryTimer(t)
 	runtime := newTCPSessionManagerTestRuntime(t)
 	peers, _ := installTCPSessionManagerDialer(t, runtime)
 	runtime.refreshCarrierGroups(paths)
@@ -99,6 +100,21 @@ func TestTCPPathSessionReconnectReopensLiveFlow(t *testing.T) {
 	if err := initialPeers["path-a"].Close(); err != nil {
 		t.Fatal(err)
 	}
+	retryTimer := retryTimers.next(t)
+	if retryTimer.delay != tcpSessionRetryInitialDelay {
+		t.Fatalf("replacement retry delay = %v, want %v", retryTimer.delay, tcpSessionRetryInitialDelay)
+	}
+	pathSession := runtime.sessions["path-a"]
+	pathSession.mu.Lock()
+	retrying := pathSession.retrying
+	retryCount := pathSession.retryCount
+	generationBeforeTick := pathSession.generation
+	pathSession.mu.Unlock()
+	if !retrying || retryCount != 1 || generationBeforeTick != initialGeneration {
+		t.Fatalf("retry state before tick = retrying %v/count %d/generation %d, want true/1/%d", retrying, retryCount, generationBeforeTick, initialGeneration)
+	}
+	retryTimers.assertNoPending(t)
+	retryTimer.fire(t)
 
 	var replacementPeer *tcpstream.Session
 	deadline := time.NewTimer(tcpSessionManagerTestTimeout)
@@ -118,7 +134,7 @@ func TestTCPPathSessionReconnectReopensLiveFlow(t *testing.T) {
 	}
 	if !waitTCPSessionManagerConditionUntil(func() bool {
 		current, generation, currentHealthy := runtime.sessions["path-a"].current(paths["path-a"])
-		return currentHealthy && current != initialClient && generation > initialGeneration && flow.CarrierCount() == 2
+		return currentHealthy && current != initialClient && generation == initialGeneration+1 && flow.CarrierCount() == 2
 	}) {
 		current, generation, currentHealthy := runtime.sessions["path-a"].current(paths["path-a"])
 		t.Fatalf("reconnected virtual stream did not converge: healthy=%v replaced=%v generation=%d initial-generation=%d flow-error=%v %s", currentHealthy, current != initialClient, generation, initialGeneration, flow.Err(), tcpSessionManagerGroupState(group))
@@ -128,6 +144,7 @@ func TestTCPPathSessionReconnectReopensLiveFlow(t *testing.T) {
 		t.Fatalf("flow ended while another path remained available: %v", flow.Err())
 	default:
 	}
+	retryTimers.assertNoPending(t)
 
 	_ = flow.Close()
 	runtime.releaseCarrierGroup(group)
@@ -139,6 +156,17 @@ func TestTCPFlowStreamReopensOnHealthySession(t *testing.T) {
 		"path-a": {index: 1, address: "192.0.2.1", destination: "198.51.100.1:59501"},
 		"path-b": {index: 2, address: "192.0.2.2", destination: "198.51.100.1:59501"},
 	}
+	retryTimers := installTCPManualFlowRetryTimer(t)
+	previousNow := tcpRetryNow
+	baseTime := time.Unix(200, 0)
+	var nowNanos atomic.Int64
+	nowNanos.Store(baseTime.UnixNano())
+	var nowCalls atomic.Int32
+	tcpRetryNow = func() time.Time {
+		nowCalls.Add(1)
+		return time.Unix(0, nowNanos.Load())
+	}
+	t.Cleanup(func() { tcpRetryNow = previousNow })
 	runtime := newTCPSessionManagerTestRuntime(t)
 	peers, dialCount := installTCPSessionManagerDialer(t, runtime)
 	runtime.refreshCarrierGroups(paths)
@@ -168,8 +196,32 @@ func TestTCPFlowStreamReopensOnHealthySession(t *testing.T) {
 	if initial == nil {
 		t.Fatal("path-a virtual carrier was not registered")
 	}
+	waitTCPSessionManagerCondition(t, func() bool { return nowCalls.Load() >= int32(2*len(paths)) })
+	group.mu.Lock()
+	group.slots["path-a"].retryCount = 3
+	group.mu.Unlock()
+	nowNanos.Store(baseTime.Add(tcpFlowRetryStablePeriod).UnixNano())
 	initial.Close()
 
+	retryTimer := retryTimers.next(t)
+	if retryTimer.delay != tcpSessionRetryInitialDelay {
+		t.Fatalf("stable carrier retry delay = %v, want %v", retryTimer.delay, tcpSessionRetryInitialDelay)
+	}
+	group.mu.Lock()
+	slot := group.slots["path-a"]
+	retrying := slot.retrying
+	retryCount := slot.retryCount
+	slotSession := slot.session
+	slotGeneration := slot.sessionGeneration
+	group.mu.Unlock()
+	runtime.mu.Lock()
+	removed := runtime.carriers[flow.ID()]["path-a"] == nil
+	runtime.mu.Unlock()
+	if !removed || !retrying || retryCount != 1 || slotSession != physical || slotGeneration != generation {
+		t.Fatalf("stable retry state = removed %v/retrying %v/count %d/session-current %v/generation %d, want true/true/1/true/%d", removed, retrying, retryCount, slotSession == physical, slotGeneration, generation)
+	}
+	retryTimers.assertNoPending(t)
+	retryTimer.fire(t)
 	waitTCPSessionManagerCondition(t, func() bool {
 		runtime.mu.Lock()
 		replacement := runtime.carriers[flow.ID()]["path-a"]
@@ -183,6 +235,15 @@ func TestTCPFlowStreamReopensOnHealthySession(t *testing.T) {
 	if got := dialCount.Load(); got != int32(len(paths)) {
 		t.Fatalf("physical dials = %d, want %d", got, len(paths))
 	}
+	group.mu.Lock()
+	slot = group.slots["path-a"]
+	retrying = slot.retrying
+	retryCount = slot.retryCount
+	group.mu.Unlock()
+	if retrying || retryCount != 1 {
+		t.Fatalf("reopened slot state = retrying %v/count %d, want false/1", retrying, retryCount)
+	}
+	retryTimers.assertNoPending(t)
 
 	_ = flow.Close()
 	runtime.releaseCarrierGroup(group)
@@ -260,6 +321,7 @@ func TestTCPFlowCommitSurvivesConcurrentPathReplacement(t *testing.T) {
 
 func TestTCPFlowOpenRejectionBlocksOnlyCurrentSessionGeneration(t *testing.T) {
 	path := tcpClientPath{index: 1, address: "192.0.2.1", destination: "198.51.100.1:59501"}
+	retryTimers := installTCPManualSessionRetryTimer(t)
 	runtime := newTCPSessionManagerTestRuntime(t)
 	peers, _ := installTCPSessionManagerDialer(t, runtime)
 	runtime.refreshCarrierGroups(map[string]tcpClientPath{"path-a": path})
@@ -296,7 +358,15 @@ func TestTCPFlowOpenRejectionBlocksOnlyCurrentSessionGeneration(t *testing.T) {
 	runtime.mu.Unlock()
 	group.rejectOpenAttempt("path-a", path, session, generation)
 	group.reconcile("path-a")
-	time.Sleep(20 * time.Millisecond)
+	group.mu.Lock()
+	slot := group.slots["path-a"]
+	rejected := slot.openRejected
+	inFlight := slot.inFlight
+	slotGeneration := slot.sessionGeneration
+	group.mu.Unlock()
+	if !rejected || inFlight || slotGeneration != generation {
+		t.Fatalf("rejected slot state = rejected %v/in-flight %v/generation %d, want true/false/%d", rejected, inFlight, slotGeneration, generation)
+	}
 	if got := initialPeer.session.StreamCount(); got != 0 {
 		t.Fatalf("same-generation rejection reopened %d virtual streams, want 0", got)
 	}
@@ -304,15 +374,22 @@ func TestTCPFlowOpenRejectionBlocksOnlyCurrentSessionGeneration(t *testing.T) {
 	if err := initialPeer.session.Close(); err != nil {
 		t.Fatal(err)
 	}
+	retryTimer := retryTimers.next(t)
+	if retryTimer.delay != tcpSessionRetryInitialDelay {
+		t.Fatalf("new-generation retry delay = %v, want %v", retryTimer.delay, tcpSessionRetryInitialDelay)
+	}
+	retryTimers.assertNoPending(t)
+	retryTimer.fire(t)
 	replacementPeer := waitTCPSessionManagerPeer(t, peers, "path-a")
 	if replacementPeer.err != nil {
 		t.Fatal(replacementPeer.err)
 	}
 	waitTCPSessionManagerCondition(t, func() bool { return flow.CarrierCount() == 1 })
 	current, currentGeneration, healthy := runtime.sessions["path-a"].current(path)
-	if !healthy || current == session || currentGeneration <= generation {
-		t.Fatal("new physical session generation did not replace the rejected generation")
+	if !healthy || current == session || currentGeneration != generation+1 {
+		t.Fatalf("new physical session = healthy %v/replaced %v/generation %d, want true/true/%d", healthy, current != session, currentGeneration, generation+1)
 	}
+	retryTimers.assertNoPending(t)
 
 	_ = flow.Close()
 	runtime.releaseCarrierGroup(group)
@@ -341,6 +418,7 @@ func TestTCPPathSessionRefreshReplacesChangedPath(t *testing.T) {
 	if runtime.sessions["path-a"] == firstPathSession {
 		t.Fatal("changed path retained the old physical session manager")
 	}
+	secondPathSession := runtime.sessions["path-a"]
 	select {
 	case <-firstPeer.session.Done():
 	case <-time.After(tcpSessionManagerTestTimeout):
@@ -353,7 +431,9 @@ func TestTCPPathSessionRefreshReplacesChangedPath(t *testing.T) {
 	if !runtime.refreshCarrierGroups(map[string]tcpClientPath{"path-a": changed}) {
 		t.Fatal("stable path refresh was rejected")
 	}
-	time.Sleep(20 * time.Millisecond)
+	if runtime.sessions["path-a"] != secondPathSession {
+		t.Fatal("stable refresh replaced the current path session")
+	}
 	if got := dialCount.Load(); got != 2 {
 		t.Fatalf("stable refresh created %d physical dials, want 2", got)
 	}
@@ -375,88 +455,171 @@ func TestTCPPathSessionRetryBackoffIsBounded(t *testing.T) {
 			t.Fatalf("retry %d delay = %v, want %v", retryCount, got, wantDelay)
 		}
 	}
-	for _, delay := range []time.Duration{tcpSessionRetryInitialDelay, time.Second, tcpSessionRetryMaxDelay} {
-		minimum := delay - delay/5
-		maximum := min(delay+delay/5, tcpSessionRetryMaxDelay)
-		for range 1000 {
-			got := jitterTCPSessionRetryDelay(delay)
-			if got < minimum || got > maximum {
-				t.Fatalf("jittered delay for %v = %v, want [%v, %v]", delay, got, minimum, maximum)
-			}
-		}
+	jitterCases := []struct {
+		name   string
+		delay  time.Duration
+		offset time.Duration
+		want   time.Duration
+	}{
+		{name: "lower boundary", delay: 100 * time.Millisecond, offset: 0, want: 80 * time.Millisecond},
+		{name: "midpoint", delay: 100 * time.Millisecond, offset: 20 * time.Millisecond, want: 100 * time.Millisecond},
+		{name: "upper boundary", delay: 100 * time.Millisecond, offset: 40 * time.Millisecond, want: 120 * time.Millisecond},
+		{name: "maximum cap", delay: tcpSessionRetryMaxDelay, offset: 2 * tcpSessionRetryMaxDelay / 5, want: tcpSessionRetryMaxDelay},
 	}
+	for _, testCase := range jitterCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := applyTCPSessionRetryJitter(testCase.delay, testCase.offset); got != testCase.want {
+				t.Fatalf("jittered delay = %v, want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestTCPPathSessionRetryIgnoresStaleGenerationTimer(t *testing.T) {
+	retryTimers := installTCPManualSessionRetryTimer(t)
+	runtime := newTCPSessionManagerTestRuntime(t)
+	path := tcpClientPath{index: 1, address: "192.0.2.1", destination: "198.51.100.1:59501"}
+	pathSession := newTCPPathSession(runtime, "path-a", path)
+	pathSession.generation = 2
+	pathSession.retrying = true
+	pathSession.retryCount = 2
+
+	done := make(chan struct{})
+	go func() {
+		pathSession.waitToRetry(1, tcpSessionRetryInitialDelay)
+		close(done)
+	}()
+	retryTimer := retryTimers.next(t)
+	if retryTimer.delay != tcpSessionRetryInitialDelay {
+		t.Fatalf("stale retry delay = %v, want %v", retryTimer.delay, tcpSessionRetryInitialDelay)
+	}
+	retryTimers.assertNoPending(t)
+	retryTimer.fire(t)
+	select {
+	case <-done:
+	case <-time.After(tcpSessionManagerTestTimeout):
+		t.Fatal("stale generation retry did not return")
+	}
+
+	pathSession.mu.Lock()
+	generation := pathSession.generation
+	retrying := pathSession.retrying
+	retryCount := pathSession.retryCount
+	inFlight := pathSession.inFlight
+	pathSession.mu.Unlock()
+	if generation != 2 || !retrying || retryCount != 2 || inFlight {
+		t.Fatalf("state after stale timer = generation %d/retrying %v/count %d/in-flight %v, want 2/true/2/false", generation, retrying, retryCount, inFlight)
+	}
+	retryTimers.assertNoPending(t)
+	pathSession.close()
 }
 
 func TestTCPPathSessionShortLivedSuccessesPreserveRetryBackoff(t *testing.T) {
 	path := tcpClientPath{index: 1, address: "192.0.2.1", destination: "198.51.100.1:59501"}
+	retryTimers := installTCPManualSessionRetryTimer(t)
+	previousNow := tcpRetryNow
+	now := time.Unix(123, 0)
+	tcpRetryNow = func() time.Time { return now }
+	t.Cleanup(func() { tcpRetryNow = previousNow })
 	runtime := newTCPSessionManagerTestRuntime(t)
-	delays := make(chan time.Duration, 4)
-	errors := make(chan error, 4)
-	var timerCalls atomic.Int32
-	originalTimer := newTCPSessionRetryTimer
-	originalJitter := jitterTCPSessionRetryDelay
+	peers := make(chan tcpSessionManagerPeer, 4)
 	originalDial := dialTCPOnInterface
-	newTCPSessionRetryTimer = func(delay time.Duration) (<-chan time.Time, func()) {
-		delays <- delay
-		ticks := make(chan time.Time, 1)
-		if timerCalls.Add(1) < 3 {
-			ticks <- time.Now()
-		}
-		return ticks, func() {}
-	}
-	jitterTCPSessionRetryDelay = func(delay time.Duration) time.Duration { return delay }
 	var dialCount atomic.Int32
 	dialTCPOnInterface = func(context.Context, string, string, string, time.Duration) (net.Conn, error) {
-		attempt := dialCount.Add(1)
+		dialCount.Add(1)
 		clientConn, serverConn := net.Pipe()
 		go func() {
 			serverSession, _, err := tcpstream.AcceptSession(serverConn, tcpstream.MaxPayloadSize, time.Second, runtime.sessionConfig(), nil)
-			if err != nil {
-				errors <- err
-				return
-			}
-			deadline := time.Now().Add(tcpSessionManagerTestTimeout)
-			for time.Now().Before(deadline) {
-				runtime.mu.Lock()
-				pathSession := runtime.sessions["path-a"]
-				runtime.mu.Unlock()
-				if pathSession != nil {
-					pathSession.mu.Lock()
-					ready := pathSession.session != nil && pathSession.generation == uint64(attempt)
-					pathSession.mu.Unlock()
-					if ready {
-						_ = serverSession.Close()
-						return
-					}
-				}
-				time.Sleep(time.Millisecond)
-			}
-			_ = serverSession.Close()
-			errors <- fmt.Errorf("attempt %d was not installed as a client session", attempt)
+			peers <- tcpSessionManagerPeer{interfaceName: "path-a", session: serverSession, err: err}
 		}()
 		return clientConn, nil
 	}
-	defer func() {
-		newTCPSessionRetryTimer = originalTimer
-		jitterTCPSessionRetryDelay = originalJitter
-		dialTCPOnInterface = originalDial
-	}()
+	t.Cleanup(func() { dialTCPOnInterface = originalDial })
 
 	runtime.refreshCarrierGroups(map[string]tcpClientPath{"path-a": path})
 	want := []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
+	pathSession := runtime.sessions["path-a"]
 	for index, wantDelay := range want {
-		select {
-		case err := <-errors:
+		peer := waitTCPSessionManagerPeer(t, peers, "path-a")
+		if peer.err != nil {
+			t.Fatal(peer.err)
+		}
+		wantGeneration := uint64(index + 1)
+		waitTCPSessionManagerCondition(t, func() bool {
+			_, generation, healthy := pathSession.current(path)
+			return healthy && generation == wantGeneration
+		})
+		if err := peer.session.Close(); err != nil {
 			t.Fatal(err)
-		case got := <-delays:
-			if got != wantDelay {
-				t.Fatalf("retry %d delay = %v, want %v", index, got, wantDelay)
-			}
-		case <-time.After(tcpSessionManagerTestTimeout):
-			t.Fatalf("timed out waiting for retry %d", index)
+		}
+		retryTimer := retryTimers.next(t)
+		if retryTimer.delay != wantDelay {
+			t.Fatalf("retry %d delay = %v, want %v", index, retryTimer.delay, wantDelay)
+		}
+		pathSession.mu.Lock()
+		retryCount := pathSession.retryCount
+		generation := pathSession.generation
+		pathSession.mu.Unlock()
+		if retryCount != index+1 || generation != wantGeneration {
+			t.Fatalf("retry %d state = count %d/generation %d, want %d/%d", index, retryCount, generation, index+1, wantGeneration)
+		}
+		retryTimers.assertNoPending(t)
+		if index+1 < len(want) {
+			retryTimer.fire(t)
 		}
 	}
+	if got := dialCount.Load(); got != int32(len(want)) {
+		t.Fatalf("physical dials = %d, want %d", got, len(want))
+	}
 	runtime.shutdown()
+}
+
+func TestTCPPathSessionStableSuccessResetsRetryBackoff(t *testing.T) {
+	path := tcpClientPath{index: 1, address: "192.0.2.1", destination: "198.51.100.1:59501"}
+	retryTimers := installTCPManualSessionRetryTimer(t)
+	previousNow := tcpRetryNow
+	baseTime := time.Unix(300, 0)
+	var nowNanos atomic.Int64
+	nowNanos.Store(baseTime.UnixNano())
+	tcpRetryNow = func() time.Time { return time.Unix(0, nowNanos.Load()) }
+	t.Cleanup(func() { tcpRetryNow = previousNow })
+	runtime := newTCPSessionManagerTestRuntime(t)
+	peers, dialCount := installTCPSessionManagerDialer(t, runtime)
+
+	runtime.refreshCarrierGroups(map[string]tcpClientPath{"path-a": path})
+	peer := waitTCPSessionManagerPeer(t, peers, "path-a")
+	if peer.err != nil {
+		t.Fatal(peer.err)
+	}
+	pathSession := runtime.sessions["path-a"]
+	waitTCPSessionManagerCondition(t, func() bool {
+		_, generation, healthy := pathSession.current(path)
+		return healthy && generation == 1
+	})
+	pathSession.mu.Lock()
+	pathSession.retryCount = 3
+	pathSession.mu.Unlock()
+	nowNanos.Store(baseTime.Add(tcpSessionRetryMaxDelay).UnixNano())
+	if err := peer.session.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	retryTimer := retryTimers.next(t)
+	if retryTimer.delay != tcpSessionRetryInitialDelay {
+		t.Fatalf("retry delay after stable session = %v, want %v", retryTimer.delay, tcpSessionRetryInitialDelay)
+	}
+	pathSession.mu.Lock()
+	retrying := pathSession.retrying
+	retryCount := pathSession.retryCount
+	generation := pathSession.generation
+	pathSession.mu.Unlock()
+	if !retrying || retryCount != 1 || generation != 1 {
+		t.Fatalf("retry state after stable session = retrying %v/count %d/generation %d, want true/1/1", retrying, retryCount, generation)
+	}
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("physical dials before retry tick = %d, want 1", got)
+	}
+	retryTimers.assertNoPending(t)
 }
 
 func TestTCPSessionRetryStabilityBoundary(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +29,63 @@ type sessionOpenResult struct {
 type sessionWriteFailureConn struct {
 	net.Conn
 	err error
+}
+
+type sessionManualTimer struct {
+	delay time.Duration
+	ticks chan time.Time
+
+	mu      sync.Mutex
+	stopped bool
+}
+
+func (timer *sessionManualTimer) stop() {
+	timer.mu.Lock()
+	timer.stopped = true
+	timer.mu.Unlock()
+}
+
+func (timer *sessionManualTimer) isStopped() bool {
+	timer.mu.Lock()
+	defer timer.mu.Unlock()
+	return timer.stopped
+}
+
+type sessionManualTimerFactory struct {
+	requests chan *sessionManualTimer
+}
+
+func installSessionManualOpenTimer(t *testing.T) *sessionManualTimerFactory {
+	t.Helper()
+	factory := &sessionManualTimerFactory{requests: make(chan *sessionManualTimer, 4)}
+	previous := newSessionOpenTimer
+	newSessionOpenTimer = func(delay time.Duration) (<-chan time.Time, func()) {
+		timer := &sessionManualTimer{delay: delay, ticks: make(chan time.Time, 1)}
+		factory.requests <- timer
+		return timer.ticks, timer.stop
+	}
+	t.Cleanup(func() { newSessionOpenTimer = previous })
+	return factory
+}
+
+func (factory *sessionManualTimerFactory) next(t *testing.T) *sessionManualTimer {
+	t.Helper()
+	select {
+	case timer := <-factory.requests:
+		return timer
+	case <-time.After(sessionTestTimeout):
+		t.Fatal("session open did not request a timer")
+		return nil
+	}
+}
+
+func (factory *sessionManualTimerFactory) assertNoPending(t *testing.T) {
+	t.Helper()
+	select {
+	case timer := <-factory.requests:
+		t.Fatalf("unexpected additional session open timer with delay %v", timer.delay)
+	default:
+	}
 }
 
 func (conn *sessionWriteFailureConn) Write([]byte) (int, error) {
@@ -156,6 +214,7 @@ func TestOpenDestinationClosesSessionOnOpenStreamFailure(t *testing.T) {
 }
 
 func TestOpenDestinationTimeoutIncludesOpeningSMUXStream(t *testing.T) {
+	timers := installSessionManualOpenTimer(t)
 	clientConn, peerConn := net.Pipe()
 	defer peerConn.Close()
 	mux, err := smux.Client(clientConn, smuxSessionConfig(SessionConfig{}))
@@ -164,17 +223,38 @@ func TestOpenDestinationTimeoutIncludesOpeningSMUXStream(t *testing.T) {
 	}
 	session := &Session{mux: mux, maxPayload: MaxPayloadSize}
 
-	started := time.Now()
-	conn, _, err := session.OpenDestination(sessionTestStreamID(10), sessionTestDestination(t, "timeout.example:443"), 25*time.Millisecond)
+	result := make(chan sessionOpenResult, 1)
+	go func() {
+		conn, maxPayload, err := session.OpenDestination(sessionTestStreamID(10), sessionTestDestination(t, "timeout.example:443"), 25*time.Millisecond)
+		result <- sessionOpenResult{conn: conn, maxPayload: maxPayload, err: err}
+	}()
+	timer := timers.next(t)
+	if timer.delay != 25*time.Millisecond {
+		t.Fatalf("open timer delay = %v, want 25ms", timer.delay)
+	}
+	select {
+	case <-session.Done():
+		t.Fatal("session closed before the open timer fired")
+	default:
+	}
+	timer.ticks <- time.Time{}
+	var opened sessionOpenResult
+	select {
+	case opened = <-result:
+	case <-time.After(sessionTestTimeout):
+		t.Fatal("OpenDestination did not return after the open timer fired")
+	}
+	if !timer.isStopped() {
+		t.Fatal("session open timer was not stopped after timeout")
+	}
+	timers.assertNoPending(t)
+	conn, err := opened.conn, opened.err
 	if conn != nil {
 		_ = conn.Close()
 		t.Fatal("timed out OpenStream returned a connection")
 	}
 	if !errors.Is(err, smux.ErrTimeout) {
 		t.Fatalf("OpenDestination error = %v, want %v", err, smux.ErrTimeout)
-	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("OpenDestination timeout took %s, want less than 1s", elapsed)
 	}
 	select {
 	case <-session.Done():
@@ -331,7 +411,11 @@ func TestSessionOpenRejectionDoesNotCloseSession(t *testing.T) {
 	}
 }
 
-func TestSessionOpenResultTimeoutClosesSessionPromptly(t *testing.T) {
+func TestSessionOpenResultDeadlineClosesSession(t *testing.T) {
+	timers := installSessionManualOpenTimer(t)
+	previousNow := sessionOpenNow
+	sessionOpenNow = func() time.Time { return time.Unix(1, 0) }
+	t.Cleanup(func() { sessionOpenNow = previousNow })
 	clientSession, serverSession, _ := newSessionTestPair(t, nil, nil)
 	defer clientSession.Close()
 	defer serverSession.Close()
@@ -346,7 +430,6 @@ func TestSessionOpenResultTimeoutClosesSessionPromptly(t *testing.T) {
 		accepted <- stream
 	}()
 
-	started := time.Now()
 	conn, _, err := clientSession.OpenDestination(sessionTestStreamID(5), sessionTestDestination(t, "silent.example:443"), 25*time.Millisecond)
 	if conn != nil {
 		_ = conn.Close()
@@ -355,9 +438,6 @@ func TestSessionOpenResultTimeoutClosesSessionPromptly(t *testing.T) {
 	var netErr net.Error
 	if !errors.As(err, &netErr) || !netErr.Timeout() {
 		t.Fatalf("OpenDestination error = %v, want timeout", err)
-	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("OpenDestination timeout took %s, want less than 1s", elapsed)
 	}
 	select {
 	case <-clientSession.Done():
@@ -372,6 +452,14 @@ func TestSessionOpenResultTimeoutClosesSessionPromptly(t *testing.T) {
 	case <-time.After(sessionTestTimeout):
 		t.Fatal("server did not accept the timed out virtual stream")
 	}
+	timer := timers.next(t)
+	if timer.delay != 25*time.Millisecond {
+		t.Fatalf("open timer delay = %v, want 25ms", timer.delay)
+	}
+	if !timer.isStopped() {
+		t.Fatal("session open timer was not stopped after stream opened")
+	}
+	timers.assertNoPending(t)
 }
 
 func TestSessionPeerAuthentication(t *testing.T) {

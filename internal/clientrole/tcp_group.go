@@ -29,9 +29,21 @@ var newTCPFlowRetryTimer = func(delay time.Duration) (<-chan time.Time, func()) 
 	return timer.C, func() { timer.Stop() }
 }
 
+var newTCPFlowOpenTimer = func(delay time.Duration) (<-chan time.Time, func()) {
+	timer := time.NewTimer(delay)
+	return timer.C, func() { timer.Stop() }
+}
+
+var tcpRetryNow = time.Now
+
 var jitterTCPSessionRetryDelay = func(delay time.Duration) time.Duration {
 	spread := delay / 5
-	jittered := delay - spread + time.Duration(rand.Int64N(int64(2*spread)+1))
+	return applyTCPSessionRetryJitter(delay, time.Duration(rand.Int64N(int64(2*spread)+1)))
+}
+
+func applyTCPSessionRetryJitter(delay, offset time.Duration) time.Duration {
+	spread := delay / 5
+	jittered := delay - spread + offset
 	if jittered > tcpSessionRetryMaxDelay {
 		return tcpSessionRetryMaxDelay
 	}
@@ -272,7 +284,7 @@ func (pathSession *tcpPathSession) dial(generation uint64) {
 		pathSession.retry(generation)
 		return
 	}
-	establishedAt := time.Now()
+	establishedAt := tcpRetryNow()
 
 	pathSession.mu.Lock()
 	if pathSession.closed || !pathSession.inFlight || pathSession.generation != generation {
@@ -294,7 +306,7 @@ func (pathSession *tcpPathSession) dial(generation uint64) {
 	current := pathSession.session == session
 	if current {
 		pathSession.session = nil
-		if tcpSessionWasStable(establishedAt, time.Now()) {
+		if tcpSessionWasStable(establishedAt, tcpRetryNow()) {
 			pathSession.retryCount = 0
 		}
 	}
@@ -452,8 +464,8 @@ func (group *tcpCarrierGroup) assign(flow *tcpstream.Flow, destination tcpstream
 }
 
 func (group *tcpCarrierGroup) watchOpen(flow *tcpstream.Flow, timeout time.Duration) {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+	ticks, stopTimer := newTCPFlowOpenTimer(timeout)
+	defer stopTimer()
 	var runtimeDone <-chan struct{}
 	if group.runtime.ctx != nil {
 		runtimeDone = group.runtime.ctx.Done()
@@ -461,7 +473,7 @@ func (group *tcpCarrierGroup) watchOpen(flow *tcpstream.Flow, timeout time.Durat
 	select {
 	case <-flow.Done():
 	case <-group.startedReady:
-	case <-timer.C:
+	case <-ticks:
 		group.failOpen(tcpstream.ErrNoCarriers)
 	case <-runtimeDone:
 		flow.Reset(group.runtime.ctx.Err())
@@ -660,10 +672,10 @@ func (group *tcpCarrierGroup) attach(interfaceName string, path tcpClientPath, s
 }
 
 func (group *tcpCarrierGroup) monitorCarrier(interfaceName string, path tcpClientPath, session *tcpstream.Session, generation uint64, carrier *tcpstream.Carrier) {
-	attachedAt := time.Now()
+	attachedAt := tcpRetryNow()
 	<-carrier.Done()
 	if group.removeCarrier(interfaceName, path, session, generation, carrier) {
-		group.retry(interfaceName, path, session, generation, time.Since(attachedAt) >= tcpFlowRetryStablePeriod)
+		group.retry(interfaceName, path, session, generation, tcpRetryNow().Sub(attachedAt) >= tcpFlowRetryStablePeriod)
 	}
 }
 

@@ -18,6 +18,36 @@ type tcpConnWithRemoteAddr struct {
 	net.Conn
 }
 
+type manualTCPServerTimer struct {
+	mu       sync.Mutex
+	callback func()
+	stopped  bool
+	fired    bool
+}
+
+func (timer *manualTCPServerTimer) Stop() bool {
+	timer.mu.Lock()
+	defer timer.mu.Unlock()
+	if timer.stopped || timer.fired {
+		return false
+	}
+	timer.stopped = true
+	return true
+}
+
+func (timer *manualTCPServerTimer) Fire() bool {
+	timer.mu.Lock()
+	if timer.stopped || timer.fired {
+		timer.mu.Unlock()
+		return false
+	}
+	timer.fired = true
+	callback := timer.callback
+	timer.mu.Unlock()
+	callback()
+	return true
+}
+
 func (conn *tcpConnWithRemoteAddr) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345}
 }
@@ -902,7 +932,7 @@ func TestTCPServerFailedInitialOpenDoesNotPoisonRedundantPath(t *testing.T) {
 func TestTCPServerUnattachedFlowExpiresAfterOpenTimeout(t *testing.T) {
 	transfer := config.Transfer{}
 	transfer.ApplyDefaults()
-	transfer.TCP.OpenTimeoutMillis = 20
+	transfer.TCP.OpenTimeoutMillis = 1234
 	runtime := &tcpServerRuntime{
 		server:  New(config.Server{Transfer: transfer}, "test", nil),
 		ctx:     context.Background(),
@@ -912,11 +942,20 @@ func TestTCPServerUnattachedFlowExpiresAfterOpenTimeout(t *testing.T) {
 	}
 	destinationEndpoint, destinationPeer := net.Pipe()
 	previousDial := dialTCPDestination
+	previousTimerFactory := newTCPServerOpenTimer
+	var timer *manualTCPServerTimer
+	var timerDelay time.Duration
 	dialTCPDestination = func(context.Context, string, time.Duration) (net.Conn, error) {
 		return destinationEndpoint, nil
 	}
+	newTCPServerOpenTimer = func(delay time.Duration, callback func()) tcpServerTimer {
+		timerDelay = delay
+		timer = &manualTCPServerTimer{callback: callback}
+		return timer
+	}
 	t.Cleanup(func() {
 		dialTCPDestination = previousDial
+		newTCPServerOpenTimer = previousTimerFactory
 		_ = destinationPeer.Close()
 	})
 	streamID := tcpstream.StreamID{5}
@@ -924,15 +963,21 @@ func TestTCPServerUnattachedFlowExpiresAfterOpenTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if timer == nil || timerDelay != 1234*time.Millisecond {
+		t.Fatalf("open timer/delay = %v/%v, want a timer/1.234s", timer, timerDelay)
+	}
 	select {
 	case <-stream.flow.Done():
 		t.Fatal("unattached flow expired before openTimeout")
 	default:
 	}
+	if !timer.Fire() {
+		t.Fatal("open timeout timer did not fire")
+	}
 	select {
 	case <-stream.flow.Done():
 	case <-time.After(time.Second):
-		t.Fatal("unattached flow did not expire after openTimeout")
+		t.Fatal("unattached flow did not expire when the open timer fired")
 	}
 	if err := stream.flow.Err(); !errors.Is(err, errTCPStreamOpenTimeout) {
 		t.Fatalf("unattached flow error = %v, want OPEN timeout", err)

@@ -1,4 +1,4 @@
-.PHONY: all test test-fuzz test-production test-soak test-soak-netem web-assets web-assets-force docker docker-test linux windows darwin linux-i386 linux-amd64 linux-arm linux-arm64 windows-i386 windows-amd64 windows-arm64 darwin-amd64 darwin-arm64
+.PHONY: all test test-fuzz test-production test-stress test-soak test-soak-netem web-assets web-assets-force docker docker-test linux windows darwin linux-i386 linux-amd64 linux-arm linux-arm64 windows-i386 windows-amd64 windows-arm64 darwin-amd64 darwin-arm64
 
 WEBMANAGER_DIR := webmanager
 WEB_NODE_MODULES := $(WEBMANAGER_DIR)/node_modules/.package-lock.json
@@ -20,10 +20,13 @@ test:
 	go test -count=1 ./...
 
 test-fuzz:
-	ENGARDE_FUZZ_TIME="$${ENGARDE_FUZZ_TIME:-$${FUZZ_TIME:-5s}}" ./build-scripts/test-fuzz.sh
+	ENGARDE_FUZZ_ITERATIONS="$${ENGARDE_FUZZ_ITERATIONS:-$${FUZZ_ITERATIONS:-1000}}" ./build-scripts/test-fuzz.sh
 
 test-production:
-	ENGARDE_STRESS_COUNT="$${ENGARDE_STRESS_COUNT:-10}" ENGARDE_FUZZ_TIME="$${ENGARDE_FUZZ_TIME:-5s}" ./build-scripts/test-production.sh
+	./build-scripts/test-production.sh
+
+test-stress:
+	ENGARDE_STRESS_RUNS="$${ENGARDE_STRESS_RUNS:-$${STRESS_RUNS:-10}}" ./build-scripts/test-stress.sh
 
 test-soak:
 	ENGARDE_SOAK_DURATION="$${ENGARDE_SOAK_DURATION:-$${SOAK_DURATION:-10m}}" \

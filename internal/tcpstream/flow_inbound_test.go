@@ -11,47 +11,136 @@ import (
 
 type endpointWriteStartedConn struct {
 	net.Conn
-	once    sync.Once
-	started chan struct{}
+	once       sync.Once
+	returnOnce sync.Once
+	started    chan struct{}
+	returned   chan struct{}
 }
 
 func (conn *endpointWriteStartedConn) Write(payload []byte) (int, error) {
 	conn.once.Do(func() { close(conn.started) })
-	return conn.Conn.Write(payload)
+	written, err := conn.Conn.Write(payload)
+	if conn.returned != nil {
+		conn.returnOnce.Do(func() { close(conn.returned) })
+	}
+	return written, err
 }
 
-func TestFlowPeerCloseCancelsBlockedEndpointDelivery(t *testing.T) {
-	flow, carrier, peer, _ := newBlockedEndpointFlow(t, 25*time.Millisecond)
-	if err := peer.Close(); err != nil {
+type immediateTimeoutError struct{}
+
+func (immediateTimeoutError) Error() string   { return "controlled endpoint timeout" }
+func (immediateTimeoutError) Timeout() bool   { return true }
+func (immediateTimeoutError) Temporary() bool { return true }
+
+type endpointTimeoutConn struct {
+	net.Conn
+	deadlineSet chan struct{}
+	once        sync.Once
+}
+
+func (conn *endpointTimeoutConn) SetWriteDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		conn.once.Do(func() { close(conn.deadlineSet) })
+	}
+	return nil
+}
+
+func (conn *endpointTimeoutConn) Write([]byte) (int, error) {
+	<-conn.deadlineSet
+	return 0, immediateTimeoutError{}
+}
+
+func TestFlowCloseCancelsBlockedEndpointDelivery(t *testing.T) {
+	flow, carrier, _, returned := newBlockedEndpointFlow(t, 0)
+	if err := flow.Close(); err != nil {
 		t.Fatal(err)
 	}
 	waitForCarrierLoop(t, "read", carrier.readDone)
 	waitForCarrierLoop(t, "process", carrier.processDone)
 	waitForCarrierLoop(t, "flow", flow.Done())
+	waitForCarrierLoop(t, "endpoint write return", returned)
 }
 
 func TestFlowCarrierCloseCancelsBlockedEndpointDelivery(t *testing.T) {
-	flow, carrier, _, _ := newBlockedEndpointFlow(t, time.Second)
+	flow, carrier, _, returned := newBlockedEndpointFlow(t, 0)
 	if err := carrier.Close(); err != nil {
 		t.Fatal(err)
 	}
 	waitForCarrierLoop(t, "read", carrier.readDone)
 	waitForCarrierLoop(t, "process", carrier.processDone)
 	waitForCarrierLoop(t, "flow", flow.Done())
+	waitForCarrierLoop(t, "endpoint write return", returned)
 }
 
-func TestFlowSlowEndpointCarrierChurnRemainsBounded(t *testing.T) {
+func TestFlowAttachLimitedRejectsOnlyCarrierBeyondExactLimit(t *testing.T) {
 	endpoint, application := net.Pipe()
-	started := make(chan struct{})
 	const maxCarriers = 4
-	flow := NewFlow(StreamID{1}, &endpointWriteStartedConn{Conn: endpoint, started: started}, DirectionServerToClient, FlowConfig{
+	flow := NewFlow(StreamID{1}, endpoint, DirectionServerToClient, FlowConfig{
 		ChunkSize:          1024,
 		CarrierQueueBytes:  1024,
 		ReorderWindowBytes: MaxPayloadSize,
-		WriteTimeout:       time.Minute,
 	})
-	anchorConn, anchorPeer := net.Pipe()
-	anchor, err := flow.AttachLimited(anchorConn, MaxPayloadSize, maxCarriers)
+	carriers := make([]*Carrier, 0, maxCarriers)
+	peers := make([]net.Conn, 0, maxCarriers+2)
+	t.Cleanup(func() {
+		_ = flow.Close()
+		_ = application.Close()
+		for _, peer := range peers {
+			_ = peer.Close()
+		}
+	})
+
+	for index := range maxCarriers {
+		carrierConn, peer := net.Pipe()
+		carrier, err := flow.AttachLimited(carrierConn, MaxPayloadSize, maxCarriers)
+		if err != nil {
+			t.Fatalf("carrier %d attach: %v", index+1, err)
+		}
+		carriers = append(carriers, carrier)
+		peers = append(peers, peer)
+		if got := flow.CarrierCount(); got != index+1 {
+			t.Fatalf("carrier count after attach %d = %d, want %d", index+1, got, index+1)
+		}
+	}
+
+	extraConn, extraPeer := net.Pipe()
+	peers = append(peers, extraPeer)
+	if carrier, err := flow.AttachLimited(extraConn, MaxPayloadSize, maxCarriers); err == nil {
+		_ = carrier.Close()
+		t.Fatal("carrier beyond the configured limit was accepted")
+	}
+	if got := flow.CarrierCount(); got != maxCarriers {
+		t.Fatalf("carrier count after rejected attach = %d, want %d", got, maxCarriers)
+	}
+
+	if err := carriers[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForCarrierLoop(t, "detached carrier", carriers[0].Detached())
+	if got := flow.CarrierCount(); got != maxCarriers-1 {
+		t.Fatalf("carrier count after detach = %d, want %d", got, maxCarriers-1)
+	}
+	replacementConn, replacementPeer := net.Pipe()
+	peers = append(peers, replacementPeer)
+	if _, err := flow.AttachLimited(replacementConn, MaxPayloadSize, maxCarriers); err != nil {
+		t.Fatal(err)
+	}
+	if got := flow.CarrierCount(); got != maxCarriers {
+		t.Fatalf("carrier count after replacement = %d, want %d", got, maxCarriers)
+	}
+}
+
+func TestFlowEndpointWriteDeadlineResetsStalledDelivery(t *testing.T) {
+	endpoint, application := net.Pipe()
+	deadlineSet := make(chan struct{})
+	carrierConn, peer := net.Pipe()
+	flow := NewFlow(StreamID{1}, &endpointTimeoutConn{Conn: endpoint, deadlineSet: deadlineSet}, DirectionServerToClient, FlowConfig{
+		ChunkSize:          1024,
+		CarrierQueueBytes:  1024,
+		ReorderWindowBytes: MaxPayloadSize,
+		WriteTimeout:       time.Second,
+	})
+	carrier, err := flow.Attach(carrierConn, MaxPayloadSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,60 +148,30 @@ func TestFlowSlowEndpointCarrierChurnRemainsBounded(t *testing.T) {
 	t.Cleanup(func() {
 		_ = flow.Close()
 		_ = application.Close()
-		_ = anchorPeer.Close()
+		_ = peer.Close()
 	})
-
-	carriers := []*Carrier{anchor}
-	rejected := 0
-	for index := range 64 {
-		carrierConn, peer := net.Pipe()
-		carrier, err := flow.AttachLimited(carrierConn, MaxPayloadSize, maxCarriers)
-		if err != nil {
-			rejected++
-			_ = peer.Close()
-			continue
-		}
-		carriers = append(carriers, carrier)
-		writeInboundFrame(t, peer, flow.ID(), []byte("blocked"))
-		if index == 0 {
-			select {
-			case <-started:
-			case <-time.After(time.Second):
-				t.Fatal("endpoint write did not start")
-			}
-		}
-		if err := peer.Close(); err != nil {
-			t.Fatal(err)
-		}
+	type frameResult struct {
+		frame Frame
+		err   error
 	}
-	if rejected == 0 {
-		t.Fatal("slow endpoint churn never reached the carrier limit")
+	resetFrame := make(chan frameResult, 1)
+	go func() {
+		frame, err := ReadFrame(peer, MaxPayloadSize)
+		resetFrame <- frameResult{frame: frame, err: err}
+	}()
+	writeInboundFrame(t, peer, flow.ID(), []byte("controlled timeout"))
+	waitForCarrierLoop(t, "write deadline", deadlineSet)
+	result := waitForResult(t, resetFrame, "flow reset frame")
+	if result.err != nil {
+		t.Fatal(result.err)
 	}
-	if got := flow.CarrierCount(); got > maxCarriers {
-		t.Fatalf("carrier count after churn = %d, want at most %d", got, maxCarriers)
+	if result.frame.Type != FrameRST {
+		t.Fatalf("reset frame type = %d, want RST", result.frame.Type)
 	}
-	select {
-	case <-flow.Done():
-		t.Fatal("flow closed while the anchor carrier remained active")
-	default:
-	}
-	if err := flow.Close(); err != nil {
-		t.Fatal(err)
-	}
-	for _, carrier := range carriers {
-		waitForCarrierLoop(t, "churn read", carrier.readDone)
-		waitForCarrierLoop(t, "churn process", carrier.processDone)
-	}
-	waitForEmptyInbound(t, flow)
-}
-
-func TestFlowEndpointWriteDeadlineResetsStalledDelivery(t *testing.T) {
-	flow, carrier, peer, _ := newBlockedEndpointFlow(t, 25*time.Millisecond)
-	defer peer.Close()
 	waitForCarrierLoop(t, "flow", flow.Done())
 	var netErr net.Error
-	if err := flow.Err(); !errors.As(err, &netErr) || !netErr.Timeout() {
-		t.Fatalf("flow error = %v, want timeout", err)
+	if flowErr := flow.Err(); !errors.As(flowErr, &netErr) || !netErr.Timeout() {
+		t.Fatalf("flow error = %v, want timeout", flowErr)
 	}
 	waitForCarrierLoop(t, "read", carrier.readDone)
 	waitForCarrierLoop(t, "process", carrier.processDone)
@@ -125,7 +184,6 @@ func TestFlowQueuesInboundBeforeStart(t *testing.T) {
 		ChunkSize:          1024,
 		CarrierQueueBytes:  1024,
 		ReorderWindowBytes: MaxPayloadSize,
-		WriteTimeout:       time.Second,
 	})
 	if _, err := flow.Attach(carrierConn, MaxPayloadSize); err != nil {
 		t.Fatal(err)
@@ -169,7 +227,6 @@ func TestFlowDeliversLastFrameBeforePeerClose(t *testing.T) {
 		ChunkSize:          1024,
 		CarrierQueueBytes:  1024,
 		ReorderWindowBytes: MaxPayloadSize,
-		WriteTimeout:       time.Second,
 	})
 	carrier, err := flow.Attach(carrierConn, MaxPayloadSize)
 	if err != nil {
@@ -225,7 +282,6 @@ func TestFlowDeliversGracefulEOFTailWhenInboundQueueIsFull(t *testing.T) {
 		ChunkSize:          1024,
 		CarrierQueueBytes:  1024,
 		ReorderWindowBytes: MaxPayloadSize,
-		WriteTimeout:       time.Second,
 	})
 	type carrierPeer struct {
 		carrier *Carrier
@@ -249,24 +305,42 @@ func TestFlowDeliversGracefulEOFTailWhenInboundQueueIsFull(t *testing.T) {
 		}
 	})
 
-	parts := [][]byte{[]byte("first-"), []byte("second-"), []byte("tail")}
-	offset := uint64(0)
-	for index, part := range parts {
-		writeInboundFrameAt(t, pairs[index].peer, flow.ID(), offset, part)
-		offset += uint64(len(part))
-		if err := pairs[index].peer.Close(); err != nil {
-			t.Fatal(err)
+	first := []byte("first-")
+	second := []byte("second-")
+	tail := []byte("tail")
+	writeInboundFrameAt(t, pairs[0].peer, flow.ID(), 0, first)
+	if err := pairs[0].peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForCarrierLoop(t, "endpoint write", started)
+
+	// The first frame is blocked in endpoint.Write. Queue the second frame
+	// synchronously so the tail has a precisely established full queue.
+	flow.mu.Lock()
+	flow.pendingInbound++
+	flow.mu.Unlock()
+	flow.inbound <- inboundFrame{source: pairs[1].carrier, frame: Frame{
+		Type:      FrameData,
+		Direction: DirectionClientToServer,
+		StreamID:  flow.ID(),
+		Offset:    uint64(len(first)),
+		Payload:   second,
+	}}
+	if err := pairs[1].peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	tailOffset := uint64(len(first) + len(second))
+	peerClosed := make(chan error, 1)
+	go func() {
+		err := WriteFrame(pairs[2].peer, Frame{Type: FrameData, Direction: DirectionClientToServer, StreamID: flow.ID(), Offset: tailOffset, Payload: tail})
+		if err == nil {
+			err = pairs[2].peer.Close()
 		}
-		if index == 0 {
-			select {
-			case <-started:
-			case <-time.After(time.Second):
-				t.Fatal("endpoint write did not start")
-			}
-		}
-		if index == 1 {
-			waitForInboundQueueLength(t, flow, 1)
-		}
+		peerClosed <- err
+	}()
+	if err := waitForResult(t, peerClosed, "tail peer close"); err != nil {
+		t.Fatal(err)
 	}
 	waitForCarrierLoop(t, "tail carrier", pairs[2].carrier.Done())
 	select {
@@ -275,7 +349,7 @@ func TestFlowDeliversGracefulEOFTailWhenInboundQueueIsFull(t *testing.T) {
 	default:
 	}
 
-	want := []byte("first-second-tail")
+	want := append(append(append([]byte(nil), first...), second...), tail...)
 	got := make([]byte, len(want))
 	if _, err := io.ReadFull(application, got); err != nil {
 		t.Fatal(err)
@@ -295,7 +369,8 @@ func newBlockedEndpointFlow(t *testing.T, writeTimeout time.Duration) (*Flow, *C
 	endpoint, application := net.Pipe()
 	carrierConn, peer := net.Pipe()
 	started := make(chan struct{})
-	flow := NewFlow(StreamID{1}, &endpointWriteStartedConn{Conn: endpoint, started: started}, DirectionServerToClient, FlowConfig{
+	returned := make(chan struct{})
+	flow := NewFlow(StreamID{1}, &endpointWriteStartedConn{Conn: endpoint, started: started, returned: returned}, DirectionServerToClient, FlowConfig{
 		ChunkSize:          1024,
 		CarrierQueueBytes:  1024,
 		ReorderWindowBytes: MaxPayloadSize,
@@ -317,7 +392,7 @@ func newBlockedEndpointFlow(t *testing.T, writeTimeout time.Duration) (*Flow, *C
 	case <-time.After(time.Second):
 		t.Fatal("endpoint write did not start")
 	}
-	return flow, carrier, peer, started
+	return flow, carrier, peer, returned
 }
 
 func writeInboundFrame(t *testing.T, peer net.Conn, streamID StreamID, payload []byte) {
@@ -340,32 +415,15 @@ func writeInboundFrameAt(t *testing.T, peer net.Conn, streamID StreamID, offset 
 	}
 }
 
-func waitForInboundQueueLength(t *testing.T, flow *Flow, want int) {
+func waitForResult[T any](t *testing.T, result <-chan T, event string) T {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for len(flow.inbound) != want && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if got := len(flow.inbound); got != want {
-		t.Fatalf("inbound queue length = %d, want %d", got, want)
-	}
-}
-
-func waitForEmptyInbound(t *testing.T, flow *Flow) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for {
-		flow.mu.Lock()
-		pendingInbound := flow.pendingInbound
-		flow.mu.Unlock()
-		queued := len(flow.inbound)
-		if pendingInbound == 0 && queued == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("inbound state after close = pending %d, queued %d", pendingInbound, queued)
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case value := <-result:
+		return value
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", event)
+		var zero T
+		return zero
 	}
 }
 

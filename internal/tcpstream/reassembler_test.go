@@ -20,17 +20,8 @@ func (writer *partialErrorWriter) Write(payload []byte) (int, error) {
 }
 
 func TestReassemblerOrdersAndDeduplicates(t *testing.T) {
-	reassembler := NewReassembler(1024)
-	if err := reassembler.Push(5, []byte(" world")); err != nil {
-		t.Fatal(err)
-	}
-	if err := reassembler.Push(0, []byte("hello")); err != nil {
-		t.Fatal(err)
-	}
-	if err := reassembler.Push(3, []byte("lo world")); err != nil {
-		t.Fatal(err)
-	}
-	if err := reassembler.SetFIN(11); err != nil {
+	reassembler := NewReassembler(64)
+	if err := reassembler.Push(3, []byte("def")); err != nil {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
@@ -38,11 +29,62 @@ func TestReassemblerOrdersAndDeduplicates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !finished || output.String() != "hello world" || reassembler.BufferedBytes() != 0 {
+	if finished || output.Len() != 0 || reassembler.NextOffset() != 0 || reassembler.BufferedBytes() != 3 {
+		t.Fatalf("gap state = finished %v/output %q/offset %d/buffered %d", finished, output.String(), reassembler.NextOffset(), reassembler.BufferedBytes())
+	}
+
+	if err := reassembler.Push(3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	if buffered := reassembler.BufferedBytes(); buffered != 3 {
+		t.Fatalf("buffered bytes after duplicate = %d, want 3", buffered)
+	}
+	if err := reassembler.Push(0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	finished, err = reassembler.DrainTo(&output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished || output.String() != "abcdef" || reassembler.BufferedBytes() != 0 {
 		t.Fatalf("finished=%v output=%q buffered=%d", finished, output.String(), reassembler.BufferedBytes())
 	}
-	if reassembler.NextOffset() != 11 {
-		t.Fatalf("next offset = %d, want 11", reassembler.NextOffset())
+	if reassembler.NextOffset() != 6 {
+		t.Fatalf("next offset = %d, want 6", reassembler.NextOffset())
+	}
+	if err := reassembler.Push(0, []byte("abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	if buffered := reassembler.BufferedBytes(); buffered != 0 {
+		t.Fatalf("delivered duplicate buffered %d bytes, want 0", buffered)
+	}
+}
+
+func TestReassemblerFINWaitsForGapThenCompletes(t *testing.T) {
+	reassembler := NewReassembler(64)
+	if err := reassembler.Push(3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	if err := reassembler.SetFIN(6); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	finished, err := reassembler.DrainTo(&output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished || output.Len() != 0 || reassembler.NextOffset() != 0 {
+		t.Fatalf("FIN before gap = finished %v/output %q/offset %d", finished, output.String(), reassembler.NextOffset())
+	}
+	if err := reassembler.Push(0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	finished, err = reassembler.DrainTo(&output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !finished || output.String() != "abcdef" || reassembler.NextOffset() != 6 {
+		t.Fatalf("FIN after gap = finished %v/output %q/offset %d", finished, output.String(), reassembler.NextOffset())
 	}
 }
 

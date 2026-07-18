@@ -265,14 +265,20 @@ user-namespaced Docker and for production use.
 ```sh
 make test
 make test-production
-make test-fuzz FUZZ_TIME=30s
+make test-fuzz FUZZ_ITERATIONS=1000
+make test-stress STRESS_RUNS=10
+make test-soak SOAK_DURATION=10m
 make
 ```
 
-`make test-production` runs the Go test, vet, race, stress, fuzz, and critical
-package coverage gates. `make` builds the embedded Angular UI and all supported
-release targets under `dist/{os}/{arch}/`. Frontend tests are run separately
-from `webmanager/` with `npm test`.
+`make test-production` is the repeatable correctness gate and runs the Go test
+suite, vet, and race detector. Fuzzing uses a fixed iteration budget; shuffled
+stress and time-based soak tests are explicit diagnostic tools, not release
+gates. Soak tests can expose leaks or timer behavior but do not establish
+protocol correctness. The regular Go suite still replays committed fuzz corpus
+entries as regression cases. `make` builds the embedded Angular UI and all
+supported release targets under `dist/{os}/{arch}/`. Frontend tests are run
+separately from `webmanager/` with `npm test`.
 
 ## Project Status and License
 

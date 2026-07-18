@@ -238,13 +238,18 @@ docker compose up -d client
 ```sh
 make test
 make test-production
-make test-fuzz FUZZ_TIME=30s
+make test-fuzz FUZZ_ITERATIONS=1000
+make test-stress STRESS_RUNS=10
+make test-soak SOAK_DURATION=10m
 make
 ```
 
-`make test-production` 执行 Go test、vet、race、压力、fuzz 和关键包覆盖率门禁。
-`make` 构建内嵌 Angular UI，并把全部 release 目标输出到 `dist/{os}/{arch}/`。
-前端测试需要在 `webmanager/` 中单独运行 `npm test`。
+`make test-production` 是可重复的正确性门禁，只执行 Go 测试套件、vet 和 race。
+fuzz 使用固定迭代预算；随机 shuffle 压力测试与按时间运行的 soak 是显式诊断工具，
+不属于发布门禁。soak 可用于发现泄漏或定时器问题，但不能证明协议逻辑正确。常规 Go
+测试仍会把已提交的 fuzz corpus 作为回归用例执行。`make` 构建内嵌 Angular UI，并把
+全部 release 目标输出到 `dist/{os}/{arch}/`。前端测试需要在 `webmanager/` 中单独运行
+`npm test`。
 
 ## 项目状态与许可证
 

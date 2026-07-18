@@ -73,22 +73,31 @@ func TestNilTrafficSnapshot(t *testing.T) {
 	}
 }
 
-func TestCountersConcurrentRecordingAndSnapshot(t *testing.T) {
+func TestCountersConcurrentRecordingHasExactBarrierSnapshots(t *testing.T) {
 	const (
 		writers    = 32
 		iterations = 1000
 	)
 	var counters Counters
 	start := make(chan struct{})
-	stopReader := make(chan struct{})
-	readerDone := make(chan struct{})
+	continueRecording := make(chan struct{})
+	var firstPhaseWG sync.WaitGroup
 	var writerWG sync.WaitGroup
+	firstPhaseWG.Add(writers)
 	writerWG.Add(writers)
 	for range writers {
 		go func() {
 			defer writerWG.Done()
 			<-start
-			for range iterations {
+			for range iterations / 2 {
+				counters.RecordRX(1)
+				counters.RecordTX(2)
+				counters.RecordDrop(3)
+				counters.RecordSkip(4)
+			}
+			firstPhaseWG.Done()
+			<-continueRecording
+			for range iterations / 2 {
 				counters.RecordRX(1)
 				counters.RecordTX(2)
 				counters.RecordDrop(3)
@@ -96,22 +105,26 @@ func TestCountersConcurrentRecordingAndSnapshot(t *testing.T) {
 			}
 		}()
 	}
-	go func() {
-		defer close(readerDone)
-		<-start
-		for {
-			select {
-			case <-stopReader:
-				return
-			default:
-				_ = counters.Snapshot()
-			}
-		}
-	}()
 	close(start)
+	firstPhaseWG.Wait()
+
+	firstPhaseTotal := uint64(writers * (iterations / 2))
+	wantFirstPhase := control.TrafficCounters{
+		RXPackets:      firstPhaseTotal,
+		RXBytes:        firstPhaseTotal,
+		TXPackets:      firstPhaseTotal,
+		TXBytes:        firstPhaseTotal * 2,
+		DropPackets:    firstPhaseTotal,
+		DropBytes:      firstPhaseTotal * 3,
+		SkippedPackets: firstPhaseTotal,
+		SkippedBytes:   firstPhaseTotal * 4,
+	}
+	if got := counters.Snapshot(); got != wantFirstPhase {
+		t.Fatalf("first-phase counter snapshot = %#v, want %#v", got, wantFirstPhase)
+	}
+
+	close(continueRecording)
 	writerWG.Wait()
-	close(stopReader)
-	<-readerDone
 
 	total := uint64(writers * iterations)
 	want := control.TrafficCounters{

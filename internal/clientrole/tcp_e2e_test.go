@@ -26,14 +26,17 @@ func TestTCPSOCKS5EndToEndWithRedundantCarriers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer echoListener.Close()
-	destinationAccepted := make(chan struct{}, 2)
+	destinationAccepted := make(chan struct{})
+	var destinationAccepts atomic.Int32
 	go func() {
 		for {
 			conn, acceptErr := echoListener.Accept()
 			if acceptErr != nil {
 				return
 			}
-			destinationAccepted <- struct{}{}
+			if destinationAccepts.Add(1) == 1 {
+				close(destinationAccepted)
+			}
 			go func() {
 				defer conn.Close()
 				_, _ = io.Copy(conn, conn)
@@ -100,7 +103,7 @@ func TestTCPSOCKS5EndToEndWithRedundantCarriers(t *testing.T) {
 	select {
 	case <-destinationAccepted:
 		t.Fatal("destination was dialed before a logical stream was opened")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 
 	application := dialSOCKS5Eventually(t, clientAddress, echoListener.Addr().String())
@@ -122,17 +125,15 @@ func TestTCPSOCKS5EndToEndWithRedundantCarriers(t *testing.T) {
 		serverStatusValue, _ := server.Status()
 		clientStatus := clientStatusValue.(control.ClientStatus)
 		serverStatus := serverStatusValue.(control.ServerStatus)
-		return clientStatus.Carriers, clientStatus.Sessions, serverStatus.Sessions
-	}, 2, 2, 2)
+		return clientStatus.Carriers, serverStatus.Sessions, serverStatus.Streams
+	}, 2, 2, 1)
 	select {
 	case <-destinationAccepted:
 	case <-time.After(time.Second):
 		t.Fatal("destination was not dialed")
 	}
-	select {
-	case <-destinationAccepted:
-		t.Fatal("destination was dialed more than once for one logical stream")
-	case <-time.After(50 * time.Millisecond):
+	if got := destinationAccepts.Load(); got != 1 {
+		t.Fatalf("destination connections = %d, want 1 after both carriers attached", got)
 	}
 }
 
@@ -237,6 +238,7 @@ func TestTCPPathSessionsContinueConnectingAfterFlowAssignment(t *testing.T) {
 }
 
 func TestTCPAssignedGroupReconnectsCarrier(t *testing.T) {
+	retryTimers := installTCPManualFlowRetryTimer(t)
 	echoListener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -302,28 +304,41 @@ func TestTCPAssignedGroupReconnectsCarrier(t *testing.T) {
 		streamID = id
 	}
 	carrier := runtime.carriers[streamID]["path-b"]
+	pathSession := runtime.sessions["path-b"]
+	var group *tcpCarrierGroup
+	for current := range runtime.groups {
+		group = current
+	}
 	runtime.mu.Unlock()
-	if carrier == nil {
-		t.Fatal("path-b carrier was not registered")
+	if carrier == nil || pathSession == nil || group == nil {
+		t.Fatal("path-b carrier, physical session, or group was not registered")
+	}
+	path := tcpClientPath{index: 2, address: "127.0.0.1", destination: serverAddress}
+	physicalSession, physicalGeneration, healthy := pathSession.current(path)
+	if !healthy {
+		t.Fatal("path-b physical session was not healthy before carrier failure")
 	}
 	carrier.Close()
 
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		runtime.mu.Lock()
-		replacement := runtime.carriers[streamID]["path-b"]
-		runtime.mu.Unlock()
-		if replacement != nil && replacement != carrier {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	retryTimer := retryTimers.next(t)
+	if retryTimer.delay != tcpSessionRetryInitialDelay {
+		t.Fatalf("carrier retry delay = %v, want %v", retryTimer.delay, tcpSessionRetryInitialDelay)
 	}
+	group.mu.Lock()
+	slot := group.slots["path-b"]
+	retrying := slot.retrying
+	retryCount := slot.retryCount
+	slotSession := slot.session
+	slotGeneration := slot.sessionGeneration
+	group.mu.Unlock()
 	runtime.mu.Lock()
-	replacement := runtime.carriers[streamID]["path-b"]
+	removed := runtime.carriers[streamID]["path-b"] == nil
 	runtime.mu.Unlock()
-	if replacement == nil || replacement == carrier {
-		t.Fatal("path-b carrier was not replaced by its group")
+	if !removed || !retrying || retryCount != 1 || slotSession != physicalSession || slotGeneration != physicalGeneration {
+		t.Fatalf("pre-retry state = removed %v/retrying %v/count %d/session-current %v/generation %d, want true/true/1/true/%d", removed, retrying, retryCount, slotSession == physicalSession, slotGeneration, physicalGeneration)
 	}
+	retryTimers.assertNoPending(t)
+	retryTimer.fire(t)
 	waitForTCPStatus(t, func() (int, int, int) {
 		statusValue, statusErr := client.Status()
 		if statusErr != nil {
@@ -332,6 +347,17 @@ func TestTCPAssignedGroupReconnectsCarrier(t *testing.T) {
 		status := statusValue.(control.ClientStatus)
 		return status.Streams, status.Carriers, status.Sessions
 	}, 1, 2, 2)
+	runtime.mu.Lock()
+	replacement := runtime.carriers[streamID]["path-b"]
+	runtime.mu.Unlock()
+	if replacement == nil || replacement == carrier {
+		t.Fatal("path-b carrier was not replaced by its group")
+	}
+	currentSession, currentGeneration, healthy := pathSession.current(path)
+	if !healthy || currentSession != physicalSession || currentGeneration != physicalGeneration {
+		t.Fatalf("carrier retry replaced physical session = healthy %v/same %v/generation %d, want true/true/%d", healthy, currentSession == physicalSession, currentGeneration, physicalGeneration)
+	}
+	retryTimers.assertNoPending(t)
 
 	want := []byte("group reconnect")
 	if _, err := application.Write(want); err != nil {

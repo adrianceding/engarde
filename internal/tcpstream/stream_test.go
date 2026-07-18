@@ -1,6 +1,7 @@
 package tcpstream
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -50,6 +51,161 @@ func TestFlowsDeduplicateAcrossTwoCarriers(t *testing.T) {
 	}
 }
 
+type recordingWriteBarrierConn struct {
+	net.Conn
+	started chan struct{}
+	release <-chan struct{}
+	writes  chan []byte
+	once    sync.Once
+}
+
+func (conn *recordingWriteBarrierConn) Write(payload []byte) (int, error) {
+	conn.once.Do(func() { close(conn.started) })
+	<-conn.release
+	copied := append([]byte(nil), payload...)
+	conn.writes <- copied
+	return len(payload), nil
+}
+
+func TestFlowsReplayUnacknowledgedFrameAfterCarrierLossWithoutDuplicateDelivery(t *testing.T) {
+	clientEndpoint, clientApplication := net.Pipe()
+	serverEndpoint, serverApplication := net.Pipe()
+	deliveryStarted := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	deliveries := make(chan []byte, 3)
+	streamID := StreamID{1}
+	config := FlowConfig{ChunkSize: 32, CarrierQueueBytes: 1024, ReorderWindowBytes: 1024, WriteTimeout: time.Second}
+	clientFlow := NewFlow(streamID, clientEndpoint, DirectionClientToServer, config)
+	serverFlow := NewFlow(streamID, &recordingWriteBarrierConn{
+		Conn:    serverEndpoint,
+		started: deliveryStarted,
+		release: releaseDelivery,
+		writes:  deliveries,
+	}, DirectionServerToClient, config)
+
+	fastClientConn, fastServerConn := net.Pipe()
+	fastClient, err := clientFlow.Attach(fastClientConn, MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastServer, err := serverFlow.Attach(fastServerConn, MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	slowWriteStarted := make(chan struct{})
+	releaseSlowWrite := make(chan struct{})
+	slowClientConn, slowServerConn := net.Pipe()
+	slowClient, err := clientFlow.Attach(&writeBarrierConn{Conn: slowClientConn, started: slowWriteStarted, release: releaseSlowWrite}, MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed := make(chan Frame, 1)
+	if _, err := serverFlow.AttachObserved(slowServerConn, MaxPayloadSize, CarrierObserver{Read: func(frame Frame) {
+		if frame.Type == FrameData {
+			replayed <- frame
+		}
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	serverFlow.Start()
+
+	var releaseDeliveryOnce sync.Once
+	allowDelivery := func() { releaseDeliveryOnce.Do(func() { close(releaseDelivery) }) }
+	var releaseSlowOnce sync.Once
+	allowSlowWrite := func() { releaseSlowOnce.Do(func() { close(releaseSlowWrite) }) }
+	t.Cleanup(func() {
+		allowSlowWrite()
+		allowDelivery()
+		_ = clientFlow.Close()
+		_ = serverFlow.Close()
+		_ = clientApplication.Close()
+		_ = serverApplication.Close()
+	})
+
+	firstPayload := []byte("first-unacknowledged-frame")
+	firstFrame := Frame{Type: FrameData, Direction: DirectionClientToServer, StreamID: streamID, Payload: firstPayload}
+	firstBroadcast := make(chan error, 1)
+	go func() { firstBroadcast <- clientFlow.broadcast(firstFrame) }()
+	waitForSignal(t, deliveryStarted, "first endpoint delivery")
+	waitForSignal(t, slowWriteStarted, "surviving carrier replay attempt")
+	waitForFlowState(t, clientFlow, "unacknowledged history on the lost carrier", func() bool {
+		fastState := clientFlow.carrierStates[fastClient]
+		slowState := clientFlow.carrierStates[slowClient]
+		return len(clientFlow.history) == 1 && clientFlow.globalAckOffset == 0 &&
+			fastState != nil && fastState.hasWritten && slowState != nil && slowState.hasInFlight && !slowState.hasWritten
+	})
+	if err := waitForResult(t, firstBroadcast, "first broadcast"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fastClient.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForCarrierLoop(t, "lost client carrier detach", fastClient.Detached())
+	waitForCarrierLoop(t, "lost server carrier detach", fastServer.Detached())
+	clientFlow.mu.Lock()
+	pendingHistory := len(clientFlow.history)
+	ackOffset := clientFlow.globalAckOffset
+	remainingCarriers := len(clientFlow.carriers)
+	clientFlow.mu.Unlock()
+	if pendingHistory != 1 || ackOffset != 0 || remainingCarriers != 1 {
+		t.Fatalf("state after carrier loss = history %d/ack %d/carriers %d, want 1/0/1", pendingHistory, ackOffset, remainingCarriers)
+	}
+
+	allowSlowWrite()
+	replayedFrame := receiveFrame(t, replayed, "replayed frame on surviving carrier")
+	if replayedFrame.Offset != 0 || string(replayedFrame.Payload) != string(firstPayload) {
+		t.Fatalf("replayed frame = offset %d payload %q, want 0/%q", replayedFrame.Offset, replayedFrame.Payload, firstPayload)
+	}
+	waitForFlowState(t, clientFlow, "surviving carrier write commit", func() bool {
+		state := clientFlow.carrierStates[slowClient]
+		return state != nil && state.hasWritten && state.writtenOffset == uint64(len(firstPayload))
+	})
+
+	allowDelivery()
+	if delivered := receiveBytes(t, deliveries, "first logical delivery"); string(delivered) != string(firstPayload) {
+		t.Fatalf("first delivery = %q, want %q", delivered, firstPayload)
+	}
+	waitForFlowState(t, clientFlow, "acknowledged replay", func() bool {
+		return clientFlow.globalAckOffset == uint64(len(firstPayload)) && len(clientFlow.history) == 0
+	})
+
+	secondPayload := []byte("second-frame")
+	secondFrame := Frame{
+		Type:      FrameData,
+		Direction: DirectionClientToServer,
+		StreamID:  streamID,
+		Offset:    uint64(len(firstPayload)),
+		Payload:   secondPayload,
+	}
+	if err := clientFlow.broadcast(secondFrame); err != nil {
+		t.Fatal(err)
+	}
+	if delivered := receiveBytes(t, deliveries, "delivery after replayed duplicate"); string(delivered) != string(secondPayload) {
+		t.Fatalf("second delivery = %q, want %q; replayed duplicate was delivered", delivered, secondPayload)
+	}
+	waitForFlowState(t, clientFlow, "second frame acknowledgement", func() bool {
+		return clientFlow.globalAckOffset == uint64(len(firstPayload)+len(secondPayload)) && len(clientFlow.history) == 0
+	})
+	select {
+	case delivered := <-deliveries:
+		t.Fatalf("unexpected duplicate endpoint delivery %q", delivered)
+	default:
+	}
+}
+
+func receiveBytes(t *testing.T, payloads <-chan []byte, event string) []byte {
+	t.Helper()
+	select {
+	case payload := <-payloads:
+		return payload
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", event)
+		return nil
+	}
+}
+
 func TestFlowResetsWhenAllCarriersClose(t *testing.T) {
 	application, endpoint := net.Pipe()
 	carrierEndpoint, peer := net.Pipe()
@@ -83,7 +239,8 @@ func TestFlowContinuesAfterFirstCarrierCloses(t *testing.T) {
 	serverFlow := NewFlow(streamID, serverEndpoint, DirectionServerToClient, config)
 	firstClientCarrier, firstServerCarrier := net.Pipe()
 	secondClientCarrier, secondServerCarrier := net.Pipe()
-	if _, err := clientFlow.Attach(firstClientCarrier, MaxPayloadSize); err != nil {
+	first, err := clientFlow.Attach(firstClientCarrier, MaxPayloadSize)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := serverFlow.Attach(firstServerCarrier, MaxPayloadSize); err != nil {
@@ -104,10 +261,11 @@ func TestFlowContinuesAfterFirstCarrierCloses(t *testing.T) {
 		serverApp.Close()
 	})
 
-	firstClientCarrier.Close()
-	deadline := time.Now().Add(time.Second)
-	for clientFlow.CarrierCount() != 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := clientFlow.CarrierCount(); got != 1 {
+		t.Fatalf("carrier count after close = %d, want 1", got)
 	}
 	go func() { _, _ = clientApp.Write([]byte("survives")) }()
 	got := make([]byte, len("survives"))
@@ -163,13 +321,7 @@ func TestFlowMigratesLatestAcknowledgementBeforePlatformCloseReturns(t *testing.
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- first.Close() }()
 	waitForSignal(t, closeStarted, "platform carrier close")
-	if err := secondPeer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	ack, err := ReadFrame(secondPeer, MaxPayloadSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ack := readFrameFromPeer(t, secondPeer, "migrated acknowledgement")
 	if ack.Type != FrameAck || ack.Offset != 64 || !ackHasFIN(ack) {
 		t.Fatalf("migrated acknowledgement = %#v, want final offset 64", ack)
 	}
@@ -198,13 +350,7 @@ func TestFlowSeedsLatestAcknowledgementOnNewCarrier(t *testing.T) {
 		_ = peer.Close()
 	})
 
-	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	ack, err := ReadFrame(peer, MaxPayloadSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ack := readFrameFromPeer(t, peer, "seeded acknowledgement")
 	if ack.Type != FrameAck || ack.Offset != 96 {
 		t.Fatalf("seeded acknowledgement = %#v, want offset 96", ack)
 	}
@@ -259,20 +405,13 @@ func TestFlowDefersAcknowledgementUntilWriteProgressCommits(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("broadcast did not finish")
 	}
-	deadline := time.Now().Add(time.Second)
-	for {
-		flow.mu.Lock()
-		ackOffset = flow.globalAckOffset
-		deferred = flow.hasDeferredAck
-		historyLength := len(flow.history)
-		flow.mu.Unlock()
-		if ackOffset == uint64(len(payload)) && !deferred && historyLength == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("committed acknowledgement state = deferred %v, offset %d, history %d", deferred, ackOffset, historyLength)
-		}
-		time.Sleep(time.Millisecond)
+	flow.mu.Lock()
+	ackOffset = flow.globalAckOffset
+	deferred = flow.hasDeferredAck
+	historyLength := len(flow.history)
+	flow.mu.Unlock()
+	if ackOffset != uint64(len(payload)) || deferred || historyLength != 0 {
+		t.Fatalf("committed acknowledgement state = deferred %v, offset %d, history %d", deferred, ackOffset, historyLength)
 	}
 }
 
@@ -286,13 +425,18 @@ func TestFlowDoesNotWaitForSlowCarrierAndReplaysBacklog(t *testing.T) {
 	flow := NewFlow(streamID, endpoint, DirectionClientToServer, config)
 	fastCarrier, fastPeer := net.Pipe()
 	slowCarrier, slowPeer := net.Pipe()
+	slowWriteStarted := make(chan struct{})
+	releaseSlowWrite := make(chan struct{})
+	var releaseSlowOnce sync.Once
+	releaseSlow := func() { releaseSlowOnce.Do(func() { close(releaseSlowWrite) }) }
 	if _, err := flow.Attach(fastCarrier, MaxPayloadSize); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := flow.Attach(slowCarrier, MaxPayloadSize); err != nil {
+	if _, err := flow.Attach(&writeBarrierConn{Conn: slowCarrier, started: slowWriteStarted, release: releaseSlowWrite}, MaxPayloadSize); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
+		releaseSlow()
 		flow.Close()
 		application.Close()
 		fastPeer.Close()
@@ -310,31 +454,28 @@ func TestFlowDoesNotWaitForSlowCarrierAndReplaysBacklog(t *testing.T) {
 		done <- flow.broadcast(Frame{Type: FrameData, Direction: DirectionClientToServer, StreamID: streamID, Offset: 5, Payload: []byte("second")})
 	}()
 
+	waitForSignal(t, slowWriteStarted, "slow carrier write")
+	var fastFirst, fastSecond Frame
+	fastFirst = receiveFrame(t, fastFrames, "first fast frame")
+	fastSecond = receiveFrame(t, fastFrames, "second fast frame")
+	if string(fastFirst.Payload) != "first" || string(fastSecond.Payload) != "second" {
+		t.Fatalf("fast payloads = %q/%q", fastFirst.Payload, fastSecond.Payload)
+	}
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(50 * time.Millisecond):
-		t.Fatal("broadcast waited for slow carrier")
+	case <-time.After(time.Second):
+		t.Fatal("broadcast did not complete after the fast carrier wrote both frames")
 	}
 	slowFrames := make(chan Frame, 2)
 	go readFrames(slowPeer, slowFrames, 2)
-	for _, frames := range []chan Frame{fastFrames, slowFrames} {
-		var first, second Frame
-		select {
-		case first = <-frames:
-		case <-time.After(time.Second):
-			t.Fatal("first frame was not delivered")
-		}
-		select {
-		case second = <-frames:
-		case <-time.After(time.Second):
-			t.Fatal("second frame was not delivered")
-		}
-		if string(first.Payload) != "first" || string(second.Payload) != "second" {
-			t.Fatalf("payloads = %q/%q", first.Payload, second.Payload)
-		}
+	releaseSlow()
+	slowFirst := receiveFrame(t, slowFrames, "first replayed slow frame")
+	slowSecond := receiveFrame(t, slowFrames, "second replayed slow frame")
+	if string(slowFirst.Payload) != "first" || string(slowSecond.Payload) != "second" {
+		t.Fatalf("slow payloads = %q/%q", slowFirst.Payload, slowSecond.Payload)
 	}
 	if flow.CarrierCount() != 2 {
 		t.Fatalf("carrier count = %d, want 2", flow.CarrierCount())
@@ -370,19 +511,7 @@ func TestFlowBroadcastCompletesAfterAcknowledgedCarrierDetaches(t *testing.T) {
 		broadcastDone <- flow.broadcast(frame)
 	}()
 
-	deadline := time.Now().Add(time.Second)
-	for {
-		flow.mu.Lock()
-		remembered := len(flow.history) == 1
-		flow.mu.Unlock()
-		if remembered {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("FIN was not remembered")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitForFlowState(t, flow, "FIN history entry", func() bool { return len(flow.history) == 1 })
 
 	flow.mu.Lock()
 	sequence := flow.history[0].sequence
@@ -409,6 +538,69 @@ func TestFlowBroadcastCompletesAfterAcknowledgedCarrierDetaches(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("broadcast waited after its FIN was globally acknowledged")
+	}
+}
+
+func TestFlowIgnoresAcknowledgementFromDetachedCarrier(t *testing.T) {
+	application, endpoint := net.Pipe()
+	flow := NewFlow(StreamID{1}, endpoint, DirectionClientToServer, FlowConfig{ReorderWindowBytes: 1024})
+	detached := new(Carrier)
+	active := new(Carrier)
+	frame := Frame{Type: FrameData, Direction: DirectionClientToServer, StreamID: flow.ID(), Payload: []byte("data")}
+	flow.mu.Lock()
+	flow.carriers = []*Carrier{detached, active}
+	flow.carrierStates[detached] = &carrierState{writtenOffset: 4, hasWritten: true}
+	flow.carrierStates[active] = &carrierState{}
+	flow.history = []replayFrame{{sequence: 0, frame: frame}}
+	flow.historyBytes = len(frame.Payload)
+	flow.writtenOffset = 4
+	flow.mu.Unlock()
+	t.Cleanup(func() {
+		flow.mu.Lock()
+		flow.carriers = nil
+		flow.carrierStates = make(map[*Carrier]*carrierState)
+		flow.mu.Unlock()
+		_ = flow.Close()
+		_ = application.Close()
+	})
+
+	flow.detach(detached, false)
+	flow.acknowledge(detached, 4, false)
+
+	flow.mu.Lock()
+	defer flow.mu.Unlock()
+	if flow.globalAckOffset != 0 || len(flow.history) != 1 {
+		t.Fatalf("detached ACK changed offset/history to %d/%d", flow.globalAckOffset, len(flow.history))
+	}
+	if len(flow.carriers) != 1 || flow.carriers[0] != active {
+		t.Fatalf("active carriers after detach = %#v, want replacement only", flow.carriers)
+	}
+}
+
+func TestFlowCloseIsIdempotentAndRejectsLateCarrier(t *testing.T) {
+	application, endpoint := net.Pipe()
+	flow := NewFlow(StreamID{1}, endpoint, DirectionClientToServer, FlowConfig{})
+	t.Cleanup(func() { _ = application.Close() })
+
+	if err := flow.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := flow.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-flow.Done():
+	default:
+		t.Fatal("Close returned before the flow reached its terminal state")
+	}
+	if err := flow.Err(); err != nil {
+		t.Fatalf("graceful Close error = %v, want nil", err)
+	}
+
+	carrierConn, peer := net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	if _, err := flow.Attach(carrierConn, MaxPayloadSize); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("late Attach error = %v, want net.ErrClosed", err)
 	}
 }
 
@@ -604,6 +796,40 @@ func waitForSignal(t *testing.T, signal <-chan struct{}, event string) {
 	}
 }
 
+func waitForFlowState(t *testing.T, flow *Flow, event string, reached func() bool) {
+	t.Helper()
+	result := make(chan bool, 1)
+	go func() {
+		flow.mu.Lock()
+		defer flow.mu.Unlock()
+		for !reached() && !flow.closed {
+			flow.cond.Wait()
+		}
+		result <- reached()
+	}()
+	if !waitForResult(t, result, event) {
+		t.Fatalf("flow closed before %s", event)
+	}
+}
+
+func readFrameFromPeer(t *testing.T, peer net.Conn, event string) Frame {
+	t.Helper()
+	type frameResult struct {
+		frame Frame
+		err   error
+	}
+	result := make(chan frameResult, 1)
+	go func() {
+		frame, err := ReadFrame(peer, MaxPayloadSize)
+		result <- frameResult{frame: frame, err: err}
+	}()
+	read := waitForResult(t, result, event)
+	if read.err != nil {
+		t.Fatal(read.err)
+	}
+	return read.frame
+}
+
 func receiveFrame(t *testing.T, frames <-chan Frame, event string) Frame {
 	t.Helper()
 	select {
@@ -720,13 +946,7 @@ func TestFlowAcknowledgesOnlyContiguousInboundData(t *testing.T) {
 	})
 
 	writeInboundFrameAt(t, secondPeer, flow.ID(), 5, []byte("second"))
-	if err := secondPeer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	ack, err := ReadFrame(secondPeer, MaxPayloadSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ack := readFrameFromPeer(t, secondPeer, "out-of-order data acknowledgement")
 	if ack.Type != FrameAck || ack.Offset != 0 || ackHasFIN(ack) {
 		t.Fatalf("ACK after out-of-order DATA = %#v, want non-FIN offset 0", ack)
 	}
@@ -743,13 +963,7 @@ func TestFlowAcknowledgesOnlyContiguousInboundData(t *testing.T) {
 		readDone <- readResult{payload: got, err: err}
 	}()
 	writeInboundFrameAt(t, firstPeer, flow.ID(), 0, []byte("first"))
-	if err := firstPeer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	ack, err = ReadFrame(firstPeer, MaxPayloadSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ack = readFrameFromPeer(t, firstPeer, "gap-closing acknowledgement")
 	if ack.Type != FrameAck || ack.Offset != uint64(len(want)) || ackHasFIN(ack) {
 		t.Fatalf("ACK after gap closed = %#v, want non-FIN offset %d", ack, len(want))
 	}
@@ -788,13 +1002,7 @@ func TestFlowAcknowledgesOutOfOrderFINAfterGapCloses(t *testing.T) {
 	if err := WriteFrame(finPeer, Frame{Type: FrameFIN, Direction: DirectionClientToServer, StreamID: flow.ID(), Offset: 5}); err != nil {
 		t.Fatal(err)
 	}
-	if err := finPeer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	ack, err := ReadFrame(finPeer, MaxPayloadSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ack := readFrameFromPeer(t, finPeer, "out-of-order FIN acknowledgement")
 	if ack.Type != FrameAck || ack.Offset != 0 || ackHasFIN(ack) {
 		t.Fatalf("ACK after out-of-order FIN = %#v, want non-FIN offset 0", ack)
 	}
@@ -809,13 +1017,7 @@ func TestFlowAcknowledgesOutOfOrderFINAfterGapCloses(t *testing.T) {
 		readDone <- readResult{payload: got, err: err}
 	}()
 	writeInboundFrameAt(t, dataPeer, flow.ID(), 0, []byte("hello"))
-	if err := dataPeer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	ack, err = ReadFrame(dataPeer, MaxPayloadSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ack = readFrameFromPeer(t, dataPeer, "FIN gap-closing acknowledgement")
 	if ack.Type != FrameAck || ack.Offset != 5 || !ackHasFIN(ack) {
 		t.Fatalf("ACK after FIN gap closed = %#v, want FIN offset 5", ack)
 	}

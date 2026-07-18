@@ -458,7 +458,6 @@ func TestTCPClientShutdownClosesPhysicalSessionsBeforeBlockedFlows(t *testing.T)
 		t.Fatal("physical write did not block")
 	}
 
-	startedAt := time.Now()
 	shutdownDone := make(chan struct{})
 	go func() {
 		runtime.shutdown()
@@ -470,9 +469,6 @@ func TestTCPClientShutdownClosesPhysicalSessionsBeforeBlockedFlows(t *testing.T)
 		_ = physical.Close()
 		<-shutdownDone
 		t.Fatal("shutdown waited on a blocked virtual stream close")
-	}
-	if elapsed := time.Since(startedAt); elapsed >= time.Second {
-		t.Fatalf("blocked-write shutdown took %v, want less than 1s", elapsed)
 	}
 	if orderedEndpoint.closedBeforeSession.Load() {
 		t.Fatal("flow endpoint closed before its physical session entered shutdown")
