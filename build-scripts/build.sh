@@ -1,7 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-if [ -n "${GITHUB_REF:-}" ]; then
+if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+    version="${GITHUB_REF_NAME:-${GITHUB_REF:-}}"
+    version="${version#refs/tags/}"
+    version="${version#v}"
+elif [ -n "${GITHUB_REF:-}" ]; then
     commit=$(echo "${GITHUB_SHA:-}" | head -c 7)
     branch=${GITHUB_REF#refs/heads/}
     if [ "$branch" = "master" ]; then
@@ -20,6 +24,15 @@ elif command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; 
     version="$version - UNOFFICIAL BUILD"
 else
     version="UNOFFICIAL BUILD"
+fi
+
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--print-version" ]; }; then
+    echo "usage: $0 [--print-version]" >&2
+    exit 2
+fi
+if [ "${1:-}" = "--print-version" ]; then
+    printf '%s\n' "$version"
+    exit 0
 fi
 
 dst_arch="${GOARCH:-$(go env GOARCH)}"

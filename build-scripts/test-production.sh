@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "==> Build version metadata"
+./build-scripts/test-build-version.sh
+
 echo "==> Go tests"
 go test -timeout=3m -count=1 ./...
 
