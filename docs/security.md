@@ -2,7 +2,7 @@
 
 [简体中文](security.zh-CN.md)
 
-Engarde is a redundant TCP relay, not a secure tunnel. It provides admission
+Engarde is a multi-path TCP relay, not a secure tunnel. It provides admission
 controls at several boundaries, but it does not add encryption to the SOCKS5
 frontend, session connections, the management listener, or the server's
 connection to a destination. Use application-layer encryption and a protected
@@ -61,6 +61,11 @@ configured IP/CIDR list. It is useful as an additional ingress control, but it
 does not identify individual clients behind NAT and it does not replace
 `peerAuth` on an untrusted network. Prefer using both an ingress firewall and
 `peerAuth`.
+
+In active-standby mode, each Flow receives a random 128-bit `resumeToken`; the
+server also verifies the original peer principal and a monotonic carrier
+generation. The token is carried in Session frames and does not encrypt the
+transport. Untrusted paths still require protected transport and `peerAuth`.
 
 ## Dynamic exit and SSRF
 
@@ -121,12 +126,13 @@ used. Do not publish the management listener directly on the Internet.
 
 ## Resource exhaustion
 
-The following admission limits default to zero, which means unlimited:
+In `redundant` mode, the following original admission limits default to zero,
+which means unlimited:
 
 | Setting | Scope | Effect |
 | --- | --- | --- |
 | `transfer.tcp.maxStreams` | client and server | Limits concurrent logical streams. |
-| `transfer.tcp.maxCarriersPerStream` | server | Limits carriers attached to one stream. The client still attempts one carrier on every eligible interface. |
+| `transfer.tcp.maxCarriersPerStream` | server | Limits carriers attached to a redundant stream. The client attempts one carrier on every eligible interface. |
 | `transfer.tcp.maxPendingConnections` | server | Limits concurrent physical connection handshakes. |
 | `transfer.tcp.maxPendingStreams` | server | Limits virtual streams still processing OPEN and destination setup. |
 | `transfer.tcp.maxSessions` | server | Limits established physical multiplexed sessions. |
@@ -142,6 +148,22 @@ upstream rate limits where appropriate.
 carrier or stream, and the dial/open/write timeouts bound stalled work. They do
 not replace admission limits: memory and socket use still multiply with the
 number of streams and carriers.
+
+Active-standby mode does not permit unlimited recovery state and applies these
+finite defaults:
+
+| Setting | Default | Effect |
+| --- | ---: | --- |
+| `transfer.tcp.maxStreams` | `2048` | Total logical Flow limit on both roles. |
+| `transfer.tcp.maxConcurrentResumes` | `64` | Concurrent client recovery/migration operations. |
+| `transfer.tcp.maxPendingResumes` | `128` | Client recovery queue and server RESUME admission limit. |
+| `transfer.tcp.maxRecoveringStreams` | `1024` | Recovering Flows whose endpoints remain retained on each role. |
+| `transfer.tcp.maxRecoveryBytes` | `536870912` | Aggregate recovery history on each role. |
+
+At an aggregate recovery limit, Engarde stops accepting new SOCKS5 Flows and
+deterministically terminates excess recovering Flows, newest first. This bounds
+Engarde replay history but does not replace process memory, file descriptor,
+or upstream connection limits.
 
 ## Credentials and host controls
 
@@ -173,7 +195,8 @@ egress policy described above.
   `allowedClients` as a destination policy.
 - Keep the Web Manager on loopback, configure its Basic authentication, and use
   TLS/VPN/SSH for remote access.
-- Set nonzero stream, carrier, and pending-connection limits and monitor actual
-  resource use.
+- In redundant mode, set nonzero stream, carrier, and pending-connection
+  limits. In active-standby mode, calibrate the finite recovery defaults and
+  monitor actual resource use.
 - Protect configuration files, separate credentials by purpose, and plan for
   rotation and revocation.

@@ -83,6 +83,8 @@ interfaces without an eligible address are still listed with an empty address.
 | `includeInterfaces` | No | `[]` | Whole-interface-name glob allowlist. An empty list allows every otherwise eligible interface. |
 | `excludedInterfaces` | No | `[]` | Whole-interface-name glob denylist. Exclusions take priority over inclusions. |
 | `interfaceLabels` | No | `{}` | Map of exact interface names to labels displayed by the management UI. |
+| `pathSelection` | No | `adaptive` in active-standby | Path selection strategy. The only currently valid value is `adaptive`. |
+| `interfaceHints` | No | `{}` | Optional per-interface cost hints used only by active-standby path scoring. |
 | `dstOverrides` | No | `[]` | Per-interface session destination overrides. Each item contains an exact `ifName` and an IPv4-reachable `dstAddr`. |
 | `transfer` | No | See [Transfer fields](#transfer-fields) | Transport tuning and resource limits. |
 | `webManager` | No | Disabled | Embedded management HTTP listener. See [Web Manager fields](#web-manager-fields). |
@@ -120,6 +122,10 @@ excludedInterfaces:
 interfaceLabels:
   eth0: "Primary ISP"
   eth1: "Backup ISP"
+pathSelection: adaptive
+interfaceHints:
+  wwan0:
+    cost: metered
 dstOverrides:
   - ifName: "eth1"
     dstAddr: "198.51.100.20:59501"
@@ -129,6 +135,12 @@ An interface is usable only when it passes these filters and Engarde can select
 a non-loopback, non-link-local IPv4 address from it. Runtime management actions
 can temporarily invert the configured state of an exact interface; resetting
 the overrides restores the YAML rules.
+
+`interfaceHints.<interface>.cost` must be `normal`, `metered`, or `avoid`. It
+expresses a cost preference that Engarde cannot discover automatically; it is
+not a fixed priority. Engarde still scores measured session RTT, jitter,
+decaying failures, and current load. Most deployments can omit both
+`pathSelection` and `interfaceHints`.
 
 ## Server fields
 
@@ -180,25 +192,36 @@ transfer:
   keepaliveIntervalMillis: 1000
   keepaliveTimeoutMillis: 5000
   tcp:
+    carrierMode: redundant
     chunkSize: 16384
     carrierQueueBytes: 1048576
     reorderWindowBytes: 4194304
     dialTimeoutMillis: 5000
     openTimeoutMillis: 5000
     writeTimeoutMillis: 10000
+    clientRecoveryTimeoutMillis: 0
+    serverOrphanRetentionMillis: 0
+    resumeOpenTimeoutMillis: 0
     maxStreams: 0
     maxCarriersPerStream: 0
     maxPendingConnections: 0
     maxPendingStreams: 0
     maxSessions: 0
+    maxConcurrentResumes: 0
+    maxPendingResumes: 0
+    maxRecoveringStreams: 0
+    maxRecoveryBytes: 0
 ```
 
 For fields with a positive default, omission and an explicit `0` both select
-that default. Negative values are invalid. The five `max*` fields are the
-exception: `0` means unlimited.
+that default. Negative values are invalid. In `redundant` mode, `0` retains the
+unlimited meaning for the original five resource `max*` fields. Active-standby
+fields are inactive in redundant mode; once active-standby is enabled, `0`
+selects their finite defaults below and cannot request an unlimited value.
 
 | Field | Effective default | Valid effective value | Applies to | Meaning |
 | --- | ---: | ---: | --- | --- |
+| `tcp.carrierMode` | `redundant` | `redundant` or `active-standby` | Both | `redundant` duplicates data on healthy paths; `active-standby` uses one active carrier per Flow while keeping warm Sessions. |
 | `keepaliveIntervalMillis` | `1000` | `> 0` | Both | Interval between multiplexed-session keepalive probes. |
 | `keepaliveTimeoutMillis` | `5000` | Greater than the same file's interval | Both | Time without a keepalive response before a multiplexed session is closed. |
 | `tcp.chunkSize` | `16384` | `1..65536` | Both | Maximum application payload placed in one DATA frame. |
@@ -207,14 +230,64 @@ exception: `0` means unlimited.
 | `tcp.dialTimeoutMillis` | `5000` | `> 0` | Both | Client-to-server session dial timeout on the client; target dial timeout on the server. |
 | `tcp.openTimeoutMillis` | `5000` | `> 0` | Both | Bound for SOCKS5 negotiation, session handshake, and virtual stream OPEN setup. |
 | `tcp.writeTimeoutMillis` | `10000` | `> 0` | Both | Deadline for a carrier or endpoint write that makes no progress. |
-| `tcp.maxStreams` | Unlimited | `>= 0` | Both | Maximum concurrent logical TCP streams. |
-| `tcp.maxCarriersPerStream` | Unlimited | `>= 0` | Server | Maximum carriers accepted for one stream. The client still attempts one carrier on every eligible interface. |
+| `tcp.clientRecoveryTimeoutMillis` | active-standby: `3000` | `> 0` | Client | Total budget for retaining the App TCP and attempting RESUME after the active carrier is lost. |
+| `tcp.serverOrphanRetentionMillis` | active-standby: `9000` | See relationships below | Server | Budget for retaining the original target TCP and Flow state with no carrier. |
+| `tcp.resumeOpenTimeoutMillis` | active-standby: `750` | `> 0` and below client recovery | Client | Limit for one RESUME stream open and response. |
+| `tcp.maxStreams` | redundant: unlimited; active-standby: `2048` | `>= 0`; active requires `> 0` | Both | Maximum concurrent logical TCP streams. |
+| `tcp.maxCarriersPerStream` | Unlimited | `>= 0` | Server | Maximum carriers for a redundant Flow. An active-standby Flow always has one. |
 | `tcp.maxPendingConnections` | Unlimited | `>= 0` | Server | Maximum concurrent physical connection handshakes that have not yet become multiplexed sessions. |
 | `tcp.maxPendingStreams` | Unlimited | `>= 0` | Server | Maximum concurrent virtual streams still processing OPEN and destination setup. |
 | `tcp.maxSessions` | Unlimited | `>= 0` | Server | Maximum established physical multiplexed sessions. |
+| `tcp.maxConcurrentResumes` | active-standby: `64` | active requires `> 0` | Client | Concurrent recoverable OPEN, RESUME, or proactive migration operations. |
+| `tcp.maxPendingResumes` | active-standby: `128` | active requires `> 0` | Both | Client recovery/migration queue and server concurrent RESUME admission limit. |
+| `tcp.maxRecoveringStreams` | active-standby: `1024` | active requires `1..maxStreams` | Both | Maximum recovering Flows whose endpoints remain retained. |
+| `tcp.maxRecoveryBytes` | active-standby: `536870912` | active requires at least `reorderWindowBytes` | Both | Aggregate unacknowledged replay history across recovering Flows. |
 
 Settings marked as server-only are still parsed and validated if placed in a
 client file, but they do not impose a client-side limit.
+
+### Active-standby mode
+
+Configure both the client and server with:
+
+```yaml
+transfer:
+  tcp:
+    carrierMode: active-standby
+```
+
+A peer without the capability, or a mode mismatch, fails the Session
+explicitly; Engarde never silently falls back to duplicated data. Every
+eligible interface still keeps one authenticated, probed physical Session,
+while each healthy logical Flow has exactly one active carrier. Session probes
+provide RTT and jitter samples; scoring also includes decaying failure
+penalties, active Flow count, and smux stream pressure, with interface name as
+a deterministic final tie-breaker.
+
+An existing Flow can RESUME only across Sessions with the same
+`serverInstanceID`. Different `dstOverrides` may reach different addresses of
+one server process, but not independent server instances with separate memory.
+A server restart makes old target TCP connections unrecoverable. Successful
+switching preserves both the original App TCP and target TCP; the Flow closes
+with a terminal error only after all paths remain unavailable beyond the
+recovery budget.
+The client filters Sessions whose advertised retention is shorter than its
+recovery budget, and the server rejects an oversized recoverable OPEN before
+dialing the target.
+
+The configuration must satisfy:
+
+```text
+resumeOpenTimeoutMillis < clientRecoveryTimeoutMillis
+serverOrphanRetentionMillis >= clientRecoveryTimeoutMillis + resumeOpenTimeoutMillis
+maxRecoveringStreams <= maxStreams
+maxRecoveryBytes >= reorderWindowBytes
+```
+
+On recovery overload, Engarde protects established Flows first and releases
+excess state deterministically, newest Flow first. Returning to
+`carrierMode: redundant` requires a process restart, which interrupts existing
+Flows.
 
 ### Keepalive settings across both ends
 

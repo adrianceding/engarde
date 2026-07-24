@@ -8,4 +8,11 @@ export interface IfaceModel {
     "dstAddress": string,
     "last": number | null,
     "traffic"?: TrafficStats,
+    "qualityState"?: string,
+    "rttMillis"?: number,
+    "jitterMillis"?: number,
+    "scoreMillis"?: number,
+    "failurePenaltyMillis"?: number,
+    "activeFlows"?: number,
+    "serverInstanceId"?: string,
 }

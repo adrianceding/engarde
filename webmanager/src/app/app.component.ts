@@ -36,6 +36,8 @@ export class AppComponent implements OnDestroy {
   public streams: number = 0
   public carriers: number = 0
   public sessions: number = 0
+  public carrierMode: string = 'redundant'
+  public recovering: number = 0
   public frontendAuthEnabled: boolean = false
   public peerAuthEnabled: boolean = false
   public tcpStreams: TCPStreamModel[] = []
@@ -61,6 +63,8 @@ export class AppComponent implements OnDestroy {
       this.streams = resp.streams || 0
       this.carriers = resp.carriers || 0
       this.sessions = resp.sessions || 0
+      this.carrierMode = resp.carrierMode || 'redundant'
+      this.recovering = resp.recovering || 0
       this.frontendAuthEnabled = !!resp.frontendAuthEnabled
       this.peerAuthEnabled = !!resp.peerAuthEnabled
       this.tcpStreams = resp.tcpStreams || []

@@ -10,11 +10,33 @@ import (
 
 var ErrNoCarriers = errors.New("tcp stream has no active carriers")
 
+type flowRecoveryTimer interface {
+	Stop() bool
+}
+
+var newFlowRecoveryTimer = func(delay time.Duration, callback func()) flowRecoveryTimer {
+	return time.AfterFunc(delay, callback)
+}
+
+var flowRecoveryNow = time.Now
+
+type FlowState string
+
+const (
+	FlowStatePending    FlowState = "pending"
+	FlowStateActive     FlowState = "active"
+	FlowStateRecovering FlowState = "recovering"
+	FlowStateCompleted  FlowState = "completed"
+	FlowStateFailed     FlowState = "failed"
+)
+
 type FlowConfig struct {
 	ChunkSize          int
 	CarrierQueueBytes  int
 	ReorderWindowBytes int
 	WriteTimeout       time.Duration
+	RecoveryTimeout    time.Duration
+	SingleCarrier      bool
 }
 
 type Flow struct {
@@ -40,6 +62,12 @@ type Flow struct {
 	done              chan struct{}
 	terminalErr       error
 	terminalNotify    bool
+	terminalAbortive  bool
+	recovering        bool
+	recoveryDeadline  time.Time
+	recoveryTimer     flowRecoveryTimer
+	recoveryEpoch     uint64
+	carrierGeneration uint64
 	history           []replayFrame
 	historyBytes      int
 	nextSequence      uint64
@@ -142,6 +170,42 @@ func (flow *Flow) CarrierCount() int {
 	return len(flow.carriers)
 }
 
+func (flow *Flow) CarrierGeneration() uint64 {
+	flow.mu.Lock()
+	defer flow.mu.Unlock()
+	return flow.carrierGeneration
+}
+
+func (flow *Flow) State() FlowState {
+	flow.mu.Lock()
+	defer flow.mu.Unlock()
+	if flow.closed {
+		if flow.terminalErr == nil {
+			return FlowStateCompleted
+		}
+		return FlowStateFailed
+	}
+	if flow.recovering {
+		return FlowStateRecovering
+	}
+	if flow.started && len(flow.carriers) > 0 {
+		return FlowStateActive
+	}
+	return FlowStatePending
+}
+
+func (flow *Flow) RecoveryDeadline() time.Time {
+	flow.mu.Lock()
+	defer flow.mu.Unlock()
+	return flow.recoveryDeadline
+}
+
+func (flow *Flow) HistoryBytes() int {
+	flow.mu.Lock()
+	defer flow.mu.Unlock()
+	return flow.historyBytes
+}
+
 func (flow *Flow) Attach(conn net.Conn, maxPayload uint32) (*Carrier, error) {
 	return flow.AttachObserved(conn, maxPayload, CarrierObserver{})
 }
@@ -158,7 +222,15 @@ func (flow *Flow) AttachLimitedObserved(conn net.Conn, maxPayload uint32, maxCar
 	return flow.attachLimited(conn, maxPayload, maxCarriers, observer)
 }
 
+func (flow *Flow) ReplaceObserved(conn net.Conn, maxPayload uint32, generation uint64, observer CarrierObserver) (*Carrier, error) {
+	return flow.attach(conn, maxPayload, 1, generation, true, observer)
+}
+
 func (flow *Flow) attachLimited(conn net.Conn, maxPayload uint32, maxCarriers int, observer CarrierObserver) (*Carrier, error) {
+	return flow.attach(conn, maxPayload, maxCarriers, 0, false, observer)
+}
+
+func (flow *Flow) attach(conn net.Conn, maxPayload uint32, maxCarriers int, generation uint64, replace bool, observer CarrierObserver) (*Carrier, error) {
 	if maxPayload == 0 || maxPayload > MaxPayloadSize {
 		maxPayload = MaxPayloadSize
 	}
@@ -168,7 +240,22 @@ func (flow *Flow) attachLimited(conn net.Conn, maxPayload uint32, maxCarriers in
 		conn.Close()
 		return nil, net.ErrClosed
 	}
-	if maxCarriers > 0 && len(flow.carriers) >= maxCarriers {
+	if replace {
+		if !flow.config.SingleCarrier || generation <= flow.carrierGeneration {
+			flow.mu.Unlock()
+			conn.Close()
+			return nil, errors.New("invalid TCP carrier generation")
+		}
+	} else if flow.config.SingleCarrier {
+		if len(flow.carriers) > 0 || flow.started {
+			flow.mu.Unlock()
+			conn.Close()
+			return nil, errors.New("active-standby flow requires carrier replacement")
+		}
+		generation = 1
+		maxCarriers = 1
+	}
+	if !replace && maxCarriers > 0 && len(flow.carriers) >= maxCarriers {
 		flow.mu.Unlock()
 		conn.Close()
 		return nil, errors.New("maximum TCP carriers reached")
@@ -176,7 +263,17 @@ func (flow *Flow) attachLimited(conn net.Conn, maxPayload uint32, maxCarriers in
 	carrier := newCarrier(conn, maxPayload, flow.config.CarrierQueueBytes, flow.config.ChunkSize, flow.config.WriteTimeout, flow.handleFrame, flow.detach, observer)
 	carrier.onStop = flow.carrierStopping
 	carrier.onWrite = flow.carrierFrameWritten
+	retired := []*Carrier(nil)
+	if replace {
+		retired = append(retired, flow.carriers...)
+		flow.carriers = nil
+		flow.carrierStates = make(map[*Carrier]*carrierState)
+	}
 	flow.carriers = append(flow.carriers, carrier)
+	if flow.config.SingleCarrier {
+		flow.carrierGeneration = generation
+	}
+	flow.stopRecoveryLocked()
 	nextSequence := flow.nextSequence
 	if len(flow.history) > 0 {
 		nextSequence = flow.history[0].sequence
@@ -185,6 +282,9 @@ func (flow *Flow) attachLimited(conn net.Conn, maxPayload uint32, maxCarriers in
 	latestAck := flow.latestAck
 	hasLatestAck := flow.hasLatestAck
 	flow.mu.Unlock()
+	for _, previous := range retired {
+		_ = previous.Close()
+	}
 	carrier.start()
 	if hasLatestAck {
 		carrier.enqueueAck(latestAck)
@@ -204,8 +304,17 @@ func (flow *Flow) Start() {
 	}
 	flow.started = true
 	if len(flow.carriers) == 0 {
+		if flow.beginRecoveryLocked() {
+			flow.mu.Unlock()
+			go flow.writeEndpoint()
+			go flow.readEndpoint()
+			return
+		}
+		finishReset := flow.claimResetLocked(ErrNoCarriers, true)
 		flow.mu.Unlock()
-		flow.Reset(ErrNoCarriers)
+		if finishReset {
+			flow.finishReset()
+		}
 		return
 	}
 	flow.mu.Unlock()
@@ -277,6 +386,16 @@ func (flow *Flow) readEndpoint() {
 }
 
 func (flow *Flow) handleFrame(source *Carrier, frame Frame) error {
+	flow.mu.Lock()
+	_, sourceActive := flow.carrierStates[source]
+	closed := flow.closed
+	flow.mu.Unlock()
+	if closed {
+		return net.ErrClosed
+	}
+	if !sourceActive {
+		return nil
+	}
 	if frame.StreamID != flow.id || frame.Type == FrameOpen {
 		flow.Reset(ErrInvalidFrame)
 		return ErrInvalidFrame
@@ -374,7 +493,11 @@ func (flow *Flow) releaseInbound() bool {
 	if flow.pendingInbound > 0 {
 		flow.pendingInbound--
 	}
-	shouldReset := flow.started && !flow.closed && flow.pendingInbound == 0 && len(flow.carriers) == 0
+	lastCarrierDrained := flow.started && !flow.closed && flow.pendingInbound == 0 && len(flow.carriers) == 0
+	shouldReset := lastCarrierDrained && flow.config.RecoveryTimeout <= 0
+	if lastCarrierDrained && flow.config.RecoveryTimeout > 0 {
+		flow.beginRecoveryLocked()
+	}
 	flow.mu.Unlock()
 	return shouldReset
 }
@@ -500,9 +623,17 @@ func (flow *Flow) broadcast(frame Frame) error {
 			flow.mu.Unlock()
 			return nil
 		}
-		if flow.closed || len(flow.carriers) == 0 {
+		if flow.closed {
 			flow.mu.Unlock()
 			return ErrNoCarriers
+		}
+		if len(flow.carriers) == 0 {
+			if !flow.beginRecoveryLocked() {
+				flow.mu.Unlock()
+				return ErrNoCarriers
+			}
+			flow.cond.Wait()
+			continue
 		}
 		for _, state := range flow.carrierStates {
 			if state.hasWritten && state.writtenSequence >= sequence {
@@ -538,12 +669,18 @@ func (flow *Flow) remember(frame Frame) (uint64, error) {
 		if flow.historyBytes+len(frame.Payload) <= flow.config.ReorderWindowBytes {
 			break
 		}
-		if flow.closed || len(flow.carriers) == 0 {
+		if flow.closed {
+			return 0, ErrNoCarriers
+		}
+		if len(flow.carriers) == 0 && !flow.beginRecoveryLocked() {
 			return 0, ErrNoCarriers
 		}
 		flow.cond.Wait()
 	}
-	if flow.closed || len(flow.carriers) == 0 {
+	if flow.closed {
+		return 0, ErrNoCarriers
+	}
+	if len(flow.carriers) == 0 && !flow.beginRecoveryLocked() {
 		return 0, ErrNoCarriers
 	}
 	sequence := flow.nextSequence
@@ -774,15 +911,14 @@ func (flow *Flow) detach(carrier *Carrier, preserveInbound bool) {
 			break
 		}
 	}
-	shouldReset := flow.started && !flow.closed && len(flow.carriers) == 0 && (!preserveInbound || flow.pendingInbound == 0)
-	if shouldReset {
-		resetErr := error(ErrNoCarriers)
-		notify := true
-		if flow.exchangeCompleteLocked() {
-			resetErr = nil
-			notify = false
+	lastCarrier := flow.started && !flow.closed && len(flow.carriers) == 0
+	shouldHandleLoss := lastCarrier && (flow.config.RecoveryTimeout > 0 || !preserveInbound || flow.pendingInbound == 0)
+	if shouldHandleLoss {
+		if flow.lossCompleteLocked() {
+			finishReset = flow.claimResetLocked(nil, false)
+		} else if !flow.beginRecoveryLocked() {
+			finishReset = flow.claimResetLocked(ErrNoCarriers, true)
 		}
-		finishReset = flow.claimResetLocked(resetErr, notify)
 	}
 	resendAck := flow.hasLatestAck && !flow.closed && len(flow.carriers) > 0
 	latestAck := flow.latestAck
@@ -804,13 +940,19 @@ func (flow *Flow) resetAfterLastCarrier() {
 		flow.mu.Unlock()
 		return
 	}
-	resetErr := error(ErrNoCarriers)
-	notify := true
-	if flow.exchangeCompleteLocked() {
-		resetErr = nil
-		notify = false
+	if flow.lossCompleteLocked() {
+		finishReset := flow.claimResetLocked(nil, false)
+		flow.mu.Unlock()
+		if finishReset {
+			flow.finishReset()
+		}
+		return
 	}
-	finishReset := flow.claimResetLocked(resetErr, notify)
+	if flow.beginRecoveryLocked() {
+		flow.mu.Unlock()
+		return
+	}
+	finishReset := flow.claimResetLocked(ErrNoCarriers, true)
 	flow.mu.Unlock()
 	if finishReset {
 		flow.finishReset()
@@ -823,17 +965,30 @@ func (flow *Flow) resetAfterCarrierFailure() {
 		flow.mu.Unlock()
 		return
 	}
-	resetErr := error(ErrNoCarriers)
-	notify := true
-	if flow.exchangeCompleteLocked() {
-		resetErr = nil
-		notify = false
+	if flow.lossCompleteLocked() {
+		finishReset := flow.claimResetLocked(nil, false)
+		flow.mu.Unlock()
+		if finishReset {
+			flow.finishReset()
+		}
+		return
 	}
-	finishReset := flow.claimResetLocked(resetErr, notify)
+	if flow.beginRecoveryLocked() {
+		flow.mu.Unlock()
+		return
+	}
+	finishReset := flow.claimResetLocked(ErrNoCarriers, true)
 	flow.mu.Unlock()
 	if finishReset {
 		flow.finishReset()
 	}
+}
+
+func (flow *Flow) lossCompleteLocked() bool {
+	if flow.config.RecoveryTimeout > 0 {
+		return flow.completeLocked()
+	}
+	return flow.exchangeCompleteLocked()
 }
 
 func (flow *Flow) reset(err error, notify bool) {
@@ -852,6 +1007,8 @@ func (flow *Flow) claimResetLocked(err error, notify bool) bool {
 	flow.closed = true
 	flow.terminalErr = err
 	flow.terminalNotify = notify
+	flow.terminalAbortive = flow.config.RecoveryTimeout > 0 && errors.Is(err, ErrNoCarriers)
+	flow.stopRecoveryLocked()
 	close(flow.inboundStop)
 	flow.cond.Broadcast()
 	return true
@@ -862,12 +1019,18 @@ func (flow *Flow) finishReset() {
 		flow.mu.Lock()
 		carriers := append([]*Carrier(nil), flow.carriers...)
 		notify := flow.terminalNotify
+		abortive := flow.terminalAbortive
 		flow.carriers = nil
 		flow.carrierStates = make(map[*Carrier]*carrierState)
 		flow.cond.Broadcast()
 		flow.mu.Unlock()
 		flow.inboundEnqueueWG.Wait()
 		flow.discardInbound()
+		if abortive {
+			if linger, ok := flow.endpoint.(interface{ SetLinger(int) error }); ok {
+				_ = linger.SetLinger(0)
+			}
+		}
 		_ = flow.endpoint.Close()
 		if notify && len(carriers) > 0 {
 			rst := Frame{Type: FrameRST, Direction: flow.sendDirection, StreamID: flow.id, Payload: []byte{0, 1}}
@@ -882,4 +1045,44 @@ func (flow *Flow) finishReset() {
 		}
 		close(flow.done)
 	})
+}
+
+func (flow *Flow) beginRecoveryLocked() bool {
+	if flow.config.RecoveryTimeout <= 0 || flow.closed || !flow.started || len(flow.carriers) != 0 {
+		return false
+	}
+	if flow.recovering {
+		return true
+	}
+	flow.recovering = true
+	flow.recoveryEpoch++
+	epoch := flow.recoveryEpoch
+	flow.recoveryDeadline = flowRecoveryNow().Add(flow.config.RecoveryTimeout)
+	flow.recoveryTimer = newFlowRecoveryTimer(flow.config.RecoveryTimeout, func() {
+		flow.expireRecovery(epoch)
+	})
+	flow.cond.Broadcast()
+	return true
+}
+
+func (flow *Flow) stopRecoveryLocked() {
+	if flow.recoveryTimer != nil {
+		flow.recoveryTimer.Stop()
+		flow.recoveryTimer = nil
+	}
+	flow.recovering = false
+	flow.recoveryDeadline = time.Time{}
+}
+
+func (flow *Flow) expireRecovery(epoch uint64) {
+	flow.mu.Lock()
+	if flow.closed || !flow.recovering || flow.recoveryEpoch != epoch || len(flow.carriers) != 0 {
+		flow.mu.Unlock()
+		return
+	}
+	finishReset := flow.claimResetLocked(ErrNoCarriers, true)
+	flow.mu.Unlock()
+	if finishReset {
+		flow.finishReset()
+	}
 }

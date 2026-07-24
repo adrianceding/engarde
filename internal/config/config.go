@@ -13,9 +13,24 @@ import (
 
 type Role string
 
+type TCPCarrierMode string
+
+type PathSelection string
+
+type InterfaceCost string
+
 const (
 	RoleClient Role = "client"
 	RoleServer Role = "server"
+
+	TCPCarrierModeRedundant     TCPCarrierMode = "redundant"
+	TCPCarrierModeActiveStandby TCPCarrierMode = "active-standby"
+
+	PathSelectionAdaptive PathSelection = "adaptive"
+
+	InterfaceCostNormal  InterfaceCost = "normal"
+	InterfaceCostMetered InterfaceCost = "metered"
+	InterfaceCostAvoid   InterfaceCost = "avoid"
 )
 
 type Config struct {
@@ -35,6 +50,14 @@ const (
 	DefaultTCPDialTimeoutMillis            int64 = 5000
 	DefaultTCPOpenTimeoutMillis            int64 = 5000
 	DefaultTCPWriteTimeoutMillis           int64 = 10000
+	DefaultTCPClientRecoveryTimeoutMillis  int64 = 3000
+	DefaultTCPServerOrphanRetentionMillis  int64 = 9000
+	DefaultTCPResumeOpenTimeoutMillis      int64 = 750
+	DefaultTCPMaxConcurrentResumes               = 64
+	DefaultTCPMaxPendingResumes                  = 128
+	DefaultTCPMaxRecoveringStreams               = 1024
+	DefaultTCPMaxRecoveryBytes             int64 = 512 * 1024 * 1024
+	DefaultTCPActiveStandbyMaxStreams            = 2048
 	MaxTCPSessionBufferBytes                     = 1<<31 - 1
 )
 
@@ -51,17 +74,25 @@ type Transfer struct {
 }
 
 type TCPTransfer struct {
-	ChunkSize             int   `yaml:"chunkSize"`
-	CarrierQueueBytes     int   `yaml:"carrierQueueBytes"`
-	ReorderWindowBytes    int   `yaml:"reorderWindowBytes"`
-	DialTimeoutMillis     int64 `yaml:"dialTimeoutMillis"`
-	OpenTimeoutMillis     int64 `yaml:"openTimeoutMillis"`
-	WriteTimeoutMillis    int64 `yaml:"writeTimeoutMillis"`
-	MaxStreams            int   `yaml:"maxStreams"`
-	MaxCarriersPerStream  int   `yaml:"maxCarriersPerStream"`
-	MaxPendingConnections int   `yaml:"maxPendingConnections"`
-	MaxPendingStreams     int   `yaml:"maxPendingStreams"`
-	MaxSessions           int   `yaml:"maxSessions"`
+	CarrierMode                 TCPCarrierMode `yaml:"carrierMode"`
+	ChunkSize                   int            `yaml:"chunkSize"`
+	CarrierQueueBytes           int            `yaml:"carrierQueueBytes"`
+	ReorderWindowBytes          int            `yaml:"reorderWindowBytes"`
+	DialTimeoutMillis           int64          `yaml:"dialTimeoutMillis"`
+	OpenTimeoutMillis           int64          `yaml:"openTimeoutMillis"`
+	WriteTimeoutMillis          int64          `yaml:"writeTimeoutMillis"`
+	ClientRecoveryTimeoutMillis int64          `yaml:"clientRecoveryTimeoutMillis"`
+	ServerOrphanRetentionMillis int64          `yaml:"serverOrphanRetentionMillis"`
+	ResumeOpenTimeoutMillis     int64          `yaml:"resumeOpenTimeoutMillis"`
+	MaxStreams                  int            `yaml:"maxStreams"`
+	MaxCarriersPerStream        int            `yaml:"maxCarriersPerStream"`
+	MaxPendingConnections       int            `yaml:"maxPendingConnections"`
+	MaxPendingStreams           int            `yaml:"maxPendingStreams"`
+	MaxSessions                 int            `yaml:"maxSessions"`
+	MaxConcurrentResumes        int            `yaml:"maxConcurrentResumes"`
+	MaxPendingResumes           int            `yaml:"maxPendingResumes"`
+	MaxRecoveringStreams        int            `yaml:"maxRecoveringStreams"`
+	MaxRecoveryBytes            int64          `yaml:"maxRecoveryBytes"`
 }
 
 func (transfer *Transfer) ApplyDefaults() {
@@ -75,6 +106,9 @@ func (transfer *Transfer) ApplyDefaults() {
 }
 
 func (tcp *TCPTransfer) ApplyDefaults() {
+	if tcp.CarrierMode == "" {
+		tcp.CarrierMode = TCPCarrierModeRedundant
+	}
 	if tcp.ChunkSize == 0 {
 		tcp.ChunkSize = DefaultTCPChunkSize
 	}
@@ -93,6 +127,33 @@ func (tcp *TCPTransfer) ApplyDefaults() {
 	if tcp.WriteTimeoutMillis == 0 {
 		tcp.WriteTimeoutMillis = DefaultTCPWriteTimeoutMillis
 	}
+	if tcp.CarrierMode != TCPCarrierModeActiveStandby {
+		return
+	}
+	if tcp.ClientRecoveryTimeoutMillis == 0 {
+		tcp.ClientRecoveryTimeoutMillis = DefaultTCPClientRecoveryTimeoutMillis
+	}
+	if tcp.ServerOrphanRetentionMillis == 0 {
+		tcp.ServerOrphanRetentionMillis = DefaultTCPServerOrphanRetentionMillis
+	}
+	if tcp.ResumeOpenTimeoutMillis == 0 {
+		tcp.ResumeOpenTimeoutMillis = DefaultTCPResumeOpenTimeoutMillis
+	}
+	if tcp.MaxStreams == 0 {
+		tcp.MaxStreams = DefaultTCPActiveStandbyMaxStreams
+	}
+	if tcp.MaxConcurrentResumes == 0 {
+		tcp.MaxConcurrentResumes = DefaultTCPMaxConcurrentResumes
+	}
+	if tcp.MaxPendingResumes == 0 {
+		tcp.MaxPendingResumes = DefaultTCPMaxPendingResumes
+	}
+	if tcp.MaxRecoveringStreams == 0 {
+		tcp.MaxRecoveringStreams = DefaultTCPMaxRecoveringStreams
+	}
+	if tcp.MaxRecoveryBytes == 0 {
+		tcp.MaxRecoveryBytes = DefaultTCPMaxRecoveryBytes
+	}
 }
 
 func (transfer Transfer) Validate(prefix string) error {
@@ -103,6 +164,9 @@ func (transfer Transfer) Validate(prefix string) error {
 }
 
 func (tcp TCPTransfer) Validate(prefix string) error {
+	if tcp.CarrierMode != TCPCarrierModeRedundant && tcp.CarrierMode != TCPCarrierModeActiveStandby {
+		return fmt.Errorf("%s.transfer.tcp.carrierMode must be %q or %q", prefix, TCPCarrierModeRedundant, TCPCarrierModeActiveStandby)
+	}
 	if tcp.ChunkSize <= 0 || tcp.ChunkSize > 64*1024 {
 		return fmt.Errorf("%s.transfer.tcp.chunkSize must be between 1 and 65536", prefix)
 	}
@@ -136,7 +200,53 @@ func (tcp TCPTransfer) Validate(prefix string) error {
 	if tcp.MaxSessions < 0 {
 		return fmt.Errorf("%s.transfer.tcp.maxSessions must not be negative", prefix)
 	}
+	if tcp.ClientRecoveryTimeoutMillis < 0 {
+		return fmt.Errorf("%s.transfer.tcp.clientRecoveryTimeoutMillis must not be negative", prefix)
+	}
+	if tcp.ServerOrphanRetentionMillis < 0 {
+		return fmt.Errorf("%s.transfer.tcp.serverOrphanRetentionMillis must not be negative", prefix)
+	}
+	if tcp.ResumeOpenTimeoutMillis < 0 {
+		return fmt.Errorf("%s.transfer.tcp.resumeOpenTimeoutMillis must not be negative", prefix)
+	}
+	if tcp.MaxConcurrentResumes < 0 {
+		return fmt.Errorf("%s.transfer.tcp.maxConcurrentResumes must not be negative", prefix)
+	}
+	if tcp.MaxPendingResumes < 0 {
+		return fmt.Errorf("%s.transfer.tcp.maxPendingResumes must not be negative", prefix)
+	}
+	if tcp.MaxRecoveringStreams < 0 {
+		return fmt.Errorf("%s.transfer.tcp.maxRecoveringStreams must not be negative", prefix)
+	}
+	if tcp.MaxRecoveryBytes < 0 {
+		return fmt.Errorf("%s.transfer.tcp.maxRecoveryBytes must not be negative", prefix)
+	}
+	if tcp.CarrierMode == TCPCarrierModeActiveStandby {
+		if tcp.ClientRecoveryTimeoutMillis <= 0 || tcp.ClientRecoveryTimeoutMillis > int64(^uint32(0)) {
+			return fmt.Errorf("%s.transfer.tcp.clientRecoveryTimeoutMillis must be positive in active-standby mode", prefix)
+		}
+		if tcp.ResumeOpenTimeoutMillis <= 0 || tcp.ResumeOpenTimeoutMillis >= tcp.ClientRecoveryTimeoutMillis {
+			return fmt.Errorf("%s.transfer.tcp.resumeOpenTimeoutMillis must be positive and less than clientRecoveryTimeoutMillis in active-standby mode", prefix)
+		}
+		minimumRetention := tcp.ClientRecoveryTimeoutMillis + tcp.ResumeOpenTimeoutMillis
+		if tcp.ServerOrphanRetentionMillis < minimumRetention || tcp.ServerOrphanRetentionMillis > int64(^uint32(0)) {
+			return fmt.Errorf("%s.transfer.tcp.serverOrphanRetentionMillis must be at least clientRecoveryTimeoutMillis + resumeOpenTimeoutMillis in active-standby mode", prefix)
+		}
+		if tcp.MaxStreams <= 0 || tcp.MaxConcurrentResumes <= 0 || tcp.MaxPendingResumes <= 0 || tcp.MaxRecoveringStreams <= 0 || tcp.MaxRecoveryBytes <= 0 {
+			return fmt.Errorf("%s.transfer.tcp active-standby limits maxStreams, maxConcurrentResumes, maxPendingResumes, maxRecoveringStreams, and maxRecoveryBytes must be positive", prefix)
+		}
+		if tcp.MaxRecoveryBytes < int64(tcp.ReorderWindowBytes) {
+			return fmt.Errorf("%s.transfer.tcp.maxRecoveryBytes must be at least reorderWindowBytes in active-standby mode", prefix)
+		}
+		if tcp.MaxRecoveringStreams > tcp.MaxStreams {
+			return fmt.Errorf("%s.transfer.tcp.maxRecoveringStreams must not exceed maxStreams in active-standby mode", prefix)
+		}
+	}
 	return nil
+}
+
+func (tcp TCPTransfer) ActiveStandby() bool {
+	return tcp.CarrierMode == TCPCarrierModeActiveStandby
 }
 
 func (transfer Transfer) present() bool {
@@ -144,22 +254,28 @@ func (transfer Transfer) present() bool {
 }
 
 func (tcp TCPTransfer) present() bool {
-	return tcp.ChunkSize != 0 || tcp.CarrierQueueBytes != 0 || tcp.ReorderWindowBytes != 0 || tcp.DialTimeoutMillis != 0 || tcp.OpenTimeoutMillis != 0 || tcp.WriteTimeoutMillis != 0 || tcp.MaxStreams != 0 || tcp.MaxCarriersPerStream != 0 || tcp.MaxPendingConnections != 0 || tcp.MaxPendingStreams != 0 || tcp.MaxSessions != 0
+	return tcp.CarrierMode != "" || tcp.ChunkSize != 0 || tcp.CarrierQueueBytes != 0 || tcp.ReorderWindowBytes != 0 || tcp.DialTimeoutMillis != 0 || tcp.OpenTimeoutMillis != 0 || tcp.WriteTimeoutMillis != 0 || tcp.ClientRecoveryTimeoutMillis != 0 || tcp.ServerOrphanRetentionMillis != 0 || tcp.ResumeOpenTimeoutMillis != 0 || tcp.MaxStreams != 0 || tcp.MaxCarriersPerStream != 0 || tcp.MaxPendingConnections != 0 || tcp.MaxPendingStreams != 0 || tcp.MaxSessions != 0 || tcp.MaxConcurrentResumes != 0 || tcp.MaxPendingResumes != 0 || tcp.MaxRecoveringStreams != 0 || tcp.MaxRecoveryBytes != 0
 }
 
 type Client struct {
-	Description         string            `yaml:"description"`
-	ListenAddr          string            `yaml:"listenAddr"`
-	DstAddr             string            `yaml:"dstAddr"`
-	SOCKS5Auth          *Credentials      `yaml:"socks5Auth"`
-	PeerAuth            *Credentials      `yaml:"peerAuth"`
-	AllowUnsafeFrontend bool              `yaml:"allowUnsafeFrontend"`
-	IncludeInterfaces   []string          `yaml:"includeInterfaces"`
-	ExcludedInterfaces  []string          `yaml:"excludedInterfaces"`
-	InterfaceLabels     map[string]string `yaml:"interfaceLabels"`
-	DstOverrides        []DstOverride     `yaml:"dstOverrides"`
-	Transfer            Transfer          `yaml:"transfer"`
-	WebManager          WebManager        `yaml:"webManager"`
+	Description         string                   `yaml:"description"`
+	ListenAddr          string                   `yaml:"listenAddr"`
+	DstAddr             string                   `yaml:"dstAddr"`
+	SOCKS5Auth          *Credentials             `yaml:"socks5Auth"`
+	PeerAuth            *Credentials             `yaml:"peerAuth"`
+	AllowUnsafeFrontend bool                     `yaml:"allowUnsafeFrontend"`
+	IncludeInterfaces   []string                 `yaml:"includeInterfaces"`
+	ExcludedInterfaces  []string                 `yaml:"excludedInterfaces"`
+	InterfaceLabels     map[string]string        `yaml:"interfaceLabels"`
+	PathSelection       PathSelection            `yaml:"pathSelection"`
+	InterfaceHints      map[string]InterfaceHint `yaml:"interfaceHints"`
+	DstOverrides        []DstOverride            `yaml:"dstOverrides"`
+	Transfer            Transfer                 `yaml:"transfer"`
+	WebManager          WebManager               `yaml:"webManager"`
+}
+
+type InterfaceHint struct {
+	Cost InterfaceCost `yaml:"cost"`
 }
 
 type Credentials struct {
@@ -263,6 +379,9 @@ func (cfg *Config) ApplyDefaults(role Role) {
 	switch role {
 	case RoleClient:
 		cfg.Client.Transfer.ApplyDefaults()
+		if cfg.Client.Transfer.TCP.ActiveStandby() && cfg.Client.PathSelection == "" {
+			cfg.Client.PathSelection = PathSelectionAdaptive
+		}
 	case RoleServer:
 		cfg.Server.Transfer.ApplyDefaults()
 	}
@@ -291,6 +410,15 @@ func (cfg Config) Validate(role Role) error {
 			return err
 		}
 		if err := validateInterfacePatterns("client.excludedInterfaces", cfg.Client.ExcludedInterfaces); err != nil {
+			return err
+		}
+		if cfg.Client.PathSelection != "" && cfg.Client.PathSelection != PathSelectionAdaptive {
+			return fmt.Errorf("client.pathSelection must be %q", PathSelectionAdaptive)
+		}
+		if cfg.Client.Transfer.TCP.ActiveStandby() && cfg.Client.PathSelection != PathSelectionAdaptive {
+			return fmt.Errorf("client.pathSelection must be %q in active-standby mode", PathSelectionAdaptive)
+		}
+		if err := validateInterfaceHints(cfg.Client.InterfaceHints); err != nil {
 			return err
 		}
 		if !cfg.Client.AllowUnsafeFrontend && !isLoopbackListenAddress(cfg.Client.ListenAddr) {
@@ -383,6 +511,20 @@ func validateInterfacePatterns(field string, patterns []string) error {
 	return nil
 }
 
+func validateInterfaceHints(hints map[string]InterfaceHint) error {
+	for interfaceName, hint := range hints {
+		if strings.TrimSpace(interfaceName) == "" {
+			return errors.New("client.interfaceHints contains an empty interface name")
+		}
+		switch hint.Cost {
+		case InterfaceCostNormal, InterfaceCostMetered, InterfaceCostAvoid:
+		default:
+			return fmt.Errorf("client.interfaceHints.%s.cost must be %q, %q, or %q", interfaceName, InterfaceCostNormal, InterfaceCostMetered, InterfaceCostAvoid)
+		}
+	}
+	return nil
+}
+
 func isLoopbackListenAddress(address string) bool {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -396,7 +538,7 @@ func isLoopbackListenAddress(address string) bool {
 }
 
 func (cfg Config) clientPresent() bool {
-	return cfg.clientSectionPresent || cfg.Client.Description != "" || cfg.Client.ListenAddr != "" || cfg.Client.DstAddr != "" || cfg.Client.SOCKS5Auth != nil || cfg.Client.PeerAuth != nil || cfg.Client.AllowUnsafeFrontend || len(cfg.Client.IncludeInterfaces) > 0 || len(cfg.Client.ExcludedInterfaces) > 0 || len(cfg.Client.InterfaceLabels) > 0 || len(cfg.Client.DstOverrides) > 0 || cfg.Client.Transfer.present() || webPresent(cfg.Client.WebManager)
+	return cfg.clientSectionPresent || cfg.Client.Description != "" || cfg.Client.ListenAddr != "" || cfg.Client.DstAddr != "" || cfg.Client.SOCKS5Auth != nil || cfg.Client.PeerAuth != nil || cfg.Client.AllowUnsafeFrontend || len(cfg.Client.IncludeInterfaces) > 0 || len(cfg.Client.ExcludedInterfaces) > 0 || len(cfg.Client.InterfaceLabels) > 0 || cfg.Client.PathSelection != "" || len(cfg.Client.InterfaceHints) > 0 || len(cfg.Client.DstOverrides) > 0 || cfg.Client.Transfer.present() || webPresent(cfg.Client.WebManager)
 }
 
 func (cfg Config) serverPresent() bool {

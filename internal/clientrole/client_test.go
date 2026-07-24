@@ -24,6 +24,7 @@ func TestNewAppliesTCPDefaults(t *testing.T) {
 		KeepaliveIntervalMillis: config.DefaultTransferKeepaliveIntervalMillis,
 		KeepaliveTimeoutMillis:  config.DefaultTransferKeepaliveTimeoutMillis,
 		TCP: config.TCPTransfer{
+			CarrierMode:        config.TCPCarrierModeRedundant,
 			ChunkSize:          config.DefaultTCPChunkSize,
 			CarrierQueueBytes:  config.DefaultTCPCarrierQueueBytes,
 			ReorderWindowBytes: config.DefaultTCPReorderWindowBytes,

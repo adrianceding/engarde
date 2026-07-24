@@ -3,5 +3,7 @@ export interface TCPStreamModel {
     protocolVersion: number,
     destination: string,
     carriers: number,
-    state: string
+    state: string,
+    recoverable?: boolean,
+    carrierGeneration?: number
 }

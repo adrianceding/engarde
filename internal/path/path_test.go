@@ -89,6 +89,24 @@ func TestAddressByInterface(t *testing.T) {
 	}
 }
 
+func TestAddressByInterfaceSelectsIPv4Deterministically(t *testing.T) {
+	originalInterfaceAddrs := interfaceAddrs
+	t.Cleanup(func() { interfaceAddrs = originalInterfaceAddrs })
+	ascending := []net.Addr{
+		&net.IPNet{IP: net.ParseIP("192.0.2.2"), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.ParseIP("192.0.2.10"), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.ParseIP("198.51.100.1"), Mask: net.CIDRMask(24, 32)},
+	}
+	descending := []net.Addr{ascending[2], ascending[1], ascending[0]}
+
+	for _, addrs := range [][]net.Addr{ascending, descending} {
+		interfaceAddrs = func(net.Interface) ([]net.Addr, error) { return addrs, nil }
+		if got := AddressByInterface(net.Interface{Name: "multi-address"}); got != "192.0.2.2" {
+			t.Fatalf("AddressByInterface = %q, want stable lowest address 192.0.2.2", got)
+		}
+	}
+}
+
 type writerFunc func([]byte) (int, error)
 
 func (fn writerFunc) Write(payload []byte) (int, error) { return fn(payload) }

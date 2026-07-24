@@ -137,6 +137,217 @@ func TestTCPSOCKS5EndToEndWithRedundantCarriers(t *testing.T) {
 	}
 }
 
+func TestTCPSOCKS5ActiveStandbyResumesWithoutApplicationReconnect(t *testing.T) {
+	echoListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoListener.Close()
+	var destinationAccepts atomic.Int32
+	go func() {
+		for {
+			conn, acceptErr := echoListener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			destinationAccepts.Add(1)
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+
+	serverAddress := freeTCPAddress(t)
+	clientAddress := freeTCPAddress(t)
+	transfer := config.Transfer{TCP: config.TCPTransfer{CarrierMode: config.TCPCarrierModeActiveStandby}}
+	transfer.ApplyDefaults()
+	server := serverrole.New(config.Server{ListenAddr: serverAddress, AllowUnsafeDynamicDestination: true, Transfer: transfer}, "test", nil)
+	client := New(config.Client{ListenAddr: clientAddress, DstAddr: serverAddress, PathSelection: config.PathSelectionAdaptive, Transfer: transfer}, "test", nil)
+	client.listInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{{Index: 1, Name: "path-a"}, {Index: 2, Name: "path-b"}}, nil
+	}
+	client.interfaceAddress = func(net.Interface) string { return "127.0.0.1" }
+	previousDial := dialTCPOnInterface
+	dialTCPOnInterface = func(ctx context.Context, destination, _, _ string, timeout time.Duration) (net.Conn, error) {
+		dialer := net.Dialer{Timeout: timeout}
+		return dialer.DialContext(ctx, "tcp4", destination)
+	}
+	t.Cleanup(func() { dialTCPOnInterface = previousDial })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	clientDone := make(chan error, 1)
+	go func() { serverDone <- server.Run(ctx) }()
+	waitForTCPListener(t, serverAddress)
+	go func() { clientDone <- client.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		waitForTCPShutdown(t, "client", clientDone)
+		waitForTCPShutdown(t, "server", serverDone)
+	})
+	waitForTCPStatus(t, func() (int, int, int) {
+		clientStatusValue, clientErr := client.Status()
+		serverStatusValue, serverErr := server.Status()
+		if clientErr != nil || serverErr != nil {
+			return -1, -1, -1
+		}
+		clientStatus := clientStatusValue.(control.ClientStatus)
+		serverStatus := serverStatusValue.(control.ServerStatus)
+		return clientStatus.Sessions, serverStatus.Sessions, clientStatus.Carriers
+	}, 2, 2, 0)
+
+	application := dialSOCKS5Eventually(t, clientAddress, echoListener.Addr().String())
+	defer application.Close()
+	first := []byte("before active-standby failover")
+	if _, err := application.Write(first); err != nil {
+		t.Fatal(err)
+	}
+	firstEcho := make([]byte, len(first))
+	if _, err := io.ReadFull(application, firstEcho); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(firstEcho, first) {
+		t.Fatalf("first echo = %q, want %q", firstEcho, first)
+	}
+	waitForTCPStatus(t, func() (int, int, int) {
+		clientStatusValue, _ := client.Status()
+		serverStatusValue, _ := server.Status()
+		clientStatus := clientStatusValue.(control.ClientStatus)
+		serverStatus := serverStatusValue.(control.ServerStatus)
+		return clientStatus.Carriers, serverStatus.Carriers, serverStatus.Streams
+	}, 1, 1, 1)
+
+	runtime := client.getTCPRuntime()
+	var group *tcpCarrierGroup
+	runtime.mu.Lock()
+	for candidate := range runtime.groups {
+		group = candidate
+		break
+	}
+	runtime.mu.Unlock()
+	if group == nil {
+		t.Fatal("active-standby carrier group was not registered")
+	}
+	group.mu.Lock()
+	failedInterface := group.activeInterface
+	var failedCarrier *tcpstream.Carrier
+	if slot := group.slots[failedInterface]; slot != nil {
+		failedCarrier = slot.carrier
+	}
+	initialGeneration := group.carrierGeneration
+	group.mu.Unlock()
+	runtime.mu.Lock()
+	failedPathSession := runtime.sessions[failedInterface]
+	runtime.mu.Unlock()
+	var failedSession *tcpstream.Session
+	if failedPathSession != nil {
+		failedPathSession.mu.Lock()
+		failedSession = failedPathSession.session
+		failedPathSession.mu.Unlock()
+	}
+	if failedInterface == "" || failedCarrier == nil || failedSession == nil || initialGeneration != 1 {
+		t.Fatalf("initial active path = %q carrier %v session %v generation %d", failedInterface, failedCarrier, failedSession, initialGeneration)
+	}
+	if err := failedSession.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForTCPStatus(t, func() (int, int, int) {
+		group.mu.Lock()
+		defer group.mu.Unlock()
+		changed := 0
+		if group.activeInterface != "" && group.activeInterface != failedInterface {
+			changed = 1
+		}
+		return int(group.carrierGeneration), changed, group.flow.CarrierCount()
+	}, 2, 1, 1)
+
+	second := []byte("after active-standby failover")
+	if err := application.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.Write(second); err != nil {
+		t.Fatal(err)
+	}
+	secondEcho := make([]byte, len(second))
+	if _, err := io.ReadFull(application, secondEcho); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(secondEcho, second) {
+		t.Fatalf("second echo = %q, want %q", secondEcho, second)
+	}
+	waitForTCPStatus(t, func() (int, int, int) {
+		clientStatusValue, clientErr := client.Status()
+		serverStatusValue, serverErr := server.Status()
+		if clientErr != nil || serverErr != nil {
+			return -1, -1, -1
+		}
+		clientStatus := clientStatusValue.(control.ClientStatus)
+		serverStatus := serverStatusValue.(control.ServerStatus)
+		return clientStatus.Sessions, serverStatus.Sessions, clientStatus.Carriers
+	}, 2, 2, 1)
+	group.mu.Lock()
+	degradedInterface := group.activeInterface
+	group.mu.Unlock()
+	runtime.mu.Lock()
+	degradedPath := runtime.sessions[degradedInterface]
+	var preferredPath *tcpPathSession
+	for interfaceName, pathSession := range runtime.sessions {
+		if interfaceName != degradedInterface {
+			preferredPath = pathSession
+			break
+		}
+	}
+	runtime.mu.Unlock()
+	if degradedPath == nil || preferredPath == nil {
+		t.Fatal("active-standby paths disappeared before migration test")
+	}
+	now := time.Now()
+	degradedPath.mu.Lock()
+	degradedPath.rttEWMA = float64(800 * time.Millisecond)
+	degradedPath.jitterEWMA = 0
+	degradedPath.penalty = 0
+	degradedPath.cooldownUntil = time.Time{}
+	degradedPath.lastProbe = now
+	degradedPath.mu.Unlock()
+	preferredPath.mu.Lock()
+	preferredPath.rttEWMA = float64(10 * time.Millisecond)
+	preferredPath.jitterEWMA = 0
+	preferredPath.penalty = 0
+	preferredPath.cooldownUntil = time.Time{}
+	preferredPath.lastProbe = now
+	preferredPath.mu.Unlock()
+	group.mu.Lock()
+	group.degradedSince = time.Now().Add(-tcpPathDegradeHold - time.Second)
+	group.lastMigration = time.Now().Add(-tcpPathMigrationCooloff - time.Second)
+	group.mu.Unlock()
+	group.considerActiveMigration()
+	waitForTCPStatus(t, func() (int, int, int) {
+		group.mu.Lock()
+		defer group.mu.Unlock()
+		migrated := 0
+		if group.activeInterface != "" && group.activeInterface != degradedInterface {
+			migrated = 1
+		}
+		return int(group.carrierGeneration), migrated, group.flow.CarrierCount()
+	}, 3, 1, 1)
+
+	third := []byte("after adaptive quality migration")
+	if _, err := application.Write(third); err != nil {
+		t.Fatal(err)
+	}
+	thirdEcho := make([]byte, len(third))
+	if _, err := io.ReadFull(application, thirdEcho); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(thirdEcho, third) {
+		t.Fatalf("third echo = %q, want %q", thirdEcho, third)
+	}
+	if got := destinationAccepts.Load(); got != 1 {
+		t.Fatalf("destination connections = %d, want 1 across failover", got)
+	}
+}
+
 func TestTCPPathSessionsContinueConnectingAfterFlowAssignment(t *testing.T) {
 	echoListener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {

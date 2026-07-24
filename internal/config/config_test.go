@@ -293,7 +293,8 @@ func assertTransferDefaults(t *testing.T, transfer Transfer) {
 		t.Fatalf("keepalive defaults = %#v", transfer)
 	}
 	tcp := transfer.TCP
-	if tcp.ChunkSize != DefaultTCPChunkSize ||
+	if tcp.CarrierMode != TCPCarrierModeRedundant ||
+		tcp.ChunkSize != DefaultTCPChunkSize ||
 		tcp.CarrierQueueBytes != DefaultTCPCarrierQueueBytes ||
 		tcp.ReorderWindowBytes != DefaultTCPReorderWindowBytes ||
 		tcp.DialTimeoutMillis != DefaultTCPDialTimeoutMillis ||
@@ -303,6 +304,9 @@ func assertTransferDefaults(t *testing.T, transfer Transfer) {
 	}
 	if tcp.MaxStreams != 0 || tcp.MaxCarriersPerStream != 0 || tcp.MaxPendingConnections != 0 || tcp.MaxPendingStreams != 0 || tcp.MaxSessions != 0 {
 		t.Fatalf("TCP limit defaults = %#v, want unlimited", tcp)
+	}
+	if tcp.ClientRecoveryTimeoutMillis != 0 || tcp.ServerOrphanRetentionMillis != 0 || tcp.ResumeOpenTimeoutMillis != 0 || tcp.MaxConcurrentResumes != 0 || tcp.MaxPendingResumes != 0 || tcp.MaxRecoveringStreams != 0 || tcp.MaxRecoveryBytes != 0 {
+		t.Fatalf("inactive active-standby defaults = %#v, want zero", tcp)
 	}
 }
 
@@ -360,6 +364,7 @@ func TestLoadTCPTuning(t *testing.T) {
 		t.Fatalf("keepalive tuning = %#v", transfer)
 	}
 	want := TCPTransfer{
+		CarrierMode:           TCPCarrierModeRedundant,
 		ChunkSize:             8192,
 		CarrierQueueBytes:     524288,
 		ReorderWindowBytes:    2097152,
@@ -377,6 +382,93 @@ func TestLoadTCPTuning(t *testing.T) {
 	}
 }
 
+func TestLoadActiveStandbyDefaults(t *testing.T) {
+	path := writeTestConfig(t, `client:
+  listenAddr: 127.0.0.1:59401
+  dstAddr: 203.0.113.20:59501
+  interfaceHints:
+    wwan0:
+      cost: metered
+  transfer:
+    tcp:
+      carrierMode: active-standby
+`)
+	cfg, role, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if role != RoleClient {
+		t.Fatalf("role = %q, want %q", role, RoleClient)
+	}
+	client := cfg.Client
+	if client.PathSelection != PathSelectionAdaptive {
+		t.Fatalf("path selection = %q, want %q", client.PathSelection, PathSelectionAdaptive)
+	}
+	if client.InterfaceHints["wwan0"].Cost != InterfaceCostMetered {
+		t.Fatalf("interface hints = %#v", client.InterfaceHints)
+	}
+	tcp := client.Transfer.TCP
+	if !tcp.ActiveStandby() || tcp.ClientRecoveryTimeoutMillis != DefaultTCPClientRecoveryTimeoutMillis || tcp.ServerOrphanRetentionMillis != DefaultTCPServerOrphanRetentionMillis || tcp.ResumeOpenTimeoutMillis != DefaultTCPResumeOpenTimeoutMillis {
+		t.Fatalf("active-standby timeout defaults = %#v", tcp)
+	}
+	if tcp.MaxStreams != DefaultTCPActiveStandbyMaxStreams || tcp.MaxConcurrentResumes != DefaultTCPMaxConcurrentResumes || tcp.MaxPendingResumes != DefaultTCPMaxPendingResumes || tcp.MaxRecoveringStreams != DefaultTCPMaxRecoveringStreams || tcp.MaxRecoveryBytes != DefaultTCPMaxRecoveryBytes {
+		t.Fatalf("active-standby limit defaults = %#v", tcp)
+	}
+}
+
+func TestActiveStandbyValidation(t *testing.T) {
+	valid := defaultTransfer()
+	valid.TCP.CarrierMode = TCPCarrierModeActiveStandby
+	valid.TCP.ApplyDefaults()
+	if err := valid.Validate("client"); err != nil {
+		t.Fatalf("active-standby defaults validation error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		set  func(*TCPTransfer)
+		want string
+	}{
+		{name: "unknown mode", set: func(tcp *TCPTransfer) { tcp.CarrierMode = "priority" }, want: "carrierMode"},
+		{name: "recovery timeout", set: func(tcp *TCPTransfer) { tcp.ClientRecoveryTimeoutMillis = -1 }, want: "clientRecoveryTimeoutMillis"},
+		{name: "resume timeout", set: func(tcp *TCPTransfer) { tcp.ResumeOpenTimeoutMillis = tcp.ClientRecoveryTimeoutMillis }, want: "resumeOpenTimeoutMillis"},
+		{name: "retention", set: func(tcp *TCPTransfer) { tcp.ServerOrphanRetentionMillis = tcp.ClientRecoveryTimeoutMillis }, want: "serverOrphanRetentionMillis"},
+		{name: "stream limit", set: func(tcp *TCPTransfer) { tcp.MaxStreams = 0 }, want: "active-standby limits"},
+		{name: "resume concurrency", set: func(tcp *TCPTransfer) { tcp.MaxConcurrentResumes = 0 }, want: "active-standby limits"},
+		{name: "pending resumes", set: func(tcp *TCPTransfer) { tcp.MaxPendingResumes = 0 }, want: "active-standby limits"},
+		{name: "recovering streams", set: func(tcp *TCPTransfer) { tcp.MaxRecoveringStreams = 0 }, want: "active-standby limits"},
+		{name: "recovery bytes", set: func(tcp *TCPTransfer) { tcp.MaxRecoveryBytes = int64(tcp.ReorderWindowBytes) - 1 }, want: "maxRecoveryBytes"},
+		{name: "recovering streams above max streams", set: func(tcp *TCPTransfer) { tcp.MaxRecoveringStreams = tcp.MaxStreams + 1 }, want: "maxRecoveringStreams"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := valid
+			test.set(&invalid.TCP)
+			if err := invalid.Validate("client"); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validation error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestClientPathSelectionAndHintValidation(t *testing.T) {
+	transfer := defaultTransfer()
+	client := Client{ListenAddr: "127.0.0.1:59401", DstAddr: "203.0.113.20:59501", Transfer: transfer}
+	client.PathSelection = "fixed"
+	if err := (Config{Client: client}).Validate(RoleClient); err == nil || !strings.Contains(err.Error(), "pathSelection") {
+		t.Fatalf("path selection validation error = %v", err)
+	}
+	client.PathSelection = PathSelectionAdaptive
+	client.InterfaceHints = map[string]InterfaceHint{"wwan0": {Cost: "cheap"}}
+	if err := (Config{Client: client}).Validate(RoleClient); err == nil || !strings.Contains(err.Error(), "interfaceHints.wwan0.cost") {
+		t.Fatalf("interface hint validation error = %v", err)
+	}
+	client.InterfaceHints = map[string]InterfaceHint{"": {Cost: InterfaceCostNormal}}
+	if err := (Config{Client: client}).Validate(RoleClient); err == nil || !strings.Contains(err.Error(), "empty interface name") {
+		t.Fatalf("empty interface hint validation error = %v", err)
+	}
+}
+
 func TestTransferValidation(t *testing.T) {
 	valid := defaultTransfer()
 	if err := valid.Validate("client"); err != nil {
@@ -389,6 +481,7 @@ func TestTransferValidation(t *testing.T) {
 		want string
 	}
 	tests := []validationTest{
+		{name: "carrier mode", set: func(value *Transfer) { value.TCP.CarrierMode = "fixed" }, want: "carrierMode"},
 		{name: "keepalive interval", set: func(value *Transfer) { value.KeepaliveIntervalMillis = 0 }, want: "keepaliveIntervalMillis"},
 		{name: "keepalive timeout", set: func(value *Transfer) { value.KeepaliveTimeoutMillis = value.KeepaliveIntervalMillis }, want: "keepaliveTimeoutMillis"},
 		{name: "chunk size zero", set: func(value *Transfer) { value.TCP.ChunkSize = 0 }, want: "chunkSize"},
@@ -403,6 +496,13 @@ func TestTransferValidation(t *testing.T) {
 		{name: "max pending", set: func(value *Transfer) { value.TCP.MaxPendingConnections = -1 }, want: "maxPendingConnections"},
 		{name: "max pending streams", set: func(value *Transfer) { value.TCP.MaxPendingStreams = -1 }, want: "maxPendingStreams"},
 		{name: "max sessions", set: func(value *Transfer) { value.TCP.MaxSessions = -1 }, want: "maxSessions"},
+		{name: "client recovery timeout", set: func(value *Transfer) { value.TCP.ClientRecoveryTimeoutMillis = -1 }, want: "clientRecoveryTimeoutMillis"},
+		{name: "server orphan retention", set: func(value *Transfer) { value.TCP.ServerOrphanRetentionMillis = -1 }, want: "serverOrphanRetentionMillis"},
+		{name: "resume open timeout", set: func(value *Transfer) { value.TCP.ResumeOpenTimeoutMillis = -1 }, want: "resumeOpenTimeoutMillis"},
+		{name: "max concurrent resumes", set: func(value *Transfer) { value.TCP.MaxConcurrentResumes = -1 }, want: "maxConcurrentResumes"},
+		{name: "max pending resumes", set: func(value *Transfer) { value.TCP.MaxPendingResumes = -1 }, want: "maxPendingResumes"},
+		{name: "max recovering streams", set: func(value *Transfer) { value.TCP.MaxRecoveringStreams = -1 }, want: "maxRecoveringStreams"},
+		{name: "max recovery bytes", set: func(value *Transfer) { value.TCP.MaxRecoveryBytes = -1 }, want: "maxRecoveryBytes"},
 	}
 	if strconv.IntSize > 32 {
 		tooLarge := int64(MaxTCPSessionBufferBytes) + 1

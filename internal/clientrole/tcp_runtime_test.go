@@ -52,6 +52,54 @@ func TestTCPClientStatusReportsLastReceived(t *testing.T) {
 	}
 }
 
+func TestTCPClientStatusLabelsMissingActiveStandbyQuality(t *testing.T) {
+	transfer := config.Transfer{TCP: config.TCPTransfer{CarrierMode: config.TCPCarrierModeActiveStandby}}
+	transfer.ApplyDefaults()
+	client := New(config.Client{
+		DstAddr:            "198.51.100.1:59501",
+		ExcludedInterfaces: []string{"excluded"},
+		Transfer:           transfer,
+	}, "test", nil)
+	client.listInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{
+			{Index: 1, Name: "connecting"},
+			{Index: 2, Name: "tracked-unhealthy"},
+			{Index: 3, Name: "unavailable"},
+			{Index: 4, Name: "excluded"},
+		}, nil
+	}
+	client.interfaceAddress = func(iface net.Interface) string {
+		if iface.Name == "unavailable" {
+			return ""
+		}
+		return "192.0.2.10"
+	}
+	trackedPath := tcpClientPath{index: 2, address: "192.0.2.10", destination: client.cfg.DstAddr}
+	runtime := &tcpClientRuntime{
+		client:   client,
+		ctx:      context.Background(),
+		flows:    make(map[tcpstream.StreamID]*tcpstream.Flow),
+		paths:    map[string]tcpClientPath{"tracked-unhealthy": trackedPath},
+		carriers: make(map[tcpstream.StreamID]map[string]*tcpstream.Carrier),
+		traffic:  make(map[string]*stats.Traffic),
+		sessions: map[string]*tcpPathSession{
+			"tracked-unhealthy": {path: trackedPath},
+		},
+	}
+
+	status, err := runtime.status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := make(map[string]string, len(status.Interfaces))
+	for _, iface := range status.Interfaces {
+		states[iface.Name] = iface.QualityState
+	}
+	if states["connecting"] != "connecting" || states["unavailable"] != "unavailable" || states["tracked-unhealthy"] != "unhealthy" || states["excluded"] != "" {
+		t.Fatalf("quality states = %#v, want connecting/unavailable/unhealthy/empty excluded", states)
+	}
+}
+
 func TestTCPClientStatusResolvesInterfacesOutsideRuntimeLock(t *testing.T) {
 	transfer := config.Transfer{}
 	transfer.ApplyDefaults()
@@ -103,6 +151,63 @@ func TestTCPClientStatusResolvesInterfacesOutsideRuntimeLock(t *testing.T) {
 	close(release)
 	if err := <-statusDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTCPRefreshRetainsPathAcrossTransientAddressMisses(t *testing.T) {
+	runtime := newTCPSessionManagerTestRuntime(t)
+	runtime.client.listInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{{Index: 1, Name: "path-a"}}, nil
+	}
+	address := "192.0.2.10"
+	runtime.client.interfaceAddress = func(net.Interface) string { return address }
+	peers, dialCount := installTCPSessionManagerDialer(t, runtime)
+
+	runtime.refresh()
+	firstPeer := waitTCPSessionManagerPeer(t, peers, "path-a")
+	if firstPeer.err != nil {
+		t.Fatal(firstPeer.err)
+	}
+	path := tcpClientPath{index: 1, address: address, destination: runtime.client.paths.Destination("path-a")}
+	firstPathSession := runtime.sessions["path-a"]
+	waitTCPSessionManagerCondition(t, func() bool {
+		_, _, healthy := firstPathSession.current(path)
+		return healthy
+	})
+
+	address = ""
+	for range tcpPathAddressMissGraceRefreshes {
+		runtime.refresh()
+		current, _, healthy := firstPathSession.current(path)
+		if !healthy || current == nil || runtime.sessions["path-a"] != firstPathSession {
+			t.Fatal("transient address miss replaced the healthy path Session")
+		}
+	}
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("physical dials during address grace period = %d, want 1", got)
+	}
+
+	runtime.refresh()
+	if _, exists := runtime.sessions["path-a"]; exists {
+		t.Fatal("path remained after the address miss grace period")
+	}
+	select {
+	case <-firstPeer.session.Done():
+	case <-time.After(tcpSessionManagerTestTimeout):
+		t.Fatal("expired address path did not close its physical Session")
+	}
+
+	address = "192.0.2.10"
+	runtime.refresh()
+	secondPeer := waitTCPSessionManagerPeer(t, peers, "path-a")
+	if secondPeer.err != nil {
+		t.Fatal(secondPeer.err)
+	}
+	if runtime.sessions["path-a"] == firstPathSession {
+		t.Fatal("restored address reused the closed path manager")
+	}
+	if got := dialCount.Load(); got != 2 {
+		t.Fatalf("physical dials after address recovery = %d, want 2", got)
 	}
 }
 

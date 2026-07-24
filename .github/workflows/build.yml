@@ -89,7 +89,9 @@ jobs:
           exit 1
 
   publish-image:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      github.event.repository.fork == false &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     needs:
       - test
       - docker
@@ -119,16 +121,23 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=raw,value=nightly
 
       - name: Validate release tag
         env:
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          if [[ -z "$IMAGE_TAGS" ]]; then
+          if [[ ! "$GITHUB_REF" =~ ^refs/tags/v ]]; then
+            exit 0
+          fi
+          release_tags="$(printf '%s\n' "$IMAGE_TAGS" | grep -Ev ':(latest|nightly)$' || true)"
+          if [[ -z "$release_tags" ]]; then
             echo "::error::Release tag '$GITHUB_REF_NAME' is not a valid semantic version (expected vMAJOR.MINOR.PATCH)."
             exit 1
           fi
@@ -142,7 +151,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
+            VERSION=${{ startsWith(github.ref, 'refs/tags/v') && steps.meta.outputs.version || github.sha }}
           cache-from: type=gha,scope=engarde-release
           cache-to: type=gha,mode=max,scope=engarde-release
 

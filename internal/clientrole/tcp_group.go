@@ -14,9 +14,12 @@ import (
 )
 
 const (
-	tcpSessionRetryInitialDelay = 100 * time.Millisecond
-	tcpSessionRetryMaxDelay     = 5 * time.Second
-	tcpFlowRetryStablePeriod    = tcpSessionRetryMaxDelay
+	tcpSessionRetryInitialDelay    = 100 * time.Millisecond
+	tcpSessionRetryMaxDelay        = 5 * time.Second
+	tcpFlowRetryStablePeriod       = tcpSessionRetryMaxDelay
+	tcpSessionProbeActiveInterval  = 250 * time.Millisecond
+	tcpSessionProbeStandbyInterval = time.Second
+	tcpSessionProbeTimeout         = 400 * time.Millisecond
 )
 
 var newTCPSessionRetryTimer = func(delay time.Duration) (<-chan time.Time, func()) {
@@ -30,6 +33,11 @@ var newTCPFlowRetryTimer = func(delay time.Duration) (<-chan time.Time, func()) 
 }
 
 var newTCPFlowOpenTimer = func(delay time.Duration) (<-chan time.Time, func()) {
+	timer := time.NewTimer(delay)
+	return timer.C, func() { timer.Stop() }
+}
+
+var newTCPSessionProbeTimer = func(delay time.Duration) (<-chan time.Time, func()) {
 	timer := time.NewTimer(delay)
 	return timer.C, func() { timer.Stop() }
 }
@@ -59,34 +67,59 @@ type tcpPathSession struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 
-	mu         sync.Mutex
-	session    *tcpstream.Session
-	generation uint64
-	inFlight   bool
-	retrying   bool
-	retryCount int
-	closed     bool
-	done       chan struct{}
+	mu            sync.Mutex
+	session       *tcpstream.Session
+	generation    uint64
+	inFlight      bool
+	retrying      bool
+	retryCount    int
+	closed        bool
+	done          chan struct{}
+	probe         *tcpstream.SessionProbe
+	rttEWMA       float64
+	jitterEWMA    float64
+	penalty       float64
+	penaltyAt     time.Time
+	cooldownUntil time.Time
+	lastProbe     time.Time
+	activeFlows   int
 }
 
 // tcpCarrierGroup owns only the virtual carriers for one logical Flow.
 type tcpCarrierGroup struct {
 	runtime *tcpClientRuntime
 
-	mu           sync.Mutex
-	startMu      sync.Mutex
-	slots        map[string]*tcpFlowSlot
-	flow         *tcpstream.Flow
-	destination  tcpstream.Destination
-	beforeAttach func() error
-	onOpenFailed func(error)
-	started      bool
-	committed    bool
-	startedReady chan struct{}
-	openResults  [tcpstream.OpenResultPolicyDenied + 1]bool
-	failed       bool
-	closed       bool
-	done         chan struct{}
+	mu                    sync.Mutex
+	startMu               sync.Mutex
+	slots                 map[string]*tcpFlowSlot
+	flow                  *tcpstream.Flow
+	destination           tcpstream.Destination
+	beforeAttach          func() error
+	onOpenFailed          func(error)
+	started               bool
+	committed             bool
+	startedReady          chan struct{}
+	openResults           [tcpstream.OpenResultPolicyDenied + 1]bool
+	failed                bool
+	closed                bool
+	done                  chan struct{}
+	resumeToken           tcpstream.ResumeToken
+	carrierGeneration     uint64
+	serverInstanceID      tcpstream.ServerInstanceID
+	activeInterface       string
+	activeCarrier         *tcpstream.Carrier
+	activePathSession     *tcpPathSession
+	retiringCarrier       *tcpstream.Carrier
+	activeQueued          bool
+	activeWork            tcpActiveWorkKind
+	activeQueueGeneration uint64
+	activeInFlight        bool
+	activePending         tcpActiveWorkKind
+	activeExecuting       tcpActiveWorkKind
+	order                 uint64
+	initialUncertain      bool
+	degradedSince         time.Time
+	lastMigration         time.Time
 }
 
 type tcpFlowSlot struct {
@@ -188,6 +221,14 @@ func (runtime *tcpClientRuntime) refreshCarrierGroups(paths map[string]tcpClient
 }
 
 func (runtime *tcpClientRuntime) assignCarrierGroup(flow *tcpstream.Flow, destination tcpstream.Destination, beforeAttach func() error, onOpenFailed func(error)) (*tcpCarrierGroup, error) {
+	var resumeToken tcpstream.ResumeToken
+	if runtime.client.cfg.Transfer.TCP.ActiveStandby() {
+		var err error
+		resumeToken, err = tcpstream.NewResumeToken()
+		if err != nil {
+			return nil, err
+		}
+	}
 	runtime.mu.Lock()
 	if runtime.closing || (runtime.ctx != nil && runtime.ctx.Err() != nil) {
 		runtime.mu.Unlock()
@@ -209,6 +250,9 @@ func (runtime *tcpClientRuntime) assignCarrierGroup(flow *tcpstream.Flow, destin
 	}
 	paths := cloneTCPPaths(runtime.paths)
 	group := newTCPCarrierGroup(runtime)
+	group.resumeToken = resumeToken
+	runtime.nextFlowOrder++
+	group.order = runtime.nextFlowOrder
 	runtime.groups[group] = struct{}{}
 	runtime.flows[flow.ID()] = flow
 	runtime.carriers[flow.ID()] = make(map[string]*tcpstream.Carrier)
@@ -258,6 +302,7 @@ func (pathSession *tcpPathSession) dial(generation uint64) {
 		time.Duration(tcpConfig.DialTimeoutMillis)*time.Millisecond,
 	)
 	if err != nil {
+		pathSession.recordFailure(tcpRetryNow())
 		if log.IsLevelEnabled(log.DebugLevel) {
 			log.WithError(err).Debug("Can't create TCP session on interface '" + pathSession.interfaceName + "'")
 		}
@@ -281,31 +326,72 @@ func (pathSession *tcpPathSession) dial(generation uint64) {
 	)
 	if err != nil {
 		_ = conn.Close()
+		pathSession.recordFailure(tcpRetryNow())
 		pathSession.retry(generation)
 		return
 	}
 	establishedAt := tcpRetryNow()
+	var probe *tcpstream.SessionProbe
+	var failedProbe *tcpstream.SessionProbe
+	var probeRTT time.Duration
+	var probedAt time.Time
+	if tcpConfig.ActiveStandby() {
+		probe, err = session.OpenProbe(time.Duration(tcpConfig.ResumeOpenTimeoutMillis) * time.Millisecond)
+		if err != nil {
+			_ = session.Close()
+			pathSession.recordFailure(tcpRetryNow())
+			pathSession.retry(generation)
+			return
+		}
+		probeRTT, err = probe.Ping(tcpSessionProbeTimeout)
+		if err != nil {
+			if tcpSessionProbeProtocolError(err) {
+				_ = session.Close()
+				pathSession.recordFailure(tcpRetryNow())
+				pathSession.retry(generation)
+				return
+			}
+			failedProbe = probe
+			probe = nil
+		} else {
+			probedAt = tcpRetryNow()
+		}
+	}
 
 	pathSession.mu.Lock()
 	if pathSession.closed || !pathSession.inFlight || pathSession.generation != generation {
 		pathSession.mu.Unlock()
 		_ = session.Close()
+		pathSession.retireProbe(failedProbe)
 		return
 	}
 	pathSession.session = session
+	pathSession.probe = probe
+	if probe != nil {
+		pathSession.recordProbeRTTLocked(probeRTT, probedAt)
+	} else if tcpConfig.ActiveStandby() {
+		pathSession.lastProbe = time.Time{}
+	}
+	pathSession.cooldownUntil = time.Time{}
 	pathSession.inFlight = false
 	pathSession.retrying = false
 	pathSession.mu.Unlock()
+	pathSession.retireProbe(failedProbe)
 	pathSession.runtime.reconcileGroups(pathSession.interfaceName)
 
-	select {
-	case <-session.Done():
-	case <-pathSession.done:
+	if tcpConfig.ActiveStandby() {
+		pathSession.monitorProbe(session)
+	} else {
+		select {
+		case <-session.Done():
+		case <-pathSession.done:
+		}
 	}
 	pathSession.mu.Lock()
 	current := pathSession.session == session
 	if current {
 		pathSession.session = nil
+		pathSession.probe = nil
 		if tcpSessionWasStable(establishedAt, tcpRetryNow()) {
 			pathSession.retryCount = 0
 		}
@@ -313,8 +399,138 @@ func (pathSession *tcpPathSession) dial(generation uint64) {
 	closed := pathSession.closed
 	pathSession.mu.Unlock()
 	if current && !closed {
+		pathSession.recordFailure(tcpRetryNow())
 		pathSession.retry(generation)
 	}
+}
+
+func (pathSession *tcpPathSession) monitorProbe(session *tcpstream.Session) {
+	defer func() { pathSession.retireProbe(pathSession.detachProbe(session)) }()
+	for {
+		pathSession.mu.Lock()
+		if pathSession.closed || pathSession.session != session {
+			pathSession.mu.Unlock()
+			return
+		}
+		activeFlows := pathSession.activeFlows
+		pathSession.mu.Unlock()
+		interval := tcpSessionProbeStandbyInterval
+		if activeFlows > 0 {
+			interval = tcpSessionProbeActiveInterval
+		}
+		ticks, stopTimer := newTCPSessionProbeTimer(interval)
+		select {
+		case <-ticks:
+			stopTimer()
+		case <-session.Done():
+			stopTimer()
+			return
+		case <-pathSession.done:
+			stopTimer()
+			return
+		}
+
+		pathSession.mu.Lock()
+		if pathSession.closed || pathSession.session != session || session.IsClosed() {
+			pathSession.mu.Unlock()
+			return
+		}
+		probe := pathSession.probe
+		pathSession.mu.Unlock()
+		if probe == nil {
+			tcpConfig := pathSession.runtime.client.cfg.Transfer.TCP
+			opened, err := session.OpenProbe(time.Duration(tcpConfig.ResumeOpenTimeoutMillis) * time.Millisecond)
+			if err != nil {
+				continue
+			}
+			if !pathSession.installProbe(session, opened) {
+				pathSession.retireProbe(opened)
+				continue
+			}
+			probe = opened
+		}
+		rtt, err := probe.Ping(tcpSessionProbeTimeout)
+		if err != nil {
+			if tcpSessionProbeProtocolError(err) {
+				_ = session.Close()
+				return
+			}
+			if pathSession.clearProbe(session, probe) {
+				pathSession.retireProbe(probe)
+			}
+			continue
+		}
+		if pathSession.recordProbeRTT(session, probe, rtt, tcpRetryNow()) {
+			pathSession.runtime.considerActiveMigrations()
+		}
+	}
+}
+
+func tcpSessionProbeProtocolError(err error) bool {
+	return errors.Is(err, tcpstream.ErrInvalidFrame) || errors.Is(err, tcpstream.ErrPayloadLength)
+}
+
+func (pathSession *tcpPathSession) installProbe(session *tcpstream.Session, probe *tcpstream.SessionProbe) bool {
+	pathSession.mu.Lock()
+	defer pathSession.mu.Unlock()
+	if pathSession.closed || pathSession.session != session || pathSession.probe != nil || session.IsClosed() {
+		return false
+	}
+	pathSession.probe = probe
+	return true
+}
+
+func (pathSession *tcpPathSession) clearProbe(session *tcpstream.Session, probe *tcpstream.SessionProbe) bool {
+	pathSession.mu.Lock()
+	defer pathSession.mu.Unlock()
+	if pathSession.session != session || pathSession.probe != probe {
+		return false
+	}
+	pathSession.probe = nil
+	pathSession.lastProbe = time.Time{}
+	return true
+}
+
+func (pathSession *tcpPathSession) detachProbe(session *tcpstream.Session) *tcpstream.SessionProbe {
+	pathSession.mu.Lock()
+	defer pathSession.mu.Unlock()
+	if pathSession.session != session {
+		return nil
+	}
+	probe := pathSession.probe
+	pathSession.probe = nil
+	return probe
+}
+
+func (pathSession *tcpPathSession) recordProbeRTT(session *tcpstream.Session, probe *tcpstream.SessionProbe, sample time.Duration, now time.Time) bool {
+	pathSession.mu.Lock()
+	defer pathSession.mu.Unlock()
+	if pathSession.closed || pathSession.session != session || pathSession.probe != probe || session.IsClosed() {
+		return false
+	}
+	pathSession.recordProbeRTTLocked(sample, now)
+	return true
+}
+
+func (pathSession *tcpPathSession) recordProbeRTTLocked(sample time.Duration, now time.Time) {
+	if sample > 0 {
+		pathSession.recordRTTLocked(sample, now)
+		return
+	}
+	// Coarse clocks can report zero for a successful probe. Refresh liveness
+	// without treating that sample as an exceptionally fast path.
+	pathSession.lastProbe = now
+	pathSession.decayPenaltyLocked(now)
+}
+
+func (pathSession *tcpPathSession) retireProbe(probe *tcpstream.SessionProbe) {
+	if probe == nil {
+		return
+	}
+	if pathSession.runtime.startGroupWorker(func() { _ = probe.Close() }) {
+		return
+	}
+	_ = probe.Close()
 }
 
 func tcpSessionWasStable(establishedAt, endedAt time.Time) bool {
@@ -397,10 +613,15 @@ func (pathSession *tcpPathSession) close() {
 	close(pathSession.done)
 	pathSession.cancel()
 	session := pathSession.session
+	probe := pathSession.probe
 	pathSession.session = nil
+	pathSession.probe = nil
 	pathSession.mu.Unlock()
 	if session != nil {
 		_ = session.Close()
+	}
+	if probe != nil {
+		_ = probe.Close()
 	}
 }
 
@@ -422,6 +643,7 @@ func (runtime *tcpClientRuntime) sessionConfig() tcpstream.SessionConfig {
 		KeepaliveTimeout:  time.Duration(transfer.KeepaliveTimeoutMillis) * time.Millisecond,
 		ReceiveBuffer:     transfer.TCP.ReorderWindowBytes,
 		StreamBuffer:      transfer.TCP.CarrierQueueBytes,
+		ActiveStandby:     transfer.TCP.ActiveStandby(),
 	}
 }
 
@@ -506,6 +728,22 @@ func (group *tcpCarrierGroup) syncPaths(paths map[string]tcpClientPath) {
 }
 
 func (group *tcpCarrierGroup) reconcileAll() {
+	if group.activeStandby() {
+		group.mu.Lock()
+		recoverable := group.started || group.initialUncertain
+		active := group.activeInterface != ""
+		closed := group.closed || group.failed || group.flow == nil || group.flowDoneLocked()
+		group.mu.Unlock()
+		if closed || active {
+			return
+		}
+		if recoverable {
+			group.scheduleActive(tcpActiveWorkRecovery)
+		} else {
+			group.scheduleActive(tcpActiveWorkOpen)
+		}
+		return
+	}
 	group.mu.Lock()
 	names := make([]string, 0, len(group.slots))
 	for interfaceName := range group.slots {
@@ -518,6 +756,10 @@ func (group *tcpCarrierGroup) reconcileAll() {
 }
 
 func (group *tcpCarrierGroup) reconcile(interfaceName string) {
+	if group.activeStandby() {
+		group.reconcileAll()
+		return
+	}
 	group.mu.Lock()
 	slot := group.slots[interfaceName]
 	if group.closed || group.failed || group.flow == nil || slot == nil || group.flowDoneLocked() {
@@ -783,12 +1025,8 @@ func (group *tcpCarrierGroup) flowDoneLocked() bool {
 	if group.flow == nil {
 		return false
 	}
-	select {
-	case <-group.flow.Done():
-		return true
-	default:
-		return false
-	}
+	state := group.flow.State()
+	return state == tcpstream.FlowStateCompleted || state == tcpstream.FlowStateFailed
 }
 
 func (group *tcpCarrierGroup) failOpen(err error) {
@@ -857,14 +1095,26 @@ func (group *tcpCarrierGroup) close() {
 	}
 	group.closed = true
 	close(group.done)
+	activeCarrier := group.activeCarrier
+	activePathSession := group.activePathSession
+	group.activeInterface = ""
+	group.activeCarrier = nil
+	group.activePathSession = nil
+	group.retiringCarrier = nil
 	carriers := make([]*tcpstream.Carrier, 0, len(group.slots))
+	if activeCarrier != nil {
+		carriers = append(carriers, activeCarrier)
+	}
 	for _, slot := range group.slots {
-		if slot.carrier != nil {
+		if slot.carrier != nil && slot.carrier != activeCarrier {
 			carriers = append(carriers, slot.carrier)
-			slot.carrier = nil
 		}
+		slot.carrier = nil
 	}
 	group.mu.Unlock()
+	if activePathSession != nil {
+		activePathSession.adjustActiveFlows(-1)
+	}
 	for _, carrier := range carriers {
 		carrier.Close()
 	}
@@ -881,7 +1131,7 @@ func (group *tcpCarrierGroup) reset(err error) {
 	flow.Reset(err)
 }
 
-func (runtime *tcpClientRuntime) pathSessionStatus() (map[string]bool, int) {
+func (runtime *tcpClientRuntime) pathSessionStatus() (map[string]tcpPathQualityStatus, int) {
 	runtime.mu.Lock()
 	sessions := make(map[string]*tcpPathSession, len(runtime.sessions))
 	for interfaceName, pathSession := range runtime.sessions {
@@ -889,16 +1139,17 @@ func (runtime *tcpClientRuntime) pathSessionStatus() (map[string]bool, int) {
 	}
 	paths := cloneTCPPaths(runtime.paths)
 	runtime.mu.Unlock()
-	active := make(map[string]bool, len(sessions))
+	status := make(map[string]tcpPathQualityStatus, len(sessions))
 	count := 0
+	now := tcpRetryNow()
 	for interfaceName, pathSession := range sessions {
-		_, _, healthy := pathSession.current(paths[interfaceName])
-		active[interfaceName] = healthy
-		if healthy {
+		quality := pathSession.qualityStatus(paths[interfaceName], runtime.client.cfg.InterfaceHints[interfaceName].Cost, now)
+		status[interfaceName] = quality
+		if quality.active {
 			count++
 		}
 	}
-	return active, count
+	return status, count
 }
 
 func (runtime *tcpClientRuntime) closeCarrierGroups() {

@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +18,57 @@ import (
 
 type tcpConnWithRemoteAddr struct {
 	net.Conn
+}
+
+type tcpServerCloseBarrierConn struct {
+	net.Conn
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (conn *tcpServerCloseBarrierConn) Close() error {
+	close(conn.started)
+	<-conn.release
+	return conn.Conn.Close()
+}
+
+func TestTCPFlowTerminalBeforeDoneCloses(t *testing.T) {
+	application, endpoint := net.Pipe()
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseClose) }) }
+	flow := tcpstream.NewFlow(tcpstream.StreamID{1}, &tcpServerCloseBarrierConn{
+		Conn:    endpoint,
+		started: closeStarted,
+		release: releaseClose,
+	}, tcpstream.DirectionServerToClient, tcpstream.FlowConfig{})
+	t.Cleanup(func() {
+		release()
+		_ = flow.Close()
+		_ = application.Close()
+	})
+
+	go flow.Reset(nil)
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("endpoint close did not reach barrier")
+	}
+	select {
+	case <-flow.Done():
+		t.Fatal("Flow.Done closed before endpoint Close returned")
+	default:
+	}
+	if !tcpFlowTerminal(flow) {
+		t.Fatalf("terminal Flow state %q was treated as live", flow.State())
+	}
+	release()
+	select {
+	case <-flow.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Flow.Done did not close after endpoint Close returned")
+	}
 }
 
 type manualTCPServerTimer struct {
@@ -101,6 +154,490 @@ func TestTCPServerDestinationForOpenRejectsInvalidPayload(t *testing.T) {
 	if _, err := runtime.destinationForOpen(tcpstream.Frame{}); err == nil {
 		t.Fatal("empty destination payload was accepted")
 	}
+}
+
+func TestTCPServerActiveSessionRejectsLegacyOpen(t *testing.T) {
+	transfer := config.Transfer{TCP: config.TCPTransfer{CarrierMode: config.TCPCarrierModeActiveStandby}}
+	transfer.ApplyDefaults()
+	runtime := &tcpServerRuntime{
+		server:         New(config.Server{Transfer: transfer}, "test", nil),
+		ctx:            context.Background(),
+		instanceID:     tcpstream.ServerInstanceID{1},
+		streams:        make(map[tcpstream.StreamID]*tcpServerStream),
+		closed:         make(map[tcpstream.StreamID]time.Time),
+		sessions:       make(map[*tcpstream.Session]struct{}),
+		probes:         make(map[*tcpstream.Session]struct{}),
+		connections:    make(map[*tcpServerConn]struct{}),
+		traffic:        make(map[string]*tcpServerTraffic),
+		pendingResumes: make(chan struct{}, transfer.TCP.MaxPendingResumes),
+	}
+	previousDial := dialTCPDestination
+	var dialCount atomic.Int32
+	dialTCPDestination = func(context.Context, string, time.Duration) (net.Conn, error) {
+		dialCount.Add(1)
+		return nil, errors.New("unexpected destination dial")
+	}
+	t.Cleanup(func() { dialTCPDestination = previousDial })
+	session, _ := dialTCPServerTestSession(t, runtime, nil)
+	destination, err := tcpstream.ParseDestination("legacy.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, _, err := session.OpenDestination(tcpstream.StreamID{3}, destination, time.Second)
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("active Session accepted a legacy OPEN")
+	}
+	var openErr *tcpstream.OpenError
+	if !errors.As(err, &openErr) || openErr.Result != tcpstream.OpenResultGeneralFailure {
+		t.Fatalf("legacy OPEN error = %v, want general failure", err)
+	}
+	if dialCount.Load() != 0 || session.IsClosed() {
+		t.Fatalf("legacy OPEN dials/session closed = %d/%v, want 0/false", dialCount.Load(), session.IsClosed())
+	}
+}
+
+func TestTCPServerAllowsOneProbePerSession(t *testing.T) {
+	transfer := config.Transfer{TCP: config.TCPTransfer{CarrierMode: config.TCPCarrierModeActiveStandby}}
+	transfer.ApplyDefaults()
+	runtime := &tcpServerRuntime{
+		server:         New(config.Server{Transfer: transfer}, "test", nil),
+		ctx:            context.Background(),
+		instanceID:     tcpstream.ServerInstanceID{1},
+		streams:        make(map[tcpstream.StreamID]*tcpServerStream),
+		closed:         make(map[tcpstream.StreamID]time.Time),
+		sessions:       make(map[*tcpstream.Session]struct{}),
+		probes:         make(map[*tcpstream.Session]struct{}),
+		connections:    make(map[*tcpServerConn]struct{}),
+		traffic:        make(map[string]*tcpServerTraffic),
+		pendingResumes: make(chan struct{}, transfer.TCP.MaxPendingResumes),
+	}
+	session, _ := dialTCPServerTestSession(t, runtime, nil)
+	first, err := session.OpenProbe(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Ping(time.Second); err != nil {
+		t.Fatalf("first probe ping: %v", err)
+	}
+	second, err := session.OpenProbe(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Ping(time.Second); err == nil {
+		t.Fatal("second probe stream on one Session was accepted")
+	}
+	_ = second.Close()
+	if _, err := first.Ping(time.Second); err != nil {
+		t.Fatalf("first probe stopped after rejecting second probe: %v", err)
+	}
+	if session.IsClosed() {
+		t.Fatal("rejecting a second probe closed the physical Session")
+	}
+	_ = first.Close()
+	runtime.probeWG.Wait()
+}
+
+func TestTCPServerRecoverableResumeKeepsDestinationConnection(t *testing.T) {
+	transfer := config.Transfer{TCP: config.TCPTransfer{CarrierMode: config.TCPCarrierModeActiveStandby}}
+	transfer.ApplyDefaults()
+	server := New(config.Server{Transfer: transfer}, "test", nil)
+	runtime := &tcpServerRuntime{
+		server:         server,
+		ctx:            context.Background(),
+		instanceID:     tcpstream.ServerInstanceID{1},
+		streams:        make(map[tcpstream.StreamID]*tcpServerStream),
+		closed:         make(map[tcpstream.StreamID]time.Time),
+		traffic:        make(map[string]*tcpServerTraffic),
+		pendingResumes: make(chan struct{}, transfer.TCP.MaxPendingResumes),
+	}
+	destinationEndpoint, destinationPeer := net.Pipe()
+	var dialCount atomic.Int32
+	previousDial := dialTCPDestination
+	dialTCPDestination = func(context.Context, string, time.Duration) (net.Conn, error) {
+		dialCount.Add(1)
+		return destinationEndpoint, nil
+	}
+	t.Cleanup(func() {
+		dialTCPDestination = previousDial
+		runtime.mu.Lock()
+		var flow *tcpstream.Flow
+		for _, stream := range runtime.streams {
+			flow = stream.flow
+		}
+		runtime.mu.Unlock()
+		if flow != nil {
+			_ = flow.Close()
+		}
+		_ = destinationPeer.Close()
+		runtime.flowWG.Wait()
+	})
+
+	streamID := tcpstream.StreamID{5}
+	token := tcpstream.ResumeToken{7, 8, 9}
+	destination, err := tcpstream.ParseDestination("same-target.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, err := (tcpstream.RecoverableOpen{
+		Destination:           destination,
+		ResumeToken:           token,
+		Generation:            1,
+		RecoveryTimeoutMillis: uint32(transfer.TCP.ClientRecoveryTimeoutMillis),
+	}).Frame(streamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traffic := &tcpServerTraffic{}
+	openClient, openServer := net.Pipe()
+	go runtime.acceptStreamWithCapability(openServer, tcpstream.MaxPayloadSize, "client-a", traffic, true)
+	setTCPServerTestDeadline(t, openClient)
+	if err := tcpstream.WriteFrame(openClient, open); err != nil {
+		t.Fatal(err)
+	}
+	openResultFrame, err := tcpstream.ReadFrame(openClient, tcpstream.MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openResult, err := tcpstream.DecodeRecoverableOpenResult(openResultFrame)
+	if err != nil || openResult.Result != tcpstream.OpenResultSuccess {
+		t.Fatalf("recoverable OPEN result = %#v, error %v", openResult, err)
+	}
+	waitForTCPServerCondition(t, func() bool {
+		runtime.mu.Lock()
+		stream := runtime.streams[streamID]
+		runtime.mu.Unlock()
+		if stream == nil {
+			return false
+		}
+		stream.attachMu.Lock()
+		started := stream.started
+		stream.attachMu.Unlock()
+		return started && stream.flow.State() == tcpstream.FlowStateActive
+	}, "recoverable stream to become active")
+	if err := openClient.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForTCPServerCondition(t, func() bool {
+		runtime.mu.Lock()
+		stream := runtime.streams[streamID]
+		runtime.mu.Unlock()
+		return stream != nil && stream.flow.State() == tcpstream.FlowStateRecovering
+	}, "recoverable stream to retain its target endpoint")
+
+	wrongClient, wrongServer := net.Pipe()
+	go runtime.acceptStreamWithCapability(wrongServer, tcpstream.MaxPayloadSize, "client-a", traffic, true)
+	setTCPServerTestDeadline(t, wrongClient)
+	if err := tcpstream.WriteFrame(wrongClient, tcpstream.NewResumeFrame(streamID, tcpstream.ResumeToken{99}, 2)); err != nil {
+		t.Fatal(err)
+	}
+	wrongResult, err := tcpstream.ReadFrame(wrongClient, tcpstream.MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tcpstream.ResumeResult(wrongResult.Payload[0]) != tcpstream.ResumeResultRejected {
+		t.Fatalf("wrong-token RESUME result = %#v", wrongResult)
+	}
+	_ = wrongClient.Close()
+
+	resumeClient, resumeServer := net.Pipe()
+	go runtime.acceptStreamWithCapability(resumeServer, tcpstream.MaxPayloadSize, "client-a", traffic, true)
+	setTCPServerTestDeadline(t, resumeClient)
+	if err := tcpstream.WriteFrame(resumeClient, tcpstream.NewResumeFrame(streamID, token, 2)); err != nil {
+		t.Fatal(err)
+	}
+	resumeResult, err := tcpstream.ReadFrame(resumeClient, tcpstream.MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tcpstream.ResumeResult(resumeResult.Payload[0]) != tcpstream.ResumeResultSuccess {
+		t.Fatalf("RESUME result = %#v", resumeResult)
+	}
+	payload := []byte("same target connection")
+	if err := tcpstream.WriteFrame(resumeClient, tcpstream.Frame{Type: tcpstream.FrameData, Direction: tcpstream.DirectionClientToServer, StreamID: streamID, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := destinationPeer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(destinationPeer, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("destination payload = %q, want %q", got, payload)
+	}
+	if dialCount.Load() != 1 {
+		t.Fatalf("destination dial count = %d, want 1", dialCount.Load())
+	}
+	runtime.mu.Lock()
+	stream := runtime.streams[streamID]
+	runtime.mu.Unlock()
+	generation := uint64(0)
+	if stream != nil {
+		stream.attachMu.Lock()
+		generation = stream.generation
+		stream.attachMu.Unlock()
+	}
+	if stream == nil || generation != 2 || stream.flow.CarrierGeneration() != 2 {
+		t.Fatalf("server generation = stream %v flow %v", stream, func() uint64 {
+			if stream == nil {
+				return 0
+			}
+			return stream.flow.CarrierGeneration()
+		}())
+	}
+
+	staleClient, staleServer := net.Pipe()
+	go runtime.acceptStreamWithCapability(staleServer, tcpstream.MaxPayloadSize, "client-a", traffic, true)
+	setTCPServerTestDeadline(t, staleClient)
+	if err := tcpstream.WriteFrame(staleClient, tcpstream.NewResumeFrame(streamID, token, 2)); err != nil {
+		t.Fatal(err)
+	}
+	staleResult, err := tcpstream.ReadFrame(staleClient, tcpstream.MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tcpstream.ResumeResult(staleResult.Payload[0]) != tcpstream.ResumeResultRejected {
+		t.Fatalf("stale-generation RESUME result = %#v", staleResult)
+	}
+	_ = staleClient.Close()
+	_ = resumeClient.Close()
+}
+
+func TestTCPServerRejectsRecoveryBudgetBeyondRetentionBeforeDial(t *testing.T) {
+	transfer := config.Transfer{TCP: config.TCPTransfer{CarrierMode: config.TCPCarrierModeActiveStandby}}
+	transfer.ApplyDefaults()
+	runtime := &tcpServerRuntime{
+		server:  New(config.Server{Transfer: transfer}, "test", nil),
+		ctx:     context.Background(),
+		streams: make(map[tcpstream.StreamID]*tcpServerStream),
+		closed:  make(map[tcpstream.StreamID]time.Time),
+		traffic: make(map[string]*tcpServerTraffic),
+	}
+	previousDial := dialTCPDestination
+	var dialCount atomic.Int32
+	dialTCPDestination = func(context.Context, string, time.Duration) (net.Conn, error) {
+		dialCount.Add(1)
+		return nil, errors.New("unexpected destination dial")
+	}
+	t.Cleanup(func() { dialTCPDestination = previousDial })
+	destination, err := tcpstream.ParseDestination("retention.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := (tcpstream.RecoverableOpen{
+		Destination:           destination,
+		ResumeToken:           tcpstream.ResumeToken{1},
+		Generation:            1,
+		RecoveryTimeoutMillis: uint32(transfer.TCP.ServerOrphanRetentionMillis + 1),
+	}).Frame(tcpstream.StreamID{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	go runtime.acceptStreamWithCapability(server, tcpstream.MaxPayloadSize, "client-a", &tcpServerTraffic{}, true)
+	setTCPServerTestDeadline(t, client)
+	if err := tcpstream.WriteFrame(client, frame); err != nil {
+		t.Fatal(err)
+	}
+	resultFrame, err := tcpstream.ReadFrame(client, tcpstream.MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := tcpstream.DecodeRecoverableOpenResult(resultFrame)
+	if err != nil || result.Result != tcpstream.OpenResultGeneralFailure {
+		t.Fatalf("recoverable OPEN result = %#v, error %v", result, err)
+	}
+	if dialCount.Load() != 0 {
+		t.Fatalf("destination dials = %d, want 0", dialCount.Load())
+	}
+}
+
+func TestTCPServerResumeStartsUncertainRecoverableOpen(t *testing.T) {
+	transfer := config.Transfer{TCP: config.TCPTransfer{CarrierMode: config.TCPCarrierModeActiveStandby}}
+	transfer.ApplyDefaults()
+	runtime := &tcpServerRuntime{
+		server:         New(config.Server{Transfer: transfer}, "test", nil),
+		ctx:            context.Background(),
+		streams:        make(map[tcpstream.StreamID]*tcpServerStream),
+		closed:         make(map[tcpstream.StreamID]time.Time),
+		traffic:        make(map[string]*tcpServerTraffic),
+		pendingResumes: make(chan struct{}, transfer.TCP.MaxPendingResumes),
+	}
+	targetEndpoint, targetPeer := net.Pipe()
+	previousDial := dialTCPDestination
+	dialTCPDestination = func(context.Context, string, time.Duration) (net.Conn, error) {
+		return targetEndpoint, nil
+	}
+	t.Cleanup(func() { dialTCPDestination = previousDial })
+
+	streamID := tcpstream.StreamID{6}
+	token := tcpstream.ResumeToken{7, 8, 9}
+	stream, err := runtime.getOrCreateMode(streamID, tcpstream.Version, "same-target.example:443", "client-a", true, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = stream.flow.Close()
+		_ = targetPeer.Close()
+		runtime.flowWG.Wait()
+		runtime.recoveryWG.Wait()
+	})
+	if stream.started || stream.flow.State() != tcpstream.FlowStatePending || stream.openTimer == nil {
+		t.Fatalf("initial stream state = started %v, flow %s, timer %v", stream.started, stream.flow.State(), stream.openTimer)
+	}
+
+	resumeClient, resumeServer := net.Pipe()
+	defer resumeClient.Close()
+	go runtime.acceptStreamWithCapability(resumeServer, tcpstream.MaxPayloadSize, "client-a", &tcpServerTraffic{}, true)
+	setTCPServerTestDeadline(t, resumeClient)
+	if err := tcpstream.WriteFrame(resumeClient, tcpstream.NewResumeFrame(streamID, token, 2)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := tcpstream.ReadFrame(resumeClient, tcpstream.MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tcpstream.ResumeResult(result.Payload[0]) != tcpstream.ResumeResultSuccess {
+		t.Fatalf("RESUME result = %#v", result)
+	}
+	waitForTCPServerCondition(t, func() bool {
+		stream.attachMu.Lock()
+		defer stream.attachMu.Unlock()
+		return stream.started && stream.openTimer == nil && stream.generation == 2 && stream.flow.State() == tcpstream.FlowStateActive
+	}, "uncertain recoverable OPEN to start through RESUME")
+
+	payload := []byte("resumed before initial OPEN result")
+	if err := tcpstream.WriteFrame(resumeClient, tcpstream.Frame{Type: tcpstream.FrameData, Direction: tcpstream.DirectionClientToServer, StreamID: streamID, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := targetPeer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(targetPeer, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("target payload = %q, want %q", got, payload)
+	}
+}
+
+func TestTCPServerResumeWaitsForRecoverableStreamReadiness(t *testing.T) {
+	transfer := config.Transfer{TCP: config.TCPTransfer{CarrierMode: config.TCPCarrierModeActiveStandby}}
+	transfer.ApplyDefaults()
+	streamID := tcpstream.StreamID{8}
+	token := tcpstream.ResumeToken{7, 8, 9}
+	stream := &tcpServerStream{
+		ready:       make(chan struct{}),
+		principal:   "client-a",
+		recoverable: true,
+		resumeToken: token,
+		generation:  1,
+	}
+	runtime := &tcpServerRuntime{
+		server:         New(config.Server{Transfer: transfer}, "test", nil),
+		ctx:            context.Background(),
+		streams:        map[tcpstream.StreamID]*tcpServerStream{streamID: stream},
+		pendingResumes: make(chan struct{}, transfer.TCP.MaxPendingResumes),
+	}
+	resumeClient, resumeServer := net.Pipe()
+	result := make(chan bool, 1)
+	go func() {
+		result <- runtime.acceptResume(resumeServer, tcpstream.MaxPayloadSize, "client-a", &tcpServerTraffic{}, tcpstream.NewResumeFrame(streamID, token, 2))
+	}()
+	waitForTCPServerCondition(t, func() bool {
+		return len(runtime.pendingResumes) == 1
+	}, "RESUME to wait for the initial stream")
+
+	targetEndpoint, targetPeer := net.Pipe()
+	stream.flow = tcpstream.NewFlow(streamID, targetEndpoint, tcpstream.DirectionServerToClient, runtime.flowConfigFor(true))
+	close(stream.ready)
+	setTCPServerTestDeadline(t, resumeClient)
+	frame, err := tcpstream.ReadFrame(resumeClient, tcpstream.MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tcpstream.ResumeResult(frame.Payload[0]) != tcpstream.ResumeResultSuccess || !<-result {
+		t.Fatalf("RESUME result = %#v, want success", frame)
+	}
+	stream.attachMu.Lock()
+	started := stream.started
+	generation := stream.generation
+	stream.attachMu.Unlock()
+	if !started || generation != 2 || stream.flow.State() != tcpstream.FlowStateActive {
+		t.Fatalf("resumed stream = started %v generation %d state %q", started, generation, stream.flow.State())
+	}
+	_ = resumeClient.Close()
+	_ = stream.flow.Close()
+	_ = targetPeer.Close()
+	runtime.recoveryWG.Wait()
+}
+
+func TestTCPServerRecoveryLimitFailsNewestFlowFirst(t *testing.T) {
+	transfer := config.Transfer{TCP: config.TCPTransfer{CarrierMode: config.TCPCarrierModeActiveStandby}}
+	transfer.ApplyDefaults()
+	transfer.TCP.MaxRecoveringStreams = 1
+	runtime := &tcpServerRuntime{
+		server:  New(config.Server{Transfer: transfer}, "test", nil),
+		streams: make(map[tcpstream.StreamID]*tcpServerStream),
+	}
+	oldFlow := newTCPServerRecoveringFlow(t, tcpstream.StreamID{1})
+	newFlow := newTCPServerRecoveringFlow(t, tcpstream.StreamID{2})
+	runtime.streams[tcpstream.StreamID{1}] = &tcpServerStream{recoverable: true, flow: oldFlow, order: 1}
+	runtime.streams[tcpstream.StreamID{2}] = &tcpServerStream{recoverable: true, flow: newFlow, order: 2}
+
+	runtime.enforceRecoveryLimits()
+	select {
+	case <-newFlow.Done():
+	case <-time.After(time.Second):
+		t.Fatal("newest server recovering flow was not failed at the limit")
+	}
+	if !errors.Is(newFlow.Err(), tcpstream.ErrNoCarriers) {
+		t.Fatalf("newest server flow error = %v, want ErrNoCarriers", newFlow.Err())
+	}
+	select {
+	case <-oldFlow.Done():
+		t.Fatal("oldest server recovering flow was failed before the newest flow")
+	default:
+	}
+}
+
+func newTCPServerRecoveringFlow(t *testing.T, streamID tcpstream.StreamID) *tcpstream.Flow {
+	t.Helper()
+	application, endpoint := net.Pipe()
+	carrierConn, peer := net.Pipe()
+	flow := tcpstream.NewFlow(streamID, endpoint, tcpstream.DirectionServerToClient, tcpstream.FlowConfig{
+		ChunkSize:          16,
+		CarrierQueueBytes:  1024,
+		ReorderWindowBytes: 1024,
+		RecoveryTimeout:    time.Minute,
+		SingleCarrier:      true,
+	})
+	carrier, err := flow.Attach(carrierConn, tcpstream.MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow.Start()
+	if err := carrier.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-carrier.Detached():
+	case <-time.After(time.Second):
+		t.Fatal("server carrier did not detach")
+	}
+	if flow.State() != tcpstream.FlowStateRecovering {
+		t.Fatalf("server flow state = %q, want recovering", flow.State())
+	}
+	t.Cleanup(func() {
+		_ = flow.Close()
+		_ = application.Close()
+		_ = peer.Close()
+	})
+	return flow
 }
 
 func TestOpenResultForDNSNotFoundIsHostUnreachable(t *testing.T) {
@@ -818,6 +1355,103 @@ func TestTCPServerMaxPendingStreamsRejectsExcessAndRecoversCapacity(t *testing.T
 	runtime.flowWG.Wait()
 }
 
+func TestTCPServerReservesDispatchCapacityForResume(t *testing.T) {
+	transfer := config.Transfer{TCP: config.TCPTransfer{CarrierMode: config.TCPCarrierModeActiveStandby}}
+	transfer.ApplyDefaults()
+	transfer.TCP.MaxPendingStreams = 1
+	runtime := &tcpServerRuntime{
+		server:         New(config.Server{Transfer: transfer}, "test", nil),
+		ctx:            context.Background(),
+		streams:        make(map[tcpstream.StreamID]*tcpServerStream),
+		closed:         make(map[tcpstream.StreamID]time.Time),
+		traffic:        make(map[string]*tcpServerTraffic),
+		pendingResumes: make(chan struct{}, transfer.TCP.MaxPendingResumes),
+		pendingStreams: 1,
+		pendingOpens:   1,
+	}
+	streamID := tcpstream.StreamID{41}
+	token := tcpstream.ResumeToken{4, 1}
+	flow := newTCPServerRecoveringFlow(t, streamID)
+	stream := &tcpServerStream{
+		ready:       make(chan struct{}),
+		principal:   "client-a",
+		flow:        flow,
+		started:     true,
+		recoverable: true,
+		resumeToken: token,
+		generation:  1,
+	}
+	close(stream.ready)
+	runtime.streams[streamID] = stream
+	traffic := &tcpServerTraffic{}
+
+	excessClient, excessServer := net.Pipe()
+	if !runtime.startSessionStreamWithCapability(excessServer, tcpstream.MaxPayloadSize, "client-a", traffic, true) {
+		t.Fatal("active dispatch reserve rejected a complete OPEN before reading it")
+	}
+	destination, err := tcpstream.ParseDestination("excess.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	excessOpen, err := (tcpstream.RecoverableOpen{
+		Destination:           destination,
+		ResumeToken:           tcpstream.ResumeToken{9},
+		Generation:            1,
+		RecoveryTimeoutMillis: uint32(transfer.TCP.ClientRecoveryTimeoutMillis),
+	}).Frame(tcpstream.StreamID{42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTCPServerTestDeadline(t, excessClient)
+	if err := tcpstream.WriteFrame(excessClient, excessOpen); err != nil {
+		t.Fatal(err)
+	}
+	excessResultFrame, err := tcpstream.ReadFrame(excessClient, tcpstream.MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	excessResult, err := tcpstream.DecodeRecoverableOpenResult(excessResultFrame)
+	if err != nil || excessResult.Result != tcpstream.OpenResultGeneralFailure {
+		t.Fatalf("excess OPEN result = %#v, error %v", excessResult, err)
+	}
+	_ = excessClient.Close()
+	waitForTCPServerCondition(t, func() bool {
+		runtime.mu.Lock()
+		defer runtime.mu.Unlock()
+		return runtime.pendingStreams == 1 && runtime.pendingOpens == 1
+	}, "OPEN dispatch reserve to be released")
+
+	resumeClient, resumeServer := net.Pipe()
+	if !runtime.startSessionStreamWithCapability(resumeServer, tcpstream.MaxPayloadSize, "client-a", traffic, true) {
+		t.Fatal("RESUME was rejected while OPEN capacity was occupied")
+	}
+	setTCPServerTestDeadline(t, resumeClient)
+	if err := tcpstream.WriteFrame(resumeClient, tcpstream.NewResumeFrame(streamID, token, 2)); err != nil {
+		t.Fatal(err)
+	}
+	resumeResult, err := tcpstream.ReadFrame(resumeClient, tcpstream.MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tcpstream.ResumeResult(resumeResult.Payload[0]) != tcpstream.ResumeResultSuccess {
+		t.Fatalf("RESUME result = %#v, want success", resumeResult)
+	}
+	waitForTCPServerCondition(t, func() bool {
+		stream.attachMu.Lock()
+		generation := stream.generation
+		stream.attachMu.Unlock()
+		return generation == 2 && flow.State() == tcpstream.FlowStateActive
+	}, "RESUME to use reserved dispatch capacity")
+	_ = resumeClient.Close()
+	_ = flow.Close()
+	runtime.streamWG.Wait()
+	runtime.recoveryWG.Wait()
+	runtime.mu.Lock()
+	runtime.pendingStreams = 0
+	runtime.pendingOpens = 0
+	runtime.mu.Unlock()
+}
+
 func TestTCPServerFailedInitialOpenDoesNotPoisonRedundantPath(t *testing.T) {
 	transfer := config.Transfer{}
 	transfer.ApplyDefaults()
@@ -1419,12 +2053,14 @@ func assertTCPServerRuntimeClean(t *testing.T, runtime *tcpServerRuntime) {
 	streams := len(runtime.streams)
 	closed := len(runtime.closed)
 	sessions := len(runtime.sessions)
+	probes := len(runtime.probes)
 	connections := len(runtime.connections)
 	traffic := len(runtime.traffic)
 	pendingStreams := runtime.pendingStreams
+	pendingOpens := runtime.pendingOpens
 	runtime.mu.Unlock()
-	if streams != 0 || closed != 0 || sessions != 0 || connections != 0 || traffic != 0 || len(runtime.pending) != 0 || pendingStreams != 0 {
-		t.Fatalf("streams/closed/sessions/connections/traffic/pending/pendingStreams = %d/%d/%d/%d/%d/%d/%d, want all zero", streams, closed, sessions, connections, traffic, len(runtime.pending), pendingStreams)
+	if streams != 0 || closed != 0 || sessions != 0 || probes != 0 || connections != 0 || traffic != 0 || len(runtime.pending) != 0 || pendingStreams != 0 || pendingOpens != 0 {
+		t.Fatalf("streams/closed/sessions/probes/connections/traffic/pending/pendingStreams/pendingOpens = %d/%d/%d/%d/%d/%d/%d/%d/%d, want all zero", streams, closed, sessions, probes, connections, traffic, len(runtime.pending), pendingStreams, pendingOpens)
 	}
 }
 
@@ -1438,4 +2074,11 @@ func waitForTCPServerCondition(t *testing.T, condition func() bool, description 
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", description)
+}
+
+func setTCPServerTestDeadline(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 }

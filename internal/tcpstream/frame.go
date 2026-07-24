@@ -10,13 +10,15 @@ import (
 )
 
 const (
-	Magic                   uint32 = 0x45475443
-	Version                 uint8  = 4
-	PrefaceSize                    = 16
-	HeaderSize                     = 32
-	MaxPayloadSize                 = 64 * 1024
-	PrefaceFlagAuthRequired uint8  = 1 << 0
-	prefaceKnownFlags              = PrefaceFlagAuthRequired
+	Magic                    uint32 = 0x45475443
+	Version                  uint8  = 4
+	PrefaceSize                     = 16
+	ActiveStandbyPrefaceSize        = 40
+	HeaderSize                      = 32
+	MaxPayloadSize                  = 64 * 1024
+	PrefaceFlagAuthRequired  uint8  = 1 << 0
+	PrefaceFlagActiveStandby uint8  = 1 << 1
+	prefaceKnownFlags               = PrefaceFlagAuthRequired | PrefaceFlagActiveStandby
 )
 
 type FrameType uint8
@@ -28,6 +30,18 @@ const (
 	FrameRST
 	FrameAck
 	FrameOpenResult
+	FrameRecoverableOpen
+	FrameRecoverableOpenResult
+	FrameResume
+	FrameResumeResult
+	FramePing
+	FramePong
+)
+
+const (
+	resumeTokenSize                 = 16
+	recoverableOpenFixedPayloadSize = resumeTokenSize + 4
+	recoverableOpenResultSize       = 5
 )
 
 type OpenResult uint8
@@ -44,6 +58,23 @@ const (
 
 type OpenError struct {
 	Result OpenResult
+}
+
+type ResumeResult uint8
+
+const (
+	ResumeResultSuccess ResumeResult = iota
+	ResumeResultRejected
+	ResumeResultBusy
+	ResumeResultExpired
+)
+
+type ResumeError struct {
+	Result ResumeResult
+}
+
+func (err *ResumeError) Error() string {
+	return fmt.Sprintf("TCP stream resume failed: result %d", err.Result)
 }
 
 func (err *OpenError) Error() string {
@@ -65,16 +96,47 @@ var (
 
 type StreamID [16]byte
 
+type ResumeToken [resumeTokenSize]byte
+
+type ServerInstanceID [16]byte
+
 func NewStreamID() (StreamID, error) {
 	var id StreamID
 	_, err := io.ReadFull(rand.Reader, id[:])
 	return id, err
 }
 
+func NewResumeToken() (ResumeToken, error) {
+	var token ResumeToken
+	_, err := io.ReadFull(rand.Reader, token[:])
+	return token, err
+}
+
+func NewServerInstanceID() (ServerInstanceID, error) {
+	var id ServerInstanceID
+	_, err := io.ReadFull(rand.Reader, id[:])
+	return id, err
+}
+
 type Preface struct {
-	Version    uint8
-	Flags      uint8
-	MaxPayload uint32
+	Version                     uint8
+	Flags                       uint8
+	MaxPayload                  uint32
+	ServerInstanceID            ServerInstanceID
+	ServerOrphanRetentionMillis uint32
+}
+
+type RecoverableOpen struct {
+	Destination           Destination
+	ResumeToken           ResumeToken
+	Generation            uint64
+	RecoveryTimeoutMillis uint32
+}
+
+type RecoverableOpenResult struct {
+	Result                      OpenResult
+	Generation                  uint64
+	ServerOrphanRetentionMillis uint32
 }
 
 type Frame struct {
@@ -106,34 +168,44 @@ func WritePreface(writer io.Writer, preface Preface) error {
 	if err != nil {
 		return err
 	}
-	return writeFull(writer, buffer[:])
+	return writeFull(writer, buffer)
 }
 
-func marshalPreface(preface Preface) ([PrefaceSize]byte, Preface, error) {
-	var buffer [PrefaceSize]byte
+func marshalPreface(preface Preface) ([]byte, Preface, error) {
 	version := preface.Version
 	if version == 0 {
 		version = Version
 	}
 	if version != Version {
-		return buffer, Preface{}, fmt.Errorf("%w: version %d", ErrInvalidPreface, version)
+		return nil, Preface{}, fmt.Errorf("%w: version %d", ErrInvalidPreface, version)
 	}
 	if preface.Flags & ^prefaceKnownFlags != 0 {
-		return buffer, Preface{}, fmt.Errorf("%w: flags %d", ErrInvalidPreface, preface.Flags)
+		return nil, Preface{}, fmt.Errorf("%w: flags %d", ErrInvalidPreface, preface.Flags)
 	}
 	maxPayload := preface.MaxPayload
 	if maxPayload == 0 {
 		maxPayload = MaxPayloadSize
 	}
 	if maxPayload > MaxPayloadSize {
-		return buffer, Preface{}, fmt.Errorf("%w: max payload %d", ErrInvalidPreface, maxPayload)
+		return nil, Preface{}, fmt.Errorf("%w: max payload %d", ErrInvalidPreface, maxPayload)
 	}
+	size := PrefaceSize
+	if preface.Flags&PrefaceFlagActiveStandby != 0 {
+		size = ActiveStandbyPrefaceSize
+	}
+	buffer := make([]byte, size)
 	binary.BigEndian.PutUint32(buffer[0:4], Magic)
 	buffer[4] = version
 	buffer[5] = preface.Flags
-	binary.BigEndian.PutUint16(buffer[6:8], PrefaceSize)
+	binary.BigEndian.PutUint16(buffer[6:8], uint16(size))
 	binary.BigEndian.PutUint32(buffer[8:12], maxPayload)
-	return buffer, Preface{Version: version, Flags: preface.Flags, MaxPayload: maxPayload}, nil
+	if size == ActiveStandbyPrefaceSize {
+		copy(buffer[16:32], preface.ServerInstanceID[:])
+		binary.BigEndian.PutUint32(buffer[32:36], preface.ServerOrphanRetentionMillis)
+	}
+	preface.Version = version
+	preface.MaxPayload = maxPayload
+	return buffer, preface, nil
 }
 
 func ReadPreface(reader io.Reader) (Preface, error) {
@@ -141,13 +213,100 @@ func ReadPreface(reader io.Reader) (Preface, error) {
 	if _, err := io.ReadFull(reader, buffer); err != nil {
 		return Preface{}, err
 	}
+	flags := buffer[5]
+	size := int(binary.BigEndian.Uint16(buffer[6:8]))
+	wantSize := PrefaceSize
+	if flags&PrefaceFlagActiveStandby != 0 {
+		wantSize = ActiveStandbyPrefaceSize
+	}
 	version := buffer[4]
 	maxPayload := binary.BigEndian.Uint32(buffer[8:12])
-	flags := buffer[5]
-	if binary.BigEndian.Uint32(buffer[0:4]) != Magic || version != Version || flags & ^prefaceKnownFlags != 0 || binary.BigEndian.Uint16(buffer[6:8]) != PrefaceSize || maxPayload == 0 || maxPayload > MaxPayloadSize || binary.BigEndian.Uint32(buffer[12:16]) != 0 {
+	if binary.BigEndian.Uint32(buffer[0:4]) != Magic || version != Version || flags&^prefaceKnownFlags != 0 || size != wantSize || maxPayload == 0 || maxPayload > MaxPayloadSize || binary.BigEndian.Uint32(buffer[12:16]) != 0 {
 		return Preface{}, ErrInvalidPreface
 	}
-	return Preface{Version: version, Flags: flags, MaxPayload: maxPayload}, nil
+	preface := Preface{Version: version, Flags: flags, MaxPayload: maxPayload}
+	if size > PrefaceSize {
+		extended := make([]byte, size-PrefaceSize)
+		if _, err := io.ReadFull(reader, extended); err != nil {
+			return Preface{}, err
+		}
+		copy(preface.ServerInstanceID[:], extended[0:16])
+		preface.ServerOrphanRetentionMillis = binary.BigEndian.Uint32(extended[16:20])
+		if binary.BigEndian.Uint32(extended[20:24]) != 0 {
+			return Preface{}, ErrInvalidPreface
+		}
+	}
+	return preface, nil
+}
+
+func (open RecoverableOpen) Frame(streamID StreamID) (Frame, error) {
+	destination, err := open.Destination.Encode()
+	if err != nil {
+		return Frame{}, err
+	}
+	payload := make([]byte, recoverableOpenFixedPayloadSize+len(destination))
+	copy(payload[:resumeTokenSize], open.ResumeToken[:])
+	binary.BigEndian.PutUint32(payload[resumeTokenSize:recoverableOpenFixedPayloadSize], open.RecoveryTimeoutMillis)
+	copy(payload[recoverableOpenFixedPayloadSize:], destination)
+	frame := Frame{Type: FrameRecoverableOpen, Direction: DirectionClientToServer, StreamID: streamID, Offset: open.Generation, Payload: payload}
+	if err := validateFrame(frame); err != nil {
+		return Frame{}, err
+	}
+	return frame, nil
+}
+
+func DecodeRecoverableOpen(frame Frame) (RecoverableOpen, error) {
+	if frame.Type != FrameRecoverableOpen || validateFrame(frame) != nil {
+		return RecoverableOpen{}, ErrInvalidFrame
+	}
+	destination, err := DecodeDestination(frame.Payload[recoverableOpenFixedPayloadSize:])
+	if err != nil {
+		return RecoverableOpen{}, ErrInvalidFrame
+	}
+	open := RecoverableOpen{
+		Destination:           destination,
+		Generation:            frame.Offset,
+		RecoveryTimeoutMillis: binary.BigEndian.Uint32(frame.Payload[resumeTokenSize:recoverableOpenFixedPayloadSize]),
+	}
+	copy(open.ResumeToken[:], frame.Payload[:resumeTokenSize])
+	return open, nil
+}
+
+func (result RecoverableOpenResult) Frame(streamID StreamID) Frame {
+	payload := make([]byte, recoverableOpenResultSize)
+	payload[0] = byte(result.Result)
+	binary.BigEndian.PutUint32(payload[1:5], result.ServerOrphanRetentionMillis)
+	return Frame{Type: FrameRecoverableOpenResult, Direction: DirectionServerToClient, StreamID: streamID, Offset: result.Generation, Payload: payload}
+}
+
+func DecodeRecoverableOpenResult(frame Frame) (RecoverableOpenResult, error) {
+	if frame.Type != FrameRecoverableOpenResult || validateFrame(frame) != nil {
+		return RecoverableOpenResult{}, ErrInvalidFrame
+	}
+	return RecoverableOpenResult{
+		Result:                      OpenResult(frame.Payload[0]),
+		Generation:                  frame.Offset,
+		ServerOrphanRetentionMillis: binary.BigEndian.Uint32(frame.Payload[1:5]),
+	}, nil
+}
+
+func NewResumeFrame(streamID StreamID, token ResumeToken, generation uint64) Frame {
+	payload := make([]byte, resumeTokenSize)
+	copy(payload, token[:])
+	return Frame{Type: FrameResume, Direction: DirectionClientToServer, StreamID: streamID, Offset: generation, Payload: payload}
+}
+
+func ResumeTokenFromFrame(frame Frame) (ResumeToken, error) {
+	if frame.Type != FrameResume || validateFrame(frame) != nil {
+		return ResumeToken{}, ErrInvalidFrame
+	}
+	var token ResumeToken
+	copy(token[:], frame.Payload)
+	return token, nil
+}
+
+func NewResumeResultFrame(streamID StreamID, generation uint64, result ResumeResult) Frame {
+	return Frame{Type: FrameResumeResult, Direction: DirectionServerToClient, StreamID: streamID, Offset: generation, Payload: []byte{byte(result)}}
 }
 
 func WriteFrame(writer io.Writer, frame Frame) error {
@@ -264,10 +423,52 @@ func validateFrame(frame Frame) error {
 		if frame.Direction != DirectionServerToClient || frame.Offset != 0 || frame.StreamID == (StreamID{}) || len(frame.Payload) != 1 || OpenResult(frame.Payload[0]) > OpenResultPolicyDenied {
 			return ErrInvalidFrame
 		}
+	case FrameRecoverableOpen:
+		if frame.Direction != DirectionClientToServer || frame.Offset != 1 || frame.StreamID == (StreamID{}) || len(frame.Payload) <= recoverableOpenFixedPayloadSize || frame.ResumeTokenZero() || binary.BigEndian.Uint32(frame.Payload[resumeTokenSize:recoverableOpenFixedPayloadSize]) == 0 {
+			return ErrInvalidFrame
+		}
+		if _, err := DecodeDestination(frame.Payload[recoverableOpenFixedPayloadSize:]); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidFrame, err)
+		}
+	case FrameRecoverableOpenResult:
+		if frame.Direction != DirectionServerToClient || frame.Offset == 0 || frame.StreamID == (StreamID{}) || len(frame.Payload) != recoverableOpenResultSize || OpenResult(frame.Payload[0]) > OpenResultPolicyDenied {
+			return ErrInvalidFrame
+		}
+		retention := binary.BigEndian.Uint32(frame.Payload[1:5])
+		if (OpenResult(frame.Payload[0]) == OpenResultSuccess) != (retention > 0) {
+			return ErrInvalidFrame
+		}
+	case FrameResume:
+		if frame.Direction != DirectionClientToServer || frame.Offset <= 1 || frame.StreamID == (StreamID{}) || len(frame.Payload) != resumeTokenSize || frame.ResumeTokenZero() {
+			return ErrInvalidFrame
+		}
+	case FrameResumeResult:
+		if frame.Direction != DirectionServerToClient || frame.Offset <= 1 || frame.StreamID == (StreamID{}) || len(frame.Payload) != 1 || ResumeResult(frame.Payload[0]) > ResumeResultExpired {
+			return ErrInvalidFrame
+		}
+	case FramePing:
+		if frame.Direction != DirectionClientToServer || frame.Offset == 0 || frame.StreamID != (StreamID{}) || len(frame.Payload) != 0 {
+			return ErrInvalidFrame
+		}
+	case FramePong:
+		if frame.Direction != DirectionServerToClient || frame.Offset == 0 || frame.StreamID != (StreamID{}) || len(frame.Payload) != 0 {
+			return ErrInvalidFrame
+		}
 	default:
 		return fmt.Errorf("%w: type %d", ErrInvalidFrame, frame.Type)
 	}
 	return nil
+}
+
+func (frame Frame) ResumeTokenZero() bool {
+	if len(frame.Payload) < resumeTokenSize {
+		return true
+	}
+	var combined byte
+	for _, value := range frame.Payload[:resumeTokenSize] {
+		combined |= value
+	}
+	return combined == 0
 }
 
 func writeFull(writer io.Writer, payload []byte) error {

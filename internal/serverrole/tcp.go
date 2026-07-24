@@ -3,6 +3,7 @@ package serverrole
 import (
 	"container/list"
 	"context"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"net"
@@ -49,10 +50,11 @@ const (
 )
 
 type tcpServerRuntime struct {
-	server   *Server
-	ctx      context.Context
-	cancel   context.CancelFunc
-	listener net.Listener
+	server     *Server
+	ctx        context.Context
+	cancel     context.CancelFunc
+	listener   net.Listener
+	instanceID tcpstream.ServerInstanceID
 
 	mu              sync.Mutex
 	closing         bool
@@ -61,15 +63,22 @@ type tcpServerRuntime struct {
 	closedOrder     *list.List
 	closedItems     map[tcpstream.StreamID]*list.Element
 	sessions        map[*tcpstream.Session]struct{}
+	probes          map[*tcpstream.Session]struct{}
 	connections     map[*tcpServerConn]struct{}
 	traffic         map[string]*tcpServerTraffic
 	inactiveTraffic *list.List
 	pending         chan struct{}
+	pendingResumes  chan struct{}
 	pendingStreams  int
+	pendingOpens    int
 	acceptWG        sync.WaitGroup
 	streamWG        sync.WaitGroup
 	flowWG          sync.WaitGroup
+	recoveryWG      sync.WaitGroup
+	probeWG         sync.WaitGroup
 	backgroundWG    sync.WaitGroup
+	recoveryMu      sync.Mutex
+	nextStreamOrder uint64
 }
 
 type tcpServerTraffic struct {
@@ -113,10 +122,22 @@ type tcpServerStream struct {
 	flow        *tcpstream.Flow
 	openTimer   tcpServerTimer
 	started     bool
+	recoverable bool
+	resumeToken tcpstream.ResumeToken
+	generation  uint64
+	order       uint64
 	err         error
 }
 
 func (server *Server) runTCP(ctx context.Context) error {
+	var instanceID tcpstream.ServerInstanceID
+	if server.cfg.Transfer.TCP.ActiveStandby() {
+		var err error
+		instanceID, err = tcpstream.NewServerInstanceID()
+		if err != nil {
+			return err
+		}
+	}
 	listener, err := listenTCP("tcp", server.cfg.ListenAddr)
 	if err != nil {
 		return err
@@ -127,17 +148,22 @@ func (server *Server) runTCP(ctx context.Context) error {
 		ctx:             runtimeCtx,
 		cancel:          cancel,
 		listener:        listener,
+		instanceID:      instanceID,
 		streams:         make(map[tcpstream.StreamID]*tcpServerStream),
 		closed:          make(map[tcpstream.StreamID]time.Time),
 		closedOrder:     list.New(),
 		closedItems:     make(map[tcpstream.StreamID]*list.Element),
 		sessions:        make(map[*tcpstream.Session]struct{}),
+		probes:          make(map[*tcpstream.Session]struct{}),
 		connections:     make(map[*tcpServerConn]struct{}),
 		traffic:         make(map[string]*tcpServerTraffic),
 		inactiveTraffic: list.New(),
 	}
 	if limit := server.cfg.Transfer.TCP.MaxPendingConnections; limit > 0 {
 		runtime.pending = make(chan struct{}, limit)
+	}
+	if server.cfg.Transfer.TCP.ActiveStandby() {
+		runtime.pendingResumes = make(chan struct{}, server.cfg.Transfer.TCP.MaxPendingResumes)
 	}
 	server.setTCPRuntime(runtime)
 	log.Info("Listening on " + server.cfg.ListenAddr + " over TCP")
@@ -230,6 +256,22 @@ func (runtime *tcpServerRuntime) releasePending() {
 	}
 }
 
+func (runtime *tcpServerRuntime) tryAcquireResume() bool {
+	if runtime.pendingResumes == nil {
+		return false
+	}
+	select {
+	case runtime.pendingResumes <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (runtime *tcpServerRuntime) releaseResume() {
+	<-runtime.pendingResumes
+}
+
 func (runtime *tcpServerRuntime) connectionClosed(conn *tcpServerConn) {
 	runtime.mu.Lock()
 	delete(runtime.connections, conn)
@@ -255,6 +297,7 @@ func (runtime *tcpServerRuntime) status() control.ServerStatus {
 	streams := make([]control.TCPStreamStatus, 0, streamCount)
 	streamIDs := make([]tcpstream.StreamID, 0, streamCount)
 	streamFlows := make([]*tcpstream.Flow, 0, streamCount)
+	streamSources := make([]*tcpServerStream, 0, streamCount)
 	for streamID, stream := range runtime.streams {
 		state := "connecting"
 		if stream.flow != nil {
@@ -266,9 +309,11 @@ func (runtime *tcpServerRuntime) status() control.ServerStatus {
 			Version:     stream.version,
 			Destination: stream.destination,
 			State:       state,
+			Recoverable: stream.recoverable,
 		})
 		streamIDs = append(streamIDs, streamID)
 		streamFlows = append(streamFlows, stream.flow)
+		streamSources = append(streamSources, stream)
 	}
 	sockets := make([]control.WebSocket, 0, len(runtime.traffic))
 	trafficSources := make([]*tcpServerTraffic, 0, len(runtime.traffic))
@@ -279,11 +324,20 @@ func (runtime *tcpServerRuntime) status() control.ServerStatus {
 	runtime.mu.Unlock()
 
 	carrierCount := 0
+	recovering := 0
 	for index := range streams {
 		streams[index].ID = hex.EncodeToString(streamIDs[index][:8])
+		streamSources[index].attachMu.Lock()
+		streams[index].Generation = streamSources[index].generation
+		streamSources[index].attachMu.Unlock()
 		if flow := streamFlows[index]; flow != nil {
 			streams[index].Carriers = tcpFlowCarrierCount(flow)
 			carrierCount += streams[index].Carriers
+			flowState := flow.State()
+			streams[index].State = string(flowState)
+			if flowState == tcpstream.FlowStateRecovering {
+				recovering++
+			}
 		}
 	}
 	sort.Slice(streams, func(left, right int) bool { return streams[left].ID < streams[right].ID })
@@ -300,6 +354,8 @@ func (runtime *tcpServerRuntime) status() control.ServerStatus {
 		Streams:         streamCount,
 		Carriers:        carrierCount,
 		Sessions:        sessionCount,
+		CarrierMode:     string(runtime.server.cfg.Transfer.TCP.CarrierMode),
+		Recovering:      recovering,
 		Sockets:         sockets,
 		TCPStreams:      streams,
 	}
@@ -370,7 +426,7 @@ func (runtime *tcpServerRuntime) acceptWithHandshakeDone(conn net.Conn, handshak
 		if err != nil {
 			return
 		}
-		if !runtime.startSessionStream(streamConn, maxPayload, principal, traffic) {
+		if !runtime.startSessionStreamForSession(streamConn, maxPayload, principal, traffic, session.ActiveStandby(), session) {
 			_ = streamConn.Close()
 			return
 		}
@@ -379,13 +435,30 @@ func (runtime *tcpServerRuntime) acceptWithHandshakeDone(conn net.Conn, handshak
 
 // startSessionStream reports whether the physical Session should keep accepting.
 func (runtime *tcpServerRuntime) startSessionStream(conn net.Conn, maxPayload uint32, principal string, traffic *tcpServerTraffic) bool {
+	return runtime.startSessionStreamWithCapability(conn, maxPayload, principal, traffic, false)
+}
+
+func (runtime *tcpServerRuntime) startSessionStreamWithCapability(conn net.Conn, maxPayload uint32, principal string, traffic *tcpServerTraffic, activeStandby bool) bool {
+	return runtime.startSessionStreamForSession(conn, maxPayload, principal, traffic, activeStandby, nil)
+}
+
+func (runtime *tcpServerRuntime) startSessionStreamForSession(conn net.Conn, maxPayload uint32, principal string, traffic *tcpServerTraffic, activeStandby bool, session *tcpstream.Session) bool {
 	runtime.mu.Lock()
 	if runtime.closing || runtime.ctx.Err() != nil {
 		runtime.mu.Unlock()
 		return false
 	}
-	maxPendingStreams := runtime.server.cfg.Transfer.TCP.MaxPendingStreams
-	if maxPendingStreams > 0 && runtime.pendingStreams >= maxPendingStreams {
+	maxPendingDispatch := runtime.server.cfg.Transfer.TCP.MaxPendingStreams
+	if activeStandby && maxPendingDispatch > 0 {
+		maxInt := int(^uint(0) >> 1)
+		resumeReserve := runtime.server.cfg.Transfer.TCP.MaxPendingResumes
+		if resumeReserve > maxInt-maxPendingDispatch {
+			maxPendingDispatch = maxInt
+		} else {
+			maxPendingDispatch += resumeReserve
+		}
+	}
+	if maxPendingDispatch > 0 && runtime.pendingStreams >= maxPendingDispatch {
 		runtime.mu.Unlock()
 		_ = conn.Close()
 		return true
@@ -400,12 +473,20 @@ func (runtime *tcpServerRuntime) startSessionStream(conn net.Conn, maxPayload ui
 			runtime.mu.Unlock()
 			runtime.streamWG.Done()
 		}()
-		runtime.acceptStream(conn, maxPayload, principal, traffic)
+		runtime.acceptStreamForSession(conn, maxPayload, principal, traffic, activeStandby, session)
 	}()
 	return true
 }
 
 func (runtime *tcpServerRuntime) acceptStream(conn net.Conn, maxPayload uint32, principal string, traffic *tcpServerTraffic) {
+	runtime.acceptStreamWithCapability(conn, maxPayload, principal, traffic, false)
+}
+
+func (runtime *tcpServerRuntime) acceptStreamWithCapability(conn net.Conn, maxPayload uint32, principal string, traffic *tcpServerTraffic, activeStandby bool) {
+	runtime.acceptStreamForSession(conn, maxPayload, principal, traffic, activeStandby, nil)
+}
+
+func (runtime *tcpServerRuntime) acceptStreamForSession(conn net.Conn, maxPayload uint32, principal string, traffic *tcpServerTraffic, activeStandby bool, session *tcpstream.Session) {
 	attached := false
 	defer func() {
 		if !attached {
@@ -417,58 +498,246 @@ func (runtime *tcpServerRuntime) acceptStream(conn net.Conn, maxPayload uint32, 
 		_ = conn.SetDeadline(time.Now().Add(openTimeout))
 	}
 	frame, err := tcpstream.ReadFrame(conn, maxPayload)
-	if err != nil || frame.Type != tcpstream.FrameOpen {
+	if err != nil {
 		return
 	}
 	traffic.Control.RecordRX(tcpstream.HeaderSize + len(frame.Payload))
 	_ = conn.SetDeadline(time.Time{})
+	switch frame.Type {
+	case tcpstream.FrameOpen:
+		if !activeStandby && runtime.tryAcquireOpen() {
+			attached = runtime.acceptLegacyOpen(conn, maxPayload, principal, traffic, frame)
+			runtime.releaseOpen()
+		} else {
+			runtime.writeOpenResult(conn, frame.StreamID, tcpstream.OpenResultGeneralFailure, traffic)
+		}
+	case tcpstream.FrameRecoverableOpen:
+		if activeStandby {
+			if runtime.tryAcquireOpen() {
+				attached = runtime.acceptRecoverableOpen(conn, maxPayload, principal, traffic, frame)
+				runtime.releaseOpen()
+			} else {
+				runtime.writeRecoverableOpenResult(conn, frame.StreamID, frame.Offset, tcpstream.OpenResultGeneralFailure, traffic)
+			}
+		}
+	case tcpstream.FrameResume:
+		if activeStandby {
+			attached = runtime.acceptResume(conn, maxPayload, principal, traffic, frame)
+		}
+	case tcpstream.FramePing:
+		if activeStandby && runtime.tryAcquireProbe(session) {
+			attached = true
+			runtime.probeWG.Add(1)
+			go func() {
+				defer runtime.probeWG.Done()
+				defer runtime.releaseProbe(session)
+				defer conn.Close()
+				runtime.acceptProbe(conn, maxPayload, traffic, frame)
+			}()
+		}
+	}
+}
 
+func (runtime *tcpServerRuntime) tryAcquireProbe(session *tcpstream.Session) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.probes == nil {
+		runtime.probes = make(map[*tcpstream.Session]struct{})
+	}
+	if _, exists := runtime.probes[session]; exists {
+		return false
+	}
+	runtime.probes[session] = struct{}{}
+	return true
+}
+
+func (runtime *tcpServerRuntime) releaseProbe(session *tcpstream.Session) {
+	runtime.mu.Lock()
+	delete(runtime.probes, session)
+	runtime.mu.Unlock()
+}
+
+func (runtime *tcpServerRuntime) tryAcquireOpen() bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	limit := runtime.server.cfg.Transfer.TCP.MaxPendingStreams
+	if limit > 0 && runtime.pendingOpens >= limit {
+		return false
+	}
+	runtime.pendingOpens++
+	return true
+}
+
+func (runtime *tcpServerRuntime) releaseOpen() {
+	runtime.mu.Lock()
+	if runtime.pendingOpens > 0 {
+		runtime.pendingOpens--
+	}
+	runtime.mu.Unlock()
+}
+
+func (runtime *tcpServerRuntime) acceptProbe(conn net.Conn, maxPayload uint32, traffic *tcpServerTraffic, frame tcpstream.Frame) {
+	for {
+		if frame.Type != tcpstream.FramePing || !runtime.writeServerFrame(conn, tcpstream.Frame{Type: tcpstream.FramePong, Direction: tcpstream.DirectionServerToClient, Offset: frame.Offset}, traffic) {
+			return
+		}
+		var err error
+		frame, err = tcpstream.ReadFrame(conn, maxPayload)
+		if err != nil {
+			return
+		}
+		traffic.Control.RecordRX(tcpstream.HeaderSize + len(frame.Payload))
+	}
+}
+
+func (runtime *tcpServerRuntime) acceptLegacyOpen(conn net.Conn, maxPayload uint32, principal string, traffic *tcpServerTraffic, frame tcpstream.Frame) bool {
 	destination, err := runtime.destinationForOpen(frame)
 	if err != nil {
 		runtime.writeOpenResult(conn, frame.StreamID, tcpstream.OpenResultPolicyDenied, traffic)
-		conn.Close()
-		return
+		return false
 	}
-	stream, err := runtime.getOrCreate(frame.StreamID, tcpstream.Version, destination, principal)
+	stream, err := runtime.getOrCreateMode(frame.StreamID, tcpstream.Version, destination, principal, false, tcpstream.ResumeToken{})
 	if err != nil {
 		runtime.writeOpenResult(conn, frame.StreamID, openResultForError(err), traffic)
-		conn.Close()
-		return
+		return false
 	}
 	stream.attachMu.Lock()
 	defer stream.attachMu.Unlock()
 	if runtime.isClosing() {
 		runtime.writeOpenResult(conn, frame.StreamID, tcpstream.OpenResultGeneralFailure, traffic)
-		_ = conn.Close()
-		return
+		return false
 	}
-	select {
-	case <-stream.flow.Done():
+	if tcpFlowTerminal(stream.flow) {
 		runtime.writeOpenResult(conn, frame.StreamID, tcpstream.OpenResultGeneralFailure, traffic)
-		conn.Close()
-		return
-	default:
+		return false
 	}
 	maxCarriers := runtime.server.cfg.Transfer.TCP.MaxCarriersPerStream
 	if maxCarriers > 0 && stream.flow.CarrierCount() >= maxCarriers {
 		runtime.writeOpenResult(conn, frame.StreamID, tcpstream.OpenResultGeneralFailure, traffic)
-		conn.Close()
-		return
+		return false
 	}
 	if !runtime.writeOpenResult(conn, frame.StreamID, tcpstream.OpenResultSuccess, traffic) {
-		conn.Close()
-		return
+		return false
 	}
 	if _, err := stream.flow.AttachLimitedObserved(conn, maxPayload, runtime.server.cfg.Transfer.TCP.MaxCarriersPerStream, tcpCarrierObserver(traffic)); err != nil {
-		return
+		return false
 	}
-	attached = true
 	stream.started = true
 	if stream.openTimer != nil {
 		stream.openTimer.Stop()
 		stream.openTimer = nil
 	}
 	stream.flow.Start()
+	return true
+}
+
+func (runtime *tcpServerRuntime) acceptRecoverableOpen(conn net.Conn, maxPayload uint32, principal string, traffic *tcpServerTraffic, frame tcpstream.Frame) bool {
+	open, err := tcpstream.DecodeRecoverableOpen(frame)
+	if err != nil {
+		return false
+	}
+	requestedRecovery := time.Duration(open.RecoveryTimeoutMillis) * time.Millisecond
+	serverRetention := time.Duration(runtime.server.cfg.Transfer.TCP.ServerOrphanRetentionMillis) * time.Millisecond
+	if requestedRecovery > serverRetention {
+		runtime.writeRecoverableOpenResult(conn, frame.StreamID, frame.Offset, tcpstream.OpenResultGeneralFailure, traffic)
+		return false
+	}
+	if !runtime.recoveryCapacityAvailable() {
+		runtime.writeRecoverableOpenResult(conn, frame.StreamID, frame.Offset, tcpstream.OpenResultGeneralFailure, traffic)
+		return false
+	}
+	destination := open.Destination.String()
+	stream, err := runtime.getOrCreateMode(frame.StreamID, tcpstream.Version, destination, principal, true, open.ResumeToken)
+	if err != nil {
+		runtime.writeRecoverableOpenResult(conn, frame.StreamID, frame.Offset, openResultForError(err), traffic)
+		return false
+	}
+	stream.attachMu.Lock()
+	defer stream.attachMu.Unlock()
+	if runtime.isClosing() || stream.started || stream.generation != frame.Offset {
+		runtime.writeRecoverableOpenResult(conn, frame.StreamID, frame.Offset, tcpstream.OpenResultGeneralFailure, traffic)
+		return false
+	}
+	if tcpFlowTerminal(stream.flow) {
+		runtime.writeRecoverableOpenResult(conn, frame.StreamID, frame.Offset, tcpstream.OpenResultGeneralFailure, traffic)
+		return false
+	}
+	if !runtime.writeRecoverableOpenResult(conn, frame.StreamID, frame.Offset, tcpstream.OpenResultSuccess, traffic) {
+		return false
+	}
+	carrier, err := stream.flow.AttachLimitedObserved(conn, maxPayload, 1, tcpCarrierObserver(traffic))
+	if err != nil {
+		return false
+	}
+	stream.started = true
+	if stream.openTimer != nil {
+		stream.openTimer.Stop()
+		stream.openTimer = nil
+	}
+	stream.flow.Start()
+	runtime.monitorRecoverableCarrier(stream, carrier)
+	return true
+}
+
+func (runtime *tcpServerRuntime) acceptResume(conn net.Conn, maxPayload uint32, principal string, traffic *tcpServerTraffic, frame tcpstream.Frame) bool {
+	if !runtime.tryAcquireResume() {
+		runtime.writeResumeResult(conn, frame.StreamID, frame.Offset, tcpstream.ResumeResultBusy, traffic)
+		return false
+	}
+	defer runtime.releaseResume()
+	token, err := tcpstream.ResumeTokenFromFrame(frame)
+	if err != nil {
+		return false
+	}
+	runtime.mu.Lock()
+	stream := runtime.streams[frame.StreamID]
+	runtime.mu.Unlock()
+	if stream == nil {
+		runtime.writeResumeResult(conn, frame.StreamID, frame.Offset, tcpstream.ResumeResultExpired, traffic)
+		return false
+	}
+	select {
+	case <-stream.ready:
+	case <-runtime.ctx.Done():
+		runtime.writeResumeResult(conn, frame.StreamID, frame.Offset, tcpstream.ResumeResultBusy, traffic)
+		return false
+	}
+	stream.attachMu.Lock()
+	defer stream.attachMu.Unlock()
+	if runtime.isClosing() {
+		runtime.writeResumeResult(conn, frame.StreamID, frame.Offset, tcpstream.ResumeResultBusy, traffic)
+		return false
+	}
+	if stream.err != nil || stream.flow == nil {
+		runtime.writeResumeResult(conn, frame.StreamID, frame.Offset, tcpstream.ResumeResultExpired, traffic)
+		return false
+	}
+	if !stream.recoverable || stream.principal != principal || subtle.ConstantTimeCompare(stream.resumeToken[:], token[:]) != 1 || frame.Offset <= stream.generation {
+		runtime.writeResumeResult(conn, frame.StreamID, frame.Offset, tcpstream.ResumeResultRejected, traffic)
+		return false
+	}
+	if tcpFlowTerminal(stream.flow) {
+		runtime.writeResumeResult(conn, frame.StreamID, frame.Offset, tcpstream.ResumeResultExpired, traffic)
+		return false
+	}
+	if !runtime.writeResumeResult(conn, frame.StreamID, frame.Offset, tcpstream.ResumeResultSuccess, traffic) {
+		return false
+	}
+	carrier, err := stream.flow.ReplaceObserved(conn, maxPayload, frame.Offset, tcpCarrierObserver(traffic))
+	if err != nil {
+		return false
+	}
+	stream.generation = frame.Offset
+	if !stream.started {
+		stream.started = true
+		if stream.openTimer != nil {
+			stream.openTimer.Stop()
+			stream.openTimer = nil
+		}
+		stream.flow.Start()
+	}
+	runtime.monitorRecoverableCarrier(stream, carrier)
+	return true
 }
 
 func (runtime *tcpServerRuntime) destinationForOpen(frame tcpstream.Frame) (string, error) {
@@ -481,6 +750,23 @@ func (runtime *tcpServerRuntime) destinationForOpen(frame tcpstream.Frame) (stri
 
 func (runtime *tcpServerRuntime) writeOpenResult(conn net.Conn, streamID tcpstream.StreamID, result tcpstream.OpenResult, traffic *tcpServerTraffic) bool {
 	frame := tcpstream.Frame{Type: tcpstream.FrameOpenResult, Direction: tcpstream.DirectionServerToClient, StreamID: streamID, Payload: []byte{byte(result)}}
+	return runtime.writeServerFrame(conn, frame, traffic)
+}
+
+func (runtime *tcpServerRuntime) writeRecoverableOpenResult(conn net.Conn, streamID tcpstream.StreamID, generation uint64, result tcpstream.OpenResult, traffic *tcpServerTraffic) bool {
+	retentionMillis := uint32(0)
+	if result == tcpstream.OpenResultSuccess {
+		retentionMillis = uint32(runtime.server.cfg.Transfer.TCP.ServerOrphanRetentionMillis)
+	}
+	frame := (tcpstream.RecoverableOpenResult{Result: result, Generation: generation, ServerOrphanRetentionMillis: retentionMillis}).Frame(streamID)
+	return runtime.writeServerFrame(conn, frame, traffic)
+}
+
+func (runtime *tcpServerRuntime) writeResumeResult(conn net.Conn, streamID tcpstream.StreamID, generation uint64, result tcpstream.ResumeResult, traffic *tcpServerTraffic) bool {
+	return runtime.writeServerFrame(conn, tcpstream.NewResumeResultFrame(streamID, generation, result), traffic)
+}
+
+func (runtime *tcpServerRuntime) writeServerFrame(conn net.Conn, frame tcpstream.Frame, traffic *tcpServerTraffic) bool {
 	_ = conn.SetWriteDeadline(time.Now().Add(time.Duration(runtime.server.cfg.Transfer.TCP.WriteTimeoutMillis) * time.Millisecond))
 	if err := tcpstream.WriteFrame(conn, frame); err != nil {
 		traffic.Control.RecordDrop(tcpstream.HeaderSize + len(frame.Payload))
@@ -757,6 +1043,10 @@ func recordTCPFrameTX(traffic *stats.Traffic, frame tcpstream.Frame) {
 }
 
 func (runtime *tcpServerRuntime) getOrCreate(streamID tcpstream.StreamID, version uint8, destination, principal string) (*tcpServerStream, error) {
+	return runtime.getOrCreateMode(streamID, version, destination, principal, false, tcpstream.ResumeToken{})
+}
+
+func (runtime *tcpServerRuntime) getOrCreateMode(streamID tcpstream.StreamID, version uint8, destination, principal string, recoverable bool, resumeToken tcpstream.ResumeToken) (*tcpServerStream, error) {
 	runtime.mu.Lock()
 	now := time.Now()
 	if runtime.closing || runtime.ctx.Err() != nil {
@@ -772,9 +1062,13 @@ func (runtime *tcpServerRuntime) getOrCreate(streamID tcpstream.StreamID, versio
 		runtime.removeClosedLocked(streamID)
 	}
 	if stream, ok := runtime.streams[streamID]; ok {
-		if stream.version != version || stream.destination != destination || stream.principal != principal {
+		if stream.version != version || stream.destination != destination || stream.principal != principal || stream.recoverable != recoverable {
 			runtime.mu.Unlock()
 			return nil, errors.New("TCP stream destination mismatch")
+		}
+		if recoverable {
+			runtime.mu.Unlock()
+			return nil, errors.New("recoverable TCP stream already exists")
 		}
 		runtime.mu.Unlock()
 		select {
@@ -789,7 +1083,19 @@ func (runtime *tcpServerRuntime) getOrCreate(streamID tcpstream.StreamID, versio
 		runtime.mu.Unlock()
 		return nil, errors.New("maximum TCP streams reached")
 	}
-	stream := &tcpServerStream{ready: make(chan struct{}), version: version, destination: destination, principal: principal}
+	stream := &tcpServerStream{
+		ready:       make(chan struct{}),
+		version:     version,
+		destination: destination,
+		principal:   principal,
+		recoverable: recoverable,
+		resumeToken: resumeToken,
+	}
+	runtime.nextStreamOrder++
+	stream.order = runtime.nextStreamOrder
+	if recoverable {
+		stream.generation = 1
+	}
 	runtime.streams[streamID] = stream
 	runtime.mu.Unlock()
 
@@ -814,7 +1120,7 @@ func (runtime *tcpServerRuntime) getOrCreate(streamID tcpstream.StreamID, versio
 		_ = endpoint.Close()
 		return nil, stream.err
 	}
-	flow := tcpstream.NewFlow(streamID, endpoint, tcpstream.DirectionServerToClient, runtime.flowConfig())
+	flow := tcpstream.NewFlow(streamID, endpoint, tcpstream.DirectionServerToClient, runtime.flowConfigFor(recoverable))
 	stream.flow = flow
 	openTimeout := time.Duration(runtime.server.cfg.Transfer.TCP.OpenTimeoutMillis) * time.Millisecond
 	if openTimeout > 0 {
@@ -855,12 +1161,83 @@ func (runtime *tcpServerRuntime) expireUnstartedStream(stream *tcpServerStream) 
 	if stream.started || stream.flow == nil {
 		return
 	}
-	select {
-	case <-stream.flow.Done():
+	if tcpFlowTerminal(stream.flow) {
 		return
-	default:
-		stream.flow.Reset(errTCPStreamOpenTimeout)
 	}
+	stream.flow.Reset(errTCPStreamOpenTimeout)
+}
+
+func tcpFlowTerminal(flow *tcpstream.Flow) bool {
+	if flow == nil {
+		return true
+	}
+	state := flow.State()
+	return state == tcpstream.FlowStateCompleted || state == tcpstream.FlowStateFailed
+}
+
+func (runtime *tcpServerRuntime) monitorRecoverableCarrier(stream *tcpServerStream, carrier *tcpstream.Carrier) {
+	runtime.recoveryWG.Add(1)
+	go func() {
+		defer runtime.recoveryWG.Done()
+		<-carrier.Detached()
+		if stream.flow.State() == tcpstream.FlowStateRecovering {
+			runtime.enforceRecoveryLimits()
+		}
+	}()
+}
+
+type tcpServerRecoveringStream struct {
+	flow         *tcpstream.Flow
+	order        uint64
+	historyBytes int64
+}
+
+func (runtime *tcpServerRuntime) recoveryCapacityAvailable() bool {
+	tcpConfig := runtime.server.cfg.Transfer.TCP
+	runtime.recoveryMu.Lock()
+	defer runtime.recoveryMu.Unlock()
+	streams, bytes := runtime.recoveringStreams()
+	return len(streams) < tcpConfig.MaxRecoveringStreams && bytes < tcpConfig.MaxRecoveryBytes
+}
+
+func (runtime *tcpServerRuntime) enforceRecoveryLimits() {
+	tcpConfig := runtime.server.cfg.Transfer.TCP
+	runtime.recoveryMu.Lock()
+	defer runtime.recoveryMu.Unlock()
+	streams, totalBytes := runtime.recoveringStreams()
+	if len(streams) <= tcpConfig.MaxRecoveringStreams && totalBytes <= tcpConfig.MaxRecoveryBytes {
+		return
+	}
+	sort.Slice(streams, func(left, right int) bool { return streams[left].order > streams[right].order })
+	remaining := len(streams)
+	for _, stream := range streams {
+		if remaining <= tcpConfig.MaxRecoveringStreams && totalBytes <= tcpConfig.MaxRecoveryBytes {
+			break
+		}
+		stream.flow.Reset(tcpstream.ErrNoCarriers)
+		totalBytes -= stream.historyBytes
+		remaining--
+	}
+}
+
+func (runtime *tcpServerRuntime) recoveringStreams() ([]tcpServerRecoveringStream, int64) {
+	runtime.mu.Lock()
+	streams := make([]*tcpServerStream, 0, len(runtime.streams))
+	for _, stream := range runtime.streams {
+		streams = append(streams, stream)
+	}
+	runtime.mu.Unlock()
+	recovering := make([]tcpServerRecoveringStream, 0, len(streams))
+	var totalBytes int64
+	for _, stream := range streams {
+		if !stream.recoverable || stream.flow == nil || stream.flow.State() != tcpstream.FlowStateRecovering {
+			continue
+		}
+		historyBytes := int64(stream.flow.HistoryBytes())
+		recovering = append(recovering, tcpServerRecoveringStream{flow: stream.flow, order: stream.order, historyBytes: historyBytes})
+		totalBytes += historyBytes
+	}
+	return recovering, totalBytes
 }
 
 func openResultForError(err error) tcpstream.OpenResult {
@@ -880,13 +1257,22 @@ func openResultForError(err error) tcpstream.OpenResult {
 }
 
 func (runtime *tcpServerRuntime) flowConfig() tcpstream.FlowConfig {
+	return runtime.flowConfigFor(runtime.server.cfg.Transfer.TCP.ActiveStandby())
+}
+
+func (runtime *tcpServerRuntime) flowConfigFor(activeStandby bool) tcpstream.FlowConfig {
 	tcpConfig := runtime.server.cfg.Transfer.TCP
-	return tcpstream.FlowConfig{
+	flowConfig := tcpstream.FlowConfig{
 		ChunkSize:          tcpConfig.ChunkSize,
 		CarrierQueueBytes:  tcpConfig.CarrierQueueBytes,
 		ReorderWindowBytes: tcpConfig.ReorderWindowBytes,
 		WriteTimeout:       time.Duration(tcpConfig.WriteTimeoutMillis) * time.Millisecond,
 	}
+	if activeStandby {
+		flowConfig.RecoveryTimeout = time.Duration(tcpConfig.ServerOrphanRetentionMillis) * time.Millisecond
+		flowConfig.SingleCarrier = true
+	}
+	return flowConfig
 }
 
 func (runtime *tcpServerRuntime) sessionConfig() tcpstream.SessionConfig {
@@ -896,6 +1282,9 @@ func (runtime *tcpServerRuntime) sessionConfig() tcpstream.SessionConfig {
 		KeepaliveTimeout:  time.Duration(transfer.KeepaliveTimeoutMillis) * time.Millisecond,
 		ReceiveBuffer:     transfer.TCP.ReorderWindowBytes,
 		StreamBuffer:      transfer.TCP.CarrierQueueBytes,
+		ActiveStandby:     transfer.TCP.ActiveStandby(),
+		ServerInstanceID:  runtime.instanceID,
+		OrphanRetention:   time.Duration(transfer.TCP.ServerOrphanRetentionMillis) * time.Millisecond,
 	}
 }
 
@@ -947,6 +1336,8 @@ func (runtime *tcpServerRuntime) shutdown() {
 	}
 	runtime.acceptWG.Wait()
 	runtime.streamWG.Wait()
+	runtime.probeWG.Wait()
+	runtime.recoveryWG.Wait()
 	runtime.flowWG.Wait()
 	runtime.backgroundWG.Wait()
 	runtime.mu.Lock()
@@ -955,7 +1346,9 @@ func (runtime *tcpServerRuntime) shutdown() {
 	runtime.closedOrder = list.New()
 	runtime.closedItems = make(map[tcpstream.StreamID]*list.Element)
 	runtime.sessions = make(map[*tcpstream.Session]struct{})
+	runtime.probes = make(map[*tcpstream.Session]struct{})
 	runtime.pendingStreams = 0
+	runtime.pendingOpens = 0
 	runtime.connections = make(map[*tcpServerConn]struct{})
 	runtime.traffic = make(map[string]*tcpServerTraffic)
 	runtime.inactiveTraffic = list.New()

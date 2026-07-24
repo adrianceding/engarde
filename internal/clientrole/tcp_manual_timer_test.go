@@ -128,3 +128,12 @@ func installTCPManualFlowOpenTimer(t *testing.T) *tcpManualTimerFactory {
 	t.Cleanup(func() { newTCPFlowOpenTimer = previousTimer })
 	return factory
 }
+
+func installTCPManualSessionProbeTimer(t *testing.T) *tcpManualTimerFactory {
+	t.Helper()
+	factory := newTCPManualTimerFactory()
+	previousTimer := newTCPSessionProbeTimer
+	newTCPSessionProbeTimer = factory.newTimer
+	t.Cleanup(func() { newTCPSessionProbeTimer = previousTimer })
+	return factory
+}

@@ -632,6 +632,200 @@ func TestTCPSessionRetryStabilityBoundary(t *testing.T) {
 	}
 }
 
+func TestTCPSessionProbeProtocolErrorClassification(t *testing.T) {
+	if !tcpSessionProbeProtocolError(tcpstream.ErrInvalidFrame) {
+		t.Fatal("ErrInvalidFrame was not classified as a Session-level probe error")
+	}
+	if !tcpSessionProbeProtocolError(fmt.Errorf("wrapped: %w", tcpstream.ErrPayloadLength)) {
+		t.Fatal("wrapped ErrPayloadLength was not classified as a Session-level probe error")
+	}
+	if tcpSessionProbeProtocolError(errors.New("stream I/O failure")) {
+		t.Fatal("ordinary stream I/O failure was classified as a Session-level probe error")
+	}
+}
+
+func TestTCPPathSessionZeroProbeRTTRefreshesHealthWithoutBiasingScore(t *testing.T) {
+	path := tcpClientPath{index: 1, address: "192.0.2.1", destination: "198.51.100.1:59501"}
+	session := newActiveSelectionSession(t, tcpstream.ServerInstanceID{1})
+	probe := &tcpstream.SessionProbe{}
+	pathSession := &tcpPathSession{
+		path:    path,
+		session: session,
+		probe:   probe,
+	}
+	probedAt := time.Unix(100, 0)
+
+	if !pathSession.recordProbeRTT(session, probe, 0, probedAt) {
+		t.Fatal("successful zero-duration probe was rejected")
+	}
+	status := pathSession.qualityStatus(path, config.InterfaceCostNormal, probedAt)
+	if status.state != "healthy" {
+		t.Fatalf("quality state = %q, want healthy", status.state)
+	}
+	if status.rttMillis != 100 || status.jitterMillis != 0 || status.scoreMillis != 100 {
+		t.Fatalf("quality RTT/jitter/score = %.3f/%.3f/%.3fms, want 100/0/100ms fallback", status.rttMillis, status.jitterMillis, status.scoreMillis)
+	}
+
+	pathSession.mu.Lock()
+	pathSession.rttEWMA = float64(25 * time.Millisecond)
+	pathSession.jitterEWMA = float64(5 * time.Millisecond)
+	pathSession.lastProbe = time.Time{}
+	pathSession.mu.Unlock()
+	probedAt = probedAt.Add(time.Second)
+	if !pathSession.recordProbeRTT(session, probe, 0, probedAt) {
+		t.Fatal("second successful zero-duration probe was rejected")
+	}
+	status = pathSession.qualityStatus(path, config.InterfaceCostNormal, probedAt)
+	if status.rttMillis != 25 || status.jitterMillis != 5 {
+		t.Fatalf("quality RTT/jitter = %.3f/%.3fms, want 25/5ms", status.rttMillis, status.jitterMillis)
+	}
+	pathSession.mu.Lock()
+	lastProbe := pathSession.lastProbe
+	pathSession.mu.Unlock()
+	if !lastProbe.Equal(probedAt) {
+		t.Fatalf("last probe = %v, want %v", lastProbe, probedAt)
+	}
+}
+
+func TestTCPPathSessionProbeFailureDoesNotReplaceSession(t *testing.T) {
+	probeTimers := installTCPManualSessionProbeTimer(t)
+	retryTimers := installTCPManualSessionRetryTimer(t)
+	runtime := newTCPSessionManagerTestRuntime(t)
+	runtime.client.cfg.Transfer.TCP.CarrierMode = config.TCPCarrierModeActiveStandby
+	runtime.client.cfg.Transfer.ApplyDefaults()
+	path := tcpClientPath{index: 1, address: "192.0.2.1", destination: "198.51.100.1:59501"}
+
+	events := make(chan string, 4)
+	serverReady := make(chan error, 1)
+	serverDone := make(chan error, 1)
+	originalDial := dialTCPOnInterface
+	var dialCount atomic.Int32
+	dialTCPOnInterface = func(context.Context, string, string, string, time.Duration) (net.Conn, error) {
+		if dialCount.Add(1) != 1 {
+			return nil, errors.New("unexpected physical redial")
+		}
+		clientConn, serverConn := net.Pipe()
+		go func() {
+			serverConfig := runtime.sessionConfig()
+			serverConfig.ServerInstanceID = tcpstream.ServerInstanceID{1}
+			serverConfig.OrphanRetention = time.Duration(runtime.client.cfg.Transfer.TCP.ServerOrphanRetentionMillis) * time.Millisecond
+			session, _, err := tcpstream.AcceptSession(serverConn, tcpstream.MaxPayloadSize, time.Second, serverConfig, nil)
+			serverReady <- err
+			if err != nil {
+				serverDone <- err
+				return
+			}
+			defer session.Close()
+			serverDone <- serveTCPSessionManagerProbeScript(session, events)
+		}()
+		return clientConn, nil
+	}
+	t.Cleanup(func() { dialTCPOnInterface = originalDial })
+
+	runtime.refreshCarrierGroups(map[string]tcpClientPath{"path-a": path})
+	select {
+	case err := <-serverReady:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(tcpSessionManagerTestTimeout):
+		t.Fatal("timed out waiting for active-standby Session handshake")
+	}
+	waitTCPSessionManagerProbeEvent(t, events, "initial-failure")
+	pathSession := runtime.sessions["path-a"]
+	waitTCPSessionManagerCondition(t, func() bool {
+		session, generation, available := pathSession.current(path)
+		pathSession.mu.Lock()
+		probe := pathSession.probe
+		pathSession.mu.Unlock()
+		return available && session != nil && generation == 1 && probe == nil
+	})
+	physicalSession, generation, available := pathSession.current(path)
+	if !available || generation != 1 {
+		t.Fatalf("initial Session availability/generation = %v/%d, want true/1", available, generation)
+	}
+	if quality := pathSession.qualityStatus(path, config.InterfaceCostNormal, tcpRetryNow()); quality.state != "degraded" {
+		t.Fatalf("quality after initial probe failure = %q, want degraded", quality.state)
+	}
+	if physicalSession.IsClosed() || dialCount.Load() != 1 {
+		t.Fatalf("initial probe failure closed/redialed Session = %v/%d, want false/1", physicalSession.IsClosed(), dialCount.Load())
+	}
+	retryTimers.assertNoPending(t)
+
+	firstRetry := probeTimers.next(t)
+	if firstRetry.delay != tcpSessionProbeStandbyInterval {
+		t.Fatalf("first probe retry delay = %v, want %v", firstRetry.delay, tcpSessionProbeStandbyInterval)
+	}
+	firstRetry.fire(t)
+	waitTCPSessionManagerProbeEvent(t, events, "first-recovery")
+	var firstReplacement *tcpstream.SessionProbe
+	waitTCPSessionManagerCondition(t, func() bool {
+		pathSession.mu.Lock()
+		firstReplacement = pathSession.probe
+		pathSession.mu.Unlock()
+		return firstReplacement != nil && pathSession.qualityStatus(path, config.InterfaceCostNormal, tcpRetryNow()).state == "healthy"
+	})
+
+	failedEstablishedProbe := probeTimers.next(t)
+	failedEstablishedProbe.fire(t)
+	waitTCPSessionManagerProbeEvent(t, events, "established-failure")
+	waitTCPSessionManagerCondition(t, func() bool {
+		pathSession.mu.Lock()
+		probe := pathSession.probe
+		pathSession.mu.Unlock()
+		return probe == nil && pathSession.qualityStatus(path, config.InterfaceCostNormal, tcpRetryNow()).state == "degraded"
+	})
+	currentSession, currentGeneration, currentAvailable := pathSession.current(path)
+	if !currentAvailable || currentSession != physicalSession || currentGeneration != generation || physicalSession.IsClosed() || dialCount.Load() != 1 {
+		t.Fatalf("Session after established probe failure = available %v/same %v/generation %d/closed %v/dials %d, want true/true/1/false/1", currentAvailable, currentSession == physicalSession, currentGeneration, physicalSession.IsClosed(), dialCount.Load())
+	}
+	retryTimers.assertNoPending(t)
+
+	secondRetry := probeTimers.next(t)
+	secondRetry.fire(t)
+	waitTCPSessionManagerProbeEvent(t, events, "second-recovery")
+	waitTCPSessionManagerCondition(t, func() bool {
+		pathSession.mu.Lock()
+		probe := pathSession.probe
+		pathSession.mu.Unlock()
+		return probe != nil && probe != firstReplacement && pathSession.qualityStatus(path, config.InterfaceCostNormal, tcpRetryNow()).state == "healthy"
+	})
+	currentSession, currentGeneration, currentAvailable = pathSession.current(path)
+	if !currentAvailable || currentSession != physicalSession || currentGeneration != generation || physicalSession.IsClosed() || dialCount.Load() != 1 {
+		t.Fatalf("Session after probe recovery = available %v/same %v/generation %d/closed %v/dials %d, want true/true/1/false/1", currentAvailable, currentSession == physicalSession, currentGeneration, physicalSession.IsClosed(), dialCount.Load())
+	}
+	retryTimers.assertNoPending(t)
+
+	protocolFailure := probeTimers.next(t)
+	protocolFailure.fire(t)
+	waitTCPSessionManagerProbeEvent(t, events, "protocol-failure")
+	sessionRetry := retryTimers.next(t)
+	if sessionRetry.delay != tcpSessionRetryInitialDelay {
+		t.Fatalf("Session retry delay after probe protocol error = %v, want %v", sessionRetry.delay, tcpSessionRetryInitialDelay)
+	}
+	waitTCPSessionManagerCondition(t, func() bool {
+		_, _, available := pathSession.current(path)
+		return !available && physicalSession.IsClosed()
+	})
+	pathSession.mu.Lock()
+	currentGeneration = pathSession.generation
+	retrying := pathSession.retrying
+	pathSession.mu.Unlock()
+	if currentGeneration != generation || !retrying || dialCount.Load() != 1 {
+		t.Fatalf("Session after probe protocol error = generation %d/retrying %v/dials %d, want 1/true/1", currentGeneration, retrying, dialCount.Load())
+	}
+
+	runtime.shutdown()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(tcpSessionManagerTestTimeout):
+		t.Fatal("probe script did not stop with the physical Session")
+	}
+}
+
 func TestTCPCarrierGroupRegistersMaxStreamsAtomically(t *testing.T) {
 	runtime := newTCPSessionManagerTestRuntime(t)
 	runtime.client.cfg.Transfer.TCP.MaxStreams = 1
@@ -753,6 +947,103 @@ func serveTCPSessionManagerPeer(session *tcpstream.Session) {
 			}
 			_ = conn.Close()
 		}()
+	}
+}
+
+func serveTCPSessionManagerProbeScript(session *tcpstream.Session, events chan<- string) error {
+	first, maxPayload, err := session.AcceptStream()
+	if err != nil {
+		return fmt.Errorf("accept initial probe: %w", err)
+	}
+	if _, err := readTCPSessionManagerPing(first, maxPayload); err != nil {
+		_ = first.Close()
+		return fmt.Errorf("read initial probe: %w", err)
+	}
+	_ = first.Close()
+	events <- "initial-failure"
+
+	second, maxPayload, err := session.AcceptStream()
+	if err != nil {
+		return fmt.Errorf("accept first replacement probe: %w", err)
+	}
+	ping, err := readTCPSessionManagerPing(second, maxPayload)
+	if err != nil {
+		_ = second.Close()
+		return fmt.Errorf("read first replacement probe: %w", err)
+	}
+	if err := writeTCPSessionManagerPong(second, ping); err != nil {
+		_ = second.Close()
+		return fmt.Errorf("write first replacement Pong: %w", err)
+	}
+	events <- "first-recovery"
+	if _, err := readTCPSessionManagerPing(second, maxPayload); err != nil {
+		_ = second.Close()
+		return fmt.Errorf("read established probe: %w", err)
+	}
+	_ = second.Close()
+	events <- "established-failure"
+
+	third, maxPayload, err := session.AcceptStream()
+	if err != nil {
+		return fmt.Errorf("accept second replacement probe: %w", err)
+	}
+	ping, err = readTCPSessionManagerPing(third, maxPayload)
+	if err != nil {
+		_ = third.Close()
+		return fmt.Errorf("read second replacement probe: %w", err)
+	}
+	if err := writeTCPSessionManagerPong(third, ping); err != nil {
+		_ = third.Close()
+		return fmt.Errorf("write second replacement Pong: %w", err)
+	}
+	events <- "second-recovery"
+	ping, err = readTCPSessionManagerPing(third, maxPayload)
+	if err != nil {
+		_ = third.Close()
+		return fmt.Errorf("read protocol-failure probe: %w", err)
+	}
+	if err := tcpstream.WriteFrame(third, tcpstream.Frame{
+		Type:      tcpstream.FramePong,
+		Direction: tcpstream.DirectionServerToClient,
+		Offset:    ping.Offset + 1,
+	}); err != nil {
+		_ = third.Close()
+		return fmt.Errorf("write invalid probe Pong: %w", err)
+	}
+	events <- "protocol-failure"
+	<-session.Done()
+	_ = third.Close()
+	return nil
+}
+
+func readTCPSessionManagerPing(conn net.Conn, maxPayload uint32) (tcpstream.Frame, error) {
+	frame, err := tcpstream.ReadFrame(conn, maxPayload)
+	if err != nil {
+		return tcpstream.Frame{}, err
+	}
+	if frame.Type != tcpstream.FramePing {
+		return tcpstream.Frame{}, fmt.Errorf("probe frame type = %d, want Ping", frame.Type)
+	}
+	return frame, nil
+}
+
+func writeTCPSessionManagerPong(conn net.Conn, ping tcpstream.Frame) error {
+	return tcpstream.WriteFrame(conn, tcpstream.Frame{
+		Type:      tcpstream.FramePong,
+		Direction: tcpstream.DirectionServerToClient,
+		Offset:    ping.Offset,
+	})
+}
+
+func waitTCPSessionManagerProbeEvent(t *testing.T, events <-chan string, want string) {
+	t.Helper()
+	select {
+	case event := <-events:
+		if event != want {
+			t.Fatalf("probe event = %q, want %q", event, want)
+		}
+	case <-time.After(tcpSessionManagerTestTimeout):
+		t.Fatalf("timed out waiting for probe event %q", want)
 	}
 }
 

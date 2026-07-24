@@ -1,6 +1,8 @@
 package tcpstream
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -24,6 +26,13 @@ type sessionOpenResult struct {
 	maxPayload  uint32
 	destination Destination
 	err         error
+}
+
+type sessionRecoverableOpenResult struct {
+	conn       net.Conn
+	maxPayload uint32
+	result     RecoverableOpenResult
+	err        error
 }
 
 type sessionWriteFailureConn struct {
@@ -210,6 +219,37 @@ func TestOpenDestinationClosesSessionOnOpenStreamFailure(t *testing.T) {
 	case <-session.Done():
 	default:
 		t.Fatal("OpenDestination did not close the session after OpenStream failed")
+	}
+}
+
+func TestRecoverableOpenClosesSessionOnOpenStreamFailure(t *testing.T) {
+	injected := errors.New("injected connection write failure")
+	clientConn, peerConn := net.Pipe()
+	defer peerConn.Close()
+	mux, err := smux.Client(&sessionWriteFailureConn{Conn: clientConn, err: injected}, smuxSessionConfig(SessionConfig{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{mux: mux, maxPayload: MaxPayloadSize, activeStandby: true}
+
+	conn, _, _, err := session.OpenRecoverableDestination(
+		sessionTestStreamID(10),
+		sessionTestDestination(t, "failure.example:443"),
+		ResumeToken{1},
+		3*time.Second,
+		time.Second,
+	)
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("failed OpenStream returned a connection")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("OpenRecoverableDestination error = %v, want %v", err, injected)
+	}
+	select {
+	case <-session.Done():
+	default:
+		t.Fatal("OpenRecoverableDestination did not close the session after OpenStream failed")
 	}
 }
 
@@ -505,6 +545,524 @@ func TestSessionPeerAuthentication(t *testing.T) {
 	})
 }
 
+func TestSessionActiveStandbyCapability(t *testing.T) {
+	instanceID := ServerInstanceID{1, 2, 3}
+	clientConfig := SessionConfig{ActiveStandby: true}
+	serverConfig := SessionConfig{ActiveStandby: true, ServerInstanceID: instanceID, OrphanRetention: 9 * time.Second}
+	clientConn, serverConn := net.Pipe()
+	serverResult := make(chan sessionAcceptResult, 1)
+	go func() {
+		session, principal, err := AcceptSession(serverConn, MaxPayloadSize, time.Second, serverConfig, map[string]string{"client-a": "peer-secret"})
+		serverResult <- sessionAcceptResult{session: session, principal: principal, err: err}
+	}()
+	clientSession, err := DialSessionWithAuth(clientConn, MaxPayloadSize, time.Second, clientConfig, &PeerCredentials{Username: "client-a", Password: "peer-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	server := waitSessionAccept(t, serverResult)
+	if server.err != nil {
+		t.Fatal(server.err)
+	}
+	defer server.session.Close()
+	if server.principal != "client-a" {
+		t.Fatalf("principal = %q, want client-a", server.principal)
+	}
+	for name, session := range map[string]*Session{"client": clientSession, "server": server.session} {
+		if !session.ActiveStandby() || session.ServerInstanceID() != instanceID || session.ServerOrphanRetention() != 9*time.Second {
+			t.Fatalf("%s capability = active %v instance %x retention %v", name, session.ActiveStandby(), session.ServerInstanceID(), session.ServerOrphanRetention())
+		}
+	}
+}
+
+func TestSessionActiveStandbyRequiresPeerSupport(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	serverResult := make(chan sessionAcceptResult, 1)
+	go func() {
+		session, principal, err := AcceptSession(serverConn, MaxPayloadSize, time.Second, SessionConfig{}, nil)
+		serverResult <- sessionAcceptResult{session: session, principal: principal, err: err}
+	}()
+	clientSession, err := DialSession(clientConn, MaxPayloadSize, time.Second, SessionConfig{ActiveStandby: true})
+	if clientSession != nil {
+		_ = clientSession.Close()
+		t.Fatal("capability mismatch returned a client session")
+	}
+	if !errors.Is(err, ErrActiveStandbyRequired) {
+		t.Fatalf("client capability error = %v, want %v", err, ErrActiveStandbyRequired)
+	}
+	server := waitSessionAccept(t, serverResult)
+	if server.session != nil {
+		_ = server.session.Close()
+		t.Fatal("capability mismatch returned a server session")
+	}
+	if !errors.Is(server.err, ErrActiveStandbyRequired) {
+		t.Fatalf("server capability error = %v, want %v", server.err, ErrActiveStandbyRequired)
+	}
+}
+
+func TestSessionRecoverableOpenAndResume(t *testing.T) {
+	instanceID := ServerInstanceID{1}
+	clientConfig := SessionConfig{ActiveStandby: true}
+	serverConfig := SessionConfig{ActiveStandby: true, ServerInstanceID: instanceID, OrphanRetention: 9 * time.Second}
+	clientConn, serverConn := net.Pipe()
+	serverResult := make(chan sessionAcceptResult, 1)
+	go func() {
+		session, principal, err := AcceptSession(serverConn, MaxPayloadSize, time.Second, serverConfig, nil)
+		serverResult <- sessionAcceptResult{session: session, principal: principal, err: err}
+	}()
+	clientSession, err := DialSession(clientConn, MaxPayloadSize, time.Second, clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	server := waitSessionAccept(t, serverResult)
+	if server.err != nil {
+		t.Fatal(server.err)
+	}
+	defer server.session.Close()
+
+	streamID := sessionTestStreamID(20)
+	token := ResumeToken{7, 8, 9}
+	destination := sessionTestDestination(t, "recoverable.example:443")
+	serverDone := make(chan error, 1)
+	go func() {
+		openStream, maxPayload, err := server.session.AcceptStream()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer openStream.Close()
+		openFrame, err := ReadFrame(openStream, maxPayload)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		open, err := DecodeRecoverableOpen(openFrame)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if open.Destination != destination || open.ResumeToken != token || open.RecoveryTimeoutMillis != 3000 {
+			serverDone <- fmt.Errorf("recoverable OPEN = %#v", open)
+			return
+		}
+		if err := WriteFrame(openStream, (RecoverableOpenResult{Result: OpenResultSuccess, Generation: 1, ServerOrphanRetentionMillis: 9000}).Frame(streamID)); err != nil {
+			serverDone <- err
+			return
+		}
+
+		resumeStream, maxPayload, err := server.session.AcceptStream()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer resumeStream.Close()
+		resume, err := ReadFrame(resumeStream, maxPayload)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		resumeToken, err := ResumeTokenFromFrame(resume)
+		if err != nil || resumeToken != token || resume.Offset != 2 {
+			serverDone <- fmt.Errorf("RESUME = token %x generation %d error %v", resumeToken, resume.Offset, err)
+			return
+		}
+		serverDone <- WriteFrame(resumeStream, NewResumeResultFrame(streamID, 2, ResumeResultSuccess))
+	}()
+
+	openConn, maxPayload, result, err := clientSession.OpenRecoverableDestination(streamID, destination, token, 3*time.Second, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer openConn.Close()
+	if maxPayload != MaxPayloadSize || result.Generation != 1 || result.ServerOrphanRetentionMillis != 9000 {
+		t.Fatalf("recoverable OPEN result = payload %d result %#v", maxPayload, result)
+	}
+	resumeConn, maxPayload, err := clientSession.Resume(streamID, token, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumeConn.Close()
+	if maxPayload != MaxPayloadSize {
+		t.Fatalf("RESUME max payload = %d, want %d", maxPayload, MaxPayloadSize)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(sessionTestTimeout):
+		t.Fatal("server did not finish recoverable OPEN and RESUME")
+	}
+}
+
+func TestRecoverableOpenReportsUncertainWrittenRequest(t *testing.T) {
+	clientSession, serverSession := newActiveSessionTestPair(t)
+	defer clientSession.Close()
+	defer serverSession.Close()
+	requestRead := make(chan error, 1)
+	go func() {
+		stream, maxPayload, err := serverSession.AcceptStream()
+		if err == nil {
+			_, err = ReadFrame(stream, maxPayload)
+			_ = stream.Close()
+		}
+		requestRead <- err
+	}()
+	_, _, _, err := clientSession.OpenRecoverableDestination(sessionTestStreamID(30), sessionTestDestination(t, "uncertain.example:443"), ResumeToken{1}, 3*time.Second, time.Second)
+	if err == nil || !StreamRequestWasWritten(err) {
+		t.Fatalf("recoverable OPEN error = %v, want uncertain written request", err)
+	}
+	select {
+	case err := <-requestRead:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(sessionTestTimeout):
+		t.Fatal("server did not read uncertain recoverable OPEN")
+	}
+	assertSessionOpen(t, clientSession, "client after uncertain recoverable OPEN")
+	assertSessionOpen(t, serverSession, "server after uncertain recoverable OPEN")
+
+	reusedID := sessionTestStreamID(31)
+	reusedDestination := sessionTestDestination(t, "reused.example:443")
+	reusedToken := ResumeToken{2}
+	serverDone := make(chan error, 1)
+	go func() {
+		stream, maxPayload, err := serverSession.AcceptStream()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer stream.Close()
+		request, err := ReadFrame(stream, maxPayload)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		open, err := DecodeRecoverableOpen(request)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if open.Destination != reusedDestination || open.ResumeToken != reusedToken {
+			serverDone <- fmt.Errorf("reused recoverable OPEN = %#v", open)
+			return
+		}
+		serverDone <- WriteFrame(stream, (RecoverableOpenResult{
+			Result:                      OpenResultSuccess,
+			Generation:                  request.Offset,
+			ServerOrphanRetentionMillis: 9000,
+		}).Frame(request.StreamID))
+	}()
+	reusedConn, maxPayload, result, err := clientSession.OpenRecoverableDestination(reusedID, reusedDestination, reusedToken, 3*time.Second, time.Second)
+	if err != nil {
+		t.Fatalf("recoverable OPEN reuse failed: %v", err)
+	}
+	defer reusedConn.Close()
+	if maxPayload != MaxPayloadSize || result.Generation != 1 || result.ServerOrphanRetentionMillis != 9000 {
+		t.Fatalf("reused recoverable OPEN result = payload %d result %#v", maxPayload, result)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(sessionTestTimeout):
+		t.Fatal("server did not finish reused recoverable OPEN")
+	}
+	assertSessionOpen(t, clientSession, "client after reused recoverable OPEN")
+	assertSessionOpen(t, serverSession, "server after reused recoverable OPEN")
+}
+
+func TestRecoverableOpenResultDeadlineKeepsSession(t *testing.T) {
+	clientSession, serverSession := newActiveSessionTestPair(t)
+	defer clientSession.Close()
+	defer serverSession.Close()
+
+	accepted := make(chan sessionOpenResult, 1)
+	go func() {
+		stream, maxPayload, err := serverSession.AcceptStream()
+		if err == nil {
+			_, err = ReadFrame(stream, maxPayload)
+		}
+		accepted <- sessionOpenResult{conn: stream, err: err}
+	}()
+	result := make(chan sessionRecoverableOpenResult, 1)
+	go func() {
+		conn, maxPayload, openResult, err := clientSession.OpenRecoverableDestination(
+			sessionTestStreamID(32),
+			sessionTestDestination(t, "silent-recoverable.example:443"),
+			ResumeToken{3},
+			3*time.Second,
+			250*time.Millisecond,
+		)
+		result <- sessionRecoverableOpenResult{conn: conn, maxPayload: maxPayload, result: openResult, err: err}
+	}()
+	serverStream := waitSessionOpen(t, accepted)
+	if serverStream.err != nil {
+		t.Fatal(serverStream.err)
+	}
+	defer serverStream.conn.Close()
+
+	var opened sessionRecoverableOpenResult
+	select {
+	case opened = <-result:
+	case <-time.After(sessionTestTimeout):
+		t.Fatal("recoverable OPEN did not return after its response deadline")
+	}
+	if opened.conn != nil {
+		_ = opened.conn.Close()
+		t.Fatal("timed out recoverable OPEN returned a connection")
+	}
+	var netErr net.Error
+	if !errors.As(opened.err, &netErr) || !netErr.Timeout() || !StreamRequestWasWritten(opened.err) {
+		t.Fatalf("recoverable OPEN error = %v, want timeout for a written request", opened.err)
+	}
+	assertSessionOpen(t, clientSession, "client after recoverable OPEN timeout")
+	assertSessionOpen(t, serverSession, "server after recoverable OPEN timeout")
+}
+
+func TestResumeEOFKeepsSessionAndAllowsRetry(t *testing.T) {
+	clientSession, serverSession := newActiveSessionTestPair(t)
+	defer clientSession.Close()
+	defer serverSession.Close()
+
+	streamID := sessionTestStreamID(33)
+	token := ResumeToken{4}
+	firstRead := make(chan error, 1)
+	go func() {
+		stream, maxPayload, err := serverSession.AcceptStream()
+		if err == nil {
+			_, err = ReadFrame(stream, maxPayload)
+			_ = stream.Close()
+		}
+		firstRead <- err
+	}()
+	_, _, err := clientSession.Resume(streamID, token, 2, time.Second)
+	if err == nil || !StreamRequestWasWritten(err) {
+		t.Fatalf("first RESUME error = %v, want failed written request", err)
+	}
+	select {
+	case err := <-firstRead:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(sessionTestTimeout):
+		t.Fatal("server did not read first RESUME")
+	}
+	assertSessionOpen(t, clientSession, "client after failed RESUME")
+	assertSessionOpen(t, serverSession, "server after failed RESUME")
+
+	serverDone := make(chan error, 1)
+	go func() {
+		stream, maxPayload, err := serverSession.AcceptStream()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer stream.Close()
+		request, err := ReadFrame(stream, maxPayload)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		resumeToken, err := ResumeTokenFromFrame(request)
+		if err != nil || resumeToken != token || request.Offset != 3 {
+			serverDone <- fmt.Errorf("retry RESUME = token %x generation %d error %v", resumeToken, request.Offset, err)
+			return
+		}
+		serverDone <- WriteFrame(stream, NewResumeResultFrame(request.StreamID, request.Offset, ResumeResultSuccess))
+	}()
+	retried, maxPayload, err := clientSession.Resume(streamID, token, 3, time.Second)
+	if err != nil {
+		t.Fatalf("retry RESUME failed: %v", err)
+	}
+	defer retried.Close()
+	if maxPayload != MaxPayloadSize {
+		t.Fatalf("retry RESUME max payload = %d, want %d", maxPayload, MaxPayloadSize)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(sessionTestTimeout):
+		t.Fatal("server did not finish retry RESUME")
+	}
+	assertSessionOpen(t, clientSession, "client after retry RESUME")
+	assertSessionOpen(t, serverSession, "server after retry RESUME")
+}
+
+func TestRecoverableOpenProtocolErrorsCloseSession(t *testing.T) {
+	tests := []struct {
+		name    string
+		wantErr error
+		respond func(net.Conn, Frame) error
+	}{
+		{
+			name:    "invalid header",
+			wantErr: ErrInvalidFrame,
+			respond: func(stream net.Conn, request Frame) error {
+				return writeMutatedSessionTestFrame(stream, (RecoverableOpenResult{
+					Result:                      OpenResultSuccess,
+					Generation:                  request.Offset,
+					ServerOrphanRetentionMillis: 9000,
+				}).Frame(request.StreamID), func(encoded []byte) {
+					binary.BigEndian.PutUint16(encoded[2:4], HeaderSize-1)
+				})
+			},
+		},
+		{
+			name:    "oversized payload",
+			wantErr: ErrPayloadLength,
+			respond: func(stream net.Conn, request Frame) error {
+				return writeMutatedSessionTestFrame(stream, (RecoverableOpenResult{
+					Result:                      OpenResultSuccess,
+					Generation:                  request.Offset,
+					ServerOrphanRetentionMillis: 9000,
+				}).Frame(request.StreamID), func(encoded []byte) {
+					binary.BigEndian.PutUint32(encoded[4:8], MaxPayloadSize+1)
+				})
+			},
+		},
+		{
+			name:    "wrong response type",
+			wantErr: ErrInvalidFrame,
+			respond: func(stream net.Conn, request Frame) error {
+				return WriteFrame(stream, NewResumeResultFrame(request.StreamID, 2, ResumeResultSuccess))
+			},
+		},
+		{
+			name:    "wrong stream ID",
+			wantErr: ErrInvalidFrame,
+			respond: func(stream net.Conn, request Frame) error {
+				return WriteFrame(stream, (RecoverableOpenResult{
+					Result:                      OpenResultSuccess,
+					Generation:                  request.Offset,
+					ServerOrphanRetentionMillis: 9000,
+				}).Frame(sessionTestStreamID(99)))
+			},
+		},
+		{
+			name:    "wrong generation",
+			wantErr: ErrInvalidFrame,
+			respond: func(stream net.Conn, request Frame) error {
+				return WriteFrame(stream, (RecoverableOpenResult{
+					Result:                      OpenResultSuccess,
+					Generation:                  request.Offset + 1,
+					ServerOrphanRetentionMillis: 9000,
+				}).Frame(request.StreamID))
+			},
+		},
+		{
+			name:    "zero retention",
+			wantErr: ErrInvalidFrame,
+			respond: func(stream net.Conn, request Frame) error {
+				return writeMutatedSessionTestFrame(stream, (RecoverableOpenResult{
+					Result:                      OpenResultSuccess,
+					Generation:                  request.Offset,
+					ServerOrphanRetentionMillis: 9000,
+				}).Frame(request.StreamID), func(encoded []byte) {
+					binary.BigEndian.PutUint32(encoded[HeaderSize+1:HeaderSize+5], 0)
+				})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clientSession, serverSession := newActiveSessionTestPair(t)
+			defer clientSession.Close()
+			defer serverSession.Close()
+			serverDone := make(chan error, 1)
+			go func() {
+				stream, maxPayload, err := serverSession.AcceptStream()
+				if err != nil {
+					serverDone <- err
+					return
+				}
+				request, err := ReadFrame(stream, maxPayload)
+				if err == nil {
+					err = test.respond(stream, request)
+				}
+				serverDone <- err
+				_ = stream.Close()
+			}()
+
+			conn, _, _, err := clientSession.OpenRecoverableDestination(
+				sessionTestStreamID(34),
+				sessionTestDestination(t, "protocol-error.example:443"),
+				ResumeToken{5},
+				3*time.Second,
+				time.Second,
+			)
+			if conn != nil {
+				_ = conn.Close()
+				t.Fatal("protocol-invalid response returned a connection")
+			}
+			if !errors.Is(err, test.wantErr) || !StreamRequestWasWritten(err) {
+				t.Fatalf("recoverable OPEN error = %v, want written request error %v", err, test.wantErr)
+			}
+			select {
+			case <-clientSession.Done():
+			default:
+				t.Fatal("protocol-invalid recoverable OPEN did not close the physical session")
+			}
+			select {
+			case err := <-serverDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(sessionTestTimeout):
+				t.Fatal("server did not finish protocol-invalid recoverable OPEN")
+			}
+		})
+	}
+}
+
+func TestResumeGenerationMismatchClosesSession(t *testing.T) {
+	clientSession, serverSession := newActiveSessionTestPair(t)
+	defer clientSession.Close()
+	defer serverSession.Close()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		stream, maxPayload, err := serverSession.AcceptStream()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		request, err := ReadFrame(stream, maxPayload)
+		if err == nil {
+			err = WriteFrame(stream, NewResumeResultFrame(request.StreamID, request.Offset+1, ResumeResultSuccess))
+		}
+		serverDone <- err
+		_ = stream.Close()
+	}()
+	conn, _, err := clientSession.Resume(sessionTestStreamID(35), ResumeToken{6}, 2, time.Second)
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("generation-mismatched RESUME returned a connection")
+	}
+	if !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("RESUME error = %v, want %v", err, ErrInvalidFrame)
+	}
+	select {
+	case <-clientSession.Done():
+	default:
+		t.Fatal("generation-mismatched RESUME did not close the physical session")
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(sessionTestTimeout):
+		t.Fatal("server did not finish generation-mismatched RESUME")
+	}
+}
+
 func newSessionTestPair(t *testing.T, credentials *PeerCredentials, users map[string]string) (*Session, *Session, string) {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
@@ -523,6 +1081,39 @@ func newSessionTestPair(t *testing.T, credentials *PeerCredentials, users map[st
 		t.Fatal(server.err)
 	}
 	return clientSession, server.session, server.principal
+}
+
+func newActiveSessionTestPair(t *testing.T) (*Session, *Session) {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	serverResult := make(chan sessionAcceptResult, 1)
+	go func() {
+		session, principal, err := AcceptSession(serverConn, MaxPayloadSize, time.Second, SessionConfig{
+			ActiveStandby:    true,
+			ServerInstanceID: ServerInstanceID{1},
+			OrphanRetention:  9 * time.Second,
+		}, nil)
+		serverResult <- sessionAcceptResult{session: session, principal: principal, err: err}
+	}()
+	clientSession, err := DialSession(clientConn, MaxPayloadSize, time.Second, SessionConfig{ActiveStandby: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := waitSessionAccept(t, serverResult)
+	if server.err != nil {
+		_ = clientSession.Close()
+		t.Fatal(server.err)
+	}
+	return clientSession, server.session
+}
+
+func writeMutatedSessionTestFrame(conn net.Conn, frame Frame, mutate func([]byte)) error {
+	var encoded bytes.Buffer
+	if err := WriteFrame(&encoded, frame); err != nil {
+		return err
+	}
+	mutate(encoded.Bytes())
+	return writeFull(conn, encoded.Bytes())
 }
 
 func acceptSessionOpen(session *Session, result OpenResult) <-chan sessionOpenResult {

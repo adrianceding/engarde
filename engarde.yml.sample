@@ -28,20 +28,33 @@ client:
     keepaliveIntervalMillis: 1000
     keepaliveTimeoutMillis: 5000
     tcp:
+      # Keep redundant on both peers for existing multi-path duplication.
+      # Set active-standby on both peers to send each Flow on one adaptive
+      # carrier while keeping every eligible interface Session warm.
+      carrierMode: redundant
       chunkSize: 16384
       carrierQueueBytes: 1048576
       reorderWindowBytes: 4194304
       dialTimeoutMillis: 5000
       openTimeoutMillis: 5000
       writeTimeoutMillis: 10000
-      # Zero leaves resource counts unlimited.
+      # In redundant mode, zero leaves the original resource counts unlimited.
+      # Active-standby applies finite defaults to maxStreams and the recovery
+      # fields below; normally only carrierMode needs to be changed.
+      clientRecoveryTimeoutMillis: 0
+      serverOrphanRetentionMillis: 0
+      resumeOpenTimeoutMillis: 0
       maxStreams: 0
-      # The following limits are server-only. The client opens one virtual
-      # carrier per healthy interface Session for each logical stream.
+      # These four limits are server-only. In redundant mode, the client opens
+      # one virtual carrier per healthy interface Session for each Flow.
       maxCarriersPerStream: 0
       maxPendingConnections: 0
       maxPendingStreams: 0
       maxSessions: 0
+      maxConcurrentResumes: 0
+      maxPendingResumes: 0
+      maxRecoveringStreams: 0
+      maxRecoveryBytes: 0
 
   # Optional whole-name shell globs. An empty include list makes every
   # interface eligible. Replace [] with patterns such as "eth*" or "wlan*"
@@ -54,6 +67,12 @@ client:
   interfaceLabels:
     eth0: "Main ISP"
     eth1: "Backup ISP"
+  # Active-standby defaults to adaptive path selection. Both fields below are
+  # optional; cost hints are preferences, not fixed interface priorities.
+  # pathSelection: adaptive
+  # interfaceHints:
+  #   wwan0:
+  #     cost: metered  # normal, metered, or avoid
   dstOverrides:
     - ifName: "eth1"
       dstAddr: "198.51.100.20:59501"
@@ -86,17 +105,25 @@ client:
 #     keepaliveIntervalMillis: 1000
 #     keepaliveTimeoutMillis: 5000
 #     tcp:
+#       carrierMode: redundant
 #       chunkSize: 16384
 #       carrierQueueBytes: 1048576
 #       reorderWindowBytes: 4194304
 #       dialTimeoutMillis: 5000
 #       openTimeoutMillis: 5000
 #       writeTimeoutMillis: 10000
+#       clientRecoveryTimeoutMillis: 0
+#       serverOrphanRetentionMillis: 0
+#       resumeOpenTimeoutMillis: 0
 #       maxStreams: 0
 #       maxCarriersPerStream: 0
 #       maxPendingConnections: 0
 #       maxPendingStreams: 0
 #       maxSessions: 0
+#       maxConcurrentResumes: 0
+#       maxPendingResumes: 0
+#       maxRecoveringStreams: 0
+#       maxRecoveryBytes: 0
 #
 #   webManager:
 #     listenAddr: "127.0.0.1:9001"

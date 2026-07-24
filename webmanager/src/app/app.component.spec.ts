@@ -44,6 +44,8 @@ describe('AppComponent', () => {
     component.streams = 2;
     component.carriers = 3;
     component.sessions = 1;
+    component.carrierMode = 'active-standby';
+    component.recovering = 1;
 
     fixture.detectChanges();
 
@@ -51,8 +53,40 @@ describe('AppComponent', () => {
     expect(root.textContent).toContain('SOCKS5 over TCP');
     expect(root.textContent).toContain('Carriers');
     expect(root.textContent).toContain('Sessions');
-    expect(root.querySelectorAll('.tcp-overview .tcp-summary-item').length).toBe(5);
+    expect(root.querySelectorAll('.tcp-overview .tcp-summary-item').length).toBe(7);
+    expect(root.textContent).toContain('active-standby');
     expect(root.textContent).toContain('Excluded interfaces');
+  });
+
+  it('renders connecting and unavailable interface quality states', () => {
+    component.type = 'client';
+    component.carrierMode = 'active-standby';
+    component.ifaces = [
+      {
+        name: 'path-a',
+        status: 'idle',
+        senderAddress: '192.0.2.10',
+        dstAddress: '198.51.100.1:59501',
+        last: null,
+        qualityState: 'connecting'
+      },
+      {
+        name: 'path-b',
+        status: 'idle',
+        senderAddress: '',
+        dstAddress: '198.51.100.1:59501',
+        last: null
+      }
+    ];
+
+    fixture.detectChanges();
+
+    const root: HTMLElement = fixture.nativeElement;
+    const qualityStates = Array.from(root.querySelectorAll('.quality-state'));
+    expect(qualityStates.map(item => item.textContent.trim())).toEqual(['connecting', 'unavailable']);
+    expect(qualityStates[0].classList).toContain('quality-connecting');
+    expect(qualityStates[1].classList).toContain('quality-unavailable');
+    expect(root.querySelector('.quality-unhealthy')).toBeNull();
   });
 
   it('renders SOCKS5 relay streams without removed socket path metadata', () => {
@@ -63,15 +97,18 @@ describe('AppComponent', () => {
       protocolVersion: 3,
       destination: 'example.com:443',
       carriers: 2,
-      state: 'active'
+      state: 'active',
+      recoverable: true,
+      carrierGeneration: 3
     }];
 
     fixture.detectChanges();
 
     const root: HTMLElement = fixture.nativeElement;
     expect(root.textContent).toContain('SOCKS5 relay');
-    expect(root.querySelectorAll('.tcp-overview .tcp-summary-item').length).toBe(4);
+    expect(root.querySelectorAll('.tcp-overview .tcp-summary-item').length).toBe(6);
     expect(root.querySelector('.stream-destination').textContent).toContain('example.com:443');
+    expect(root.querySelector('.tcp-stream-row:not(.tcp-stream-header)').textContent).toContain('3');
     expect(root.textContent).not.toContain('Last received packet');
   });
 

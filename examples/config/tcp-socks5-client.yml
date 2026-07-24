@@ -17,3 +17,7 @@ client:
   transfer:
     keepaliveIntervalMillis: 1000
     keepaliveTimeoutMillis: 5000
+    tcp:
+      # Change this to active-standby on both peers to use one adaptive
+      # carrier per Flow while retaining warm Sessions on eligible interfaces.
+      carrierMode: redundant

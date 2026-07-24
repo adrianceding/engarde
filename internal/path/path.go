@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	stdpath "path"
+	"sort"
 	"strings"
 	"sync"
 
@@ -149,13 +151,45 @@ func AddressByInterface(iface net.Interface) string {
 	if err != nil {
 		return ""
 	}
+	addresses := make([]netip.Addr, 0, len(addrs))
 	for _, addr := range addrs {
-		address := strings.Split(addr.String(), "/")[0]
-		if IsAddressAllowed(address) {
-			return address
+		address, ok := interfaceIPv4(addr)
+		if ok && IsAddressAllowed(address.String()) {
+			addresses = append(addresses, address)
 		}
 	}
-	return ""
+	if len(addresses) == 0 {
+		return ""
+	}
+	sort.Slice(addresses, func(left, right int) bool {
+		return addresses[left].Less(addresses[right])
+	})
+	return addresses[0].String()
+}
+
+func interfaceIPv4(addr net.Addr) (netip.Addr, bool) {
+	if addr == nil {
+		return netip.Addr{}, false
+	}
+	var ip net.IP
+	switch addr := addr.(type) {
+	case *net.IPNet:
+		ip = addr.IP
+	case *net.IPAddr:
+		ip = addr.IP
+	default:
+		parsed, _, err := net.ParseCIDR(addr.String())
+		if err != nil {
+			parsed = net.ParseIP(addr.String())
+		}
+		ip = parsed
+	}
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	address = address.Unmap()
+	return address, address.Is4()
 }
 
 func IsAddressAllowed(address string) bool {

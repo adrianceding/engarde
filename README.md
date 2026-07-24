@@ -1,13 +1,15 @@
 # Engarde
 
-**Redundant TCP relay for SOCKS5 traffic over multiple uplinks.**
+**Continuous SOCKS5 TCP relay over multiple uplinks.**
 
 [简体中文](README.zh-CN.md) | [Releases](https://github.com/adrianceding/engarde/releases) | [Container](https://github.com/adrianceding/engarde/pkgs/container/engarde) | [Issues](https://github.com/adrianceding/engarde/issues)
 
 Engarde runs as a client/server pair. Applications connect to a local SOCKS5
 listener. The client maintains one multiplexed TCP **session** to the server on
 each available IPv4 interface, and every logical TCP stream gets one virtual
-**carrier** on each healthy session.
+**carrier** on every healthy session in the default `redundant` mode. In
+`active-standby` mode, a stream uses one adaptively selected active carrier and
+keeps the other sessions warm.
 
 ```text
                                       +-- eth0 / ISP A --+
@@ -16,9 +18,10 @@ SOCKS5 application -> Engarde client -+                  +-> Engarde server -> d
 ```
 
 > [!IMPORTANT]
-> Engarde is not MPTCP and does not combine uplink bandwidth. It sends stream
-> data redundantly across healthy carriers so that the first copy can make
-> progress. This improves path-failure tolerance at the cost of extra traffic.
+> Engarde is not MPTCP and does not combine uplink bandwidth. The default
+> `redundant` mode duplicates stream data across healthy carriers.
+> `active-standby` sends one copy and takes over the same App TCP and target TCP
+> through a warm Session when a path fails.
 
 ## When Engarde Fits
 
@@ -39,8 +42,10 @@ when the paths do not share one destination address.
 
 - One persistent multiplexed session on every eligible interface, established
   when the client starts and shared by all SOCKS5 streams.
-- Ordered delivery, duplicate suppression, cumulative acknowledgements, and a
-  bounded replay window across carriers.
+- Default multi-carrier redundancy or one active carrier with adaptive path
+  scoring and bounded recovery.
+- Ordered delivery, cumulative acknowledgements, and a bounded replay window
+  across carrier changes.
 - Runtime interface discovery, whole-name glob filters, and per-interface server
   address overrides.
 - Separate authentication for the local SOCKS5 frontend and remote Engarde
@@ -147,6 +152,16 @@ client:
 Use `includeInterfaces` when Engarde should use only named interfaces. Patterns
 match the whole interface name, for example `eth*`, `enp*`, `wlan*`, or `wlp*`.
 
+The configuration above uses `redundant` by default. To enable traffic
+optimization, add the following field to both the client and server files.
+Other recovery settings have finite defaults and normally need no override:
+
+```yaml
+transfer:
+  tcp:
+    carrierMode: active-standby
+```
+
 On Linux, grant the client binary the capability needed to bind sessions to
 specific interfaces, then start it as a regular user:
 
@@ -178,9 +193,11 @@ curl --socks5-hostname 127.0.0.1:59401 \
 ```
 
 The request succeeds only after the server has connected to the requested
-destination and at least one carrier is ready. During a longer transfer, loss
-of one carrier should not interrupt the stream while another carrier remains.
-If all active carriers disappear, the logical stream closes.
+destination and at least one carrier is ready. In `redundant` mode, another
+existing carrier continues after one is lost. In `active-standby`, Engarde
+RESUMEs the same Flow on a warm Session without rebuilding the App TCP or target
+TCP during the recovery budget. The Flow closes with a terminal error only
+after all paths remain unavailable beyond that budget.
 
 ## Configuration
 
@@ -207,7 +224,8 @@ the [client example](examples/config/tcp-socks5-client.yml), the
   destinations reachable from the server; Engarde has no destination ACL.
 - The management listener is plain HTTP. Keep it on loopback and use a TLS
   reverse proxy or VPN for remote access.
-- Stream, carrier, session, and pending-connection limits default to unlimited.
+- Original redundant-mode count limits default to unlimited; active-standby
+  stream and recovery resources have finite defaults.
 
 Read the [security model and deployment checklist](docs/security.md) before
 exposing either role outside an isolated network.
@@ -255,8 +273,10 @@ user-namespaced Docker and for production use.
 - SOCKS5 TCP `CONNECT` only; no raw TCP frontend, UDP relay, `BIND`, or
   `UDP ASSOCIATE`.
 - IPv4 client carrier paths only.
-- Redundancy rather than bandwidth aggregation.
-- No automatic recovery of a logical stream after every active carrier is lost.
+- Redundancy or active-standby takeover rather than bandwidth aggregation.
+- Active-standby recovery is limited to Sessions on one server process. A
+  server restart, or all paths exceeding the recovery budget, cannot preserve
+  the existing logical stream.
 - No encryption, destination ACL, configuration reload, or built-in TLS for the
   management service.
 

@@ -59,6 +59,52 @@ type recordingWriteBarrierConn struct {
 	once    sync.Once
 }
 
+type manualFlowRecoveryTimer struct {
+	mu       sync.Mutex
+	delay    time.Duration
+	callback func()
+	stopped  bool
+}
+
+func (timer *manualFlowRecoveryTimer) Stop() bool {
+	timer.mu.Lock()
+	defer timer.mu.Unlock()
+	wasActive := !timer.stopped
+	timer.stopped = true
+	return wasActive
+}
+
+func (timer *manualFlowRecoveryTimer) Fire() {
+	timer.mu.Lock()
+	if timer.stopped {
+		timer.mu.Unlock()
+		return
+	}
+	timer.stopped = true
+	callback := timer.callback
+	timer.mu.Unlock()
+	callback()
+}
+
+func (timer *manualFlowRecoveryTimer) Stopped() bool {
+	timer.mu.Lock()
+	defer timer.mu.Unlock()
+	return timer.stopped
+}
+
+func installManualFlowRecoveryTimers(t *testing.T) <-chan *manualFlowRecoveryTimer {
+	t.Helper()
+	timers := make(chan *manualFlowRecoveryTimer, 8)
+	previous := newFlowRecoveryTimer
+	newFlowRecoveryTimer = func(delay time.Duration, callback func()) flowRecoveryTimer {
+		timer := &manualFlowRecoveryTimer{delay: delay, callback: callback}
+		timers <- timer
+		return timer
+	}
+	t.Cleanup(func() { newFlowRecoveryTimer = previous })
+	return timers
+}
+
 func (conn *recordingWriteBarrierConn) Write(payload []byte) (int, error) {
 	conn.once.Do(func() { close(conn.started) })
 	<-conn.release
@@ -225,6 +271,294 @@ func TestFlowResetsWhenAllCarriersClose(t *testing.T) {
 		t.Fatal("flow did not close after its last carrier")
 	}
 	application.Close()
+}
+
+func TestActiveStandbyFlowRecoversWithoutClosingEndpoints(t *testing.T) {
+	timers := installManualFlowRecoveryTimers(t)
+	clientApplication, clientEndpoint := net.Pipe()
+	serverEndpoint, serverApplication := net.Pipe()
+	streamID := StreamID{1}
+	config := FlowConfig{
+		ChunkSize:          16,
+		CarrierQueueBytes:  1024,
+		ReorderWindowBytes: 1024,
+		WriteTimeout:       time.Second,
+		RecoveryTimeout:    3 * time.Second,
+		SingleCarrier:      true,
+	}
+	clientFlow := NewFlow(streamID, clientEndpoint, DirectionClientToServer, config)
+	serverFlow := NewFlow(streamID, serverEndpoint, DirectionServerToClient, config)
+	clientConn, serverConn := net.Pipe()
+	clientCarrier, err := clientFlow.Attach(clientConn, MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := serverFlow.Attach(serverConn, MaxPayloadSize); err != nil {
+		t.Fatal(err)
+	}
+	clientFlow.Start()
+	serverFlow.Start()
+	t.Cleanup(func() {
+		_ = clientFlow.Close()
+		_ = serverFlow.Close()
+		_ = clientApplication.Close()
+		_ = serverApplication.Close()
+	})
+
+	if err := clientCarrier.Close(); err != nil {
+		t.Fatal(err)
+	}
+	clientTimer := receiveFlowRecoveryTimer(t, timers)
+	serverTimer := receiveFlowRecoveryTimer(t, timers)
+	if clientTimer.delay != 3*time.Second || serverTimer.delay != 3*time.Second {
+		t.Fatalf("recovery timer delays = %v/%v, want 3s", clientTimer.delay, serverTimer.delay)
+	}
+	if clientFlow.State() != FlowStateRecovering || serverFlow.State() != FlowStateRecovering {
+		t.Fatalf("flow states = %q/%q, want recovering", clientFlow.State(), serverFlow.State())
+	}
+	select {
+	case <-clientFlow.Done():
+		t.Fatal("client flow closed while recovery budget remained")
+	case <-serverFlow.Done():
+		t.Fatal("server flow closed while recovery budget remained")
+	default:
+	}
+
+	replacementClient, replacementServer := net.Pipe()
+	if _, err := clientFlow.ReplaceObserved(replacementClient, MaxPayloadSize, 2, CarrierObserver{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := serverFlow.ReplaceObserved(replacementServer, MaxPayloadSize, 2, CarrierObserver{}); err != nil {
+		t.Fatal(err)
+	}
+	if !clientTimer.Stopped() || !serverTimer.Stopped() {
+		t.Fatal("successful replacement did not stop recovery timers")
+	}
+	if clientFlow.State() != FlowStateActive || serverFlow.State() != FlowStateActive {
+		t.Fatalf("flow states after replacement = %q/%q, want active", clientFlow.State(), serverFlow.State())
+	}
+	if clientFlow.CarrierGeneration() != 2 || serverFlow.CarrierGeneration() != 2 {
+		t.Fatalf("carrier generations = %d/%d, want 2", clientFlow.CarrierGeneration(), serverFlow.CarrierGeneration())
+	}
+
+	payload := []byte("survives active-standby recovery")
+	written := make(chan error, 1)
+	go func() {
+		_, err := clientApplication.Write(payload)
+		written <- err
+	}()
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(serverApplication, got); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForResult(t, written, "application write after recovery"); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("payload after recovery = %q, want %q", got, payload)
+	}
+
+	stale, peer := net.Pipe()
+	defer peer.Close()
+	if _, err := clientFlow.ReplaceObserved(stale, MaxPayloadSize, 2, CarrierObserver{}); err == nil {
+		t.Fatal("stale carrier generation was accepted")
+	}
+	if clientFlow.CarrierGeneration() != 2 || clientFlow.CarrierCount() != 1 {
+		t.Fatalf("stale replacement changed flow to generation %d carriers %d", clientFlow.CarrierGeneration(), clientFlow.CarrierCount())
+	}
+}
+
+func TestActiveStandbyRecoveryStartsBeforePreservedInboundDrains(t *testing.T) {
+	timers := installManualFlowRecoveryTimers(t)
+	application, endpoint := net.Pipe()
+	flow := NewFlow(StreamID{1}, endpoint, DirectionClientToServer, FlowConfig{
+		RecoveryTimeout: 3 * time.Second,
+		SingleCarrier:   true,
+	})
+	carrier := new(Carrier)
+	flow.mu.Lock()
+	flow.started = true
+	flow.pendingInbound = 1
+	flow.carriers = []*Carrier{carrier}
+	flow.carrierStates[carrier] = &carrierState{}
+	flow.mu.Unlock()
+	t.Cleanup(func() {
+		_ = flow.Close()
+		_ = application.Close()
+	})
+
+	flow.detach(carrier, true)
+	timer := receiveFlowRecoveryTimer(t, timers)
+	if timer.delay != 3*time.Second {
+		t.Fatalf("recovery timer delay = %v, want 3s", timer.delay)
+	}
+	if flow.State() != FlowStateRecovering {
+		t.Fatalf("flow state = %q, want recovering", flow.State())
+	}
+	flow.mu.Lock()
+	pendingInbound := flow.pendingInbound
+	flow.mu.Unlock()
+	if pendingInbound != 1 {
+		t.Fatalf("pending inbound = %d, want preserved frame", pendingInbound)
+	}
+}
+
+func TestLastCarrierLossUsesRecoverableCompletionBoundary(t *testing.T) {
+	timers := installManualFlowRecoveryTimers(t)
+	tests := []struct {
+		name             string
+		recoveryTimeout  time.Duration
+		remoteFINAckSent bool
+		wantState        FlowState
+		wantRecovery     bool
+	}{
+		{
+			name:            "recoverable waits for final ack",
+			recoveryTimeout: 3 * time.Second,
+			wantState:       FlowStateRecovering,
+			wantRecovery:    true,
+		},
+		{
+			name:             "recoverable completes after final ack",
+			recoveryTimeout:  3 * time.Second,
+			remoteFINAckSent: true,
+			wantState:        FlowStateCompleted,
+		},
+		{
+			name:      "legacy completes after fin exchange",
+			wantState: FlowStateCompleted,
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			application, endpoint := net.Pipe()
+			flow := NewFlow(StreamID{byte(index + 20)}, endpoint, DirectionClientToServer, FlowConfig{
+				RecoveryTimeout: test.recoveryTimeout,
+				SingleCarrier:   true,
+			})
+			carrier := new(Carrier)
+			flow.mu.Lock()
+			flow.started = true
+			flow.localFIN = true
+			flow.localFINAck = true
+			flow.remoteFIN = true
+			flow.remoteFINAckSent = test.remoteFINAckSent
+			flow.carriers = []*Carrier{carrier}
+			flow.carrierStates[carrier] = &carrierState{}
+			flow.mu.Unlock()
+			t.Cleanup(func() {
+				_ = flow.Close()
+				_ = application.Close()
+			})
+
+			flow.detach(carrier, false)
+			if test.wantRecovery {
+				timer := receiveFlowRecoveryTimer(t, timers)
+				if timer.delay != test.recoveryTimeout {
+					t.Fatalf("recovery timer delay = %v, want %v", timer.delay, test.recoveryTimeout)
+				}
+			}
+			if state := flow.State(); state != test.wantState {
+				t.Fatalf("flow state = %q, want %q", state, test.wantState)
+			}
+			select {
+			case <-flow.Done():
+				if test.wantRecovery {
+					t.Fatal("recoverable Flow completed before its final ACK was sent")
+				}
+			default:
+				if !test.wantRecovery {
+					t.Fatal("completed Flow left Done open")
+				}
+			}
+		})
+	}
+}
+
+func TestActiveStandbyFlowFailsWhenRecoveryExpires(t *testing.T) {
+	timers := installManualFlowRecoveryTimers(t)
+	application, endpoint := net.Pipe()
+	carrierConn, peer := net.Pipe()
+	flow := NewFlow(StreamID{1}, endpoint, DirectionClientToServer, FlowConfig{
+		ChunkSize:          16,
+		CarrierQueueBytes:  1024,
+		ReorderWindowBytes: 1024,
+		WriteTimeout:       time.Second,
+		RecoveryTimeout:    3 * time.Second,
+		SingleCarrier:      true,
+	})
+	if _, err := flow.Attach(carrierConn, MaxPayloadSize); err != nil {
+		t.Fatal(err)
+	}
+	flow.Start()
+	t.Cleanup(func() {
+		_ = flow.Close()
+		_ = application.Close()
+	})
+	if err := peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	timer := receiveFlowRecoveryTimer(t, timers)
+	if flow.State() != FlowStateRecovering {
+		t.Fatalf("flow state = %q, want recovering", flow.State())
+	}
+	timer.Fire()
+	select {
+	case <-flow.Done():
+	case <-time.After(time.Second):
+		t.Fatal("flow did not fail when recovery timer fired")
+	}
+	if !errors.Is(flow.Err(), ErrNoCarriers) || flow.State() != FlowStateFailed {
+		t.Fatalf("expired flow = state %q error %v", flow.State(), flow.Err())
+	}
+}
+
+func TestActiveStandbyFlowAtomicallyReplacesActiveCarrier(t *testing.T) {
+	application, endpoint := net.Pipe()
+	firstConn, firstPeer := net.Pipe()
+	flow := NewFlow(StreamID{1}, endpoint, DirectionClientToServer, FlowConfig{
+		ChunkSize:          16,
+		CarrierQueueBytes:  1024,
+		ReorderWindowBytes: 1024,
+		WriteTimeout:       time.Second,
+		RecoveryTimeout:    3 * time.Second,
+		SingleCarrier:      true,
+	})
+	first, err := flow.Attach(firstConn, MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow.Start()
+	t.Cleanup(func() {
+		_ = flow.Close()
+		_ = application.Close()
+		_ = firstPeer.Close()
+	})
+	secondConn, secondPeer := net.Pipe()
+	defer secondPeer.Close()
+	second, err := flow.ReplaceObserved(secondConn, MaxPayloadSize, 2, CarrierObserver{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first || flow.CarrierCount() != 1 || flow.CarrierGeneration() != 2 || flow.State() != FlowStateActive {
+		t.Fatalf("replacement state = carrier %v count %d generation %d state %q", second == first, flow.CarrierCount(), flow.CarrierGeneration(), flow.State())
+	}
+	select {
+	case <-first.Done():
+	default:
+		t.Fatal("retired active carrier remained open")
+	}
+}
+
+func receiveFlowRecoveryTimer(t *testing.T, timers <-chan *manualFlowRecoveryTimer) *manualFlowRecoveryTimer {
+	t.Helper()
+	select {
+	case timer := <-timers:
+		return timer
+	case <-time.After(time.Second):
+		t.Fatal("flow did not start recovery timer")
+		return nil
+	}
 }
 
 func TestFlowContinuesAfterFirstCarrierCloses(t *testing.T) {

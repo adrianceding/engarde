@@ -22,26 +22,33 @@ var listenTCP = func(network, address string) (net.Listener, error) {
 
 var dialTCPOnInterface = tcpbind.DialContext
 
+// Netlink/DHCP updates can briefly hide an address that is still usable by an established Session.
+const tcpPathAddressMissGraceRefreshes = 2
+
 type tcpClientRuntime struct {
 	client   *Client
 	ctx      context.Context
 	cancel   context.CancelFunc
 	listener net.Listener
 
-	mu           sync.Mutex
-	closing      bool
-	flows        map[tcpstream.StreamID]*tcpstream.Flow
-	paths        map[string]tcpClientPath
-	carriers     map[tcpstream.StreamID]map[string]*tcpstream.Carrier
-	traffic      map[string]*stats.Traffic
-	lastReceived map[string]*atomic.Int64
-	sessions     map[string]*tcpPathSession
-	groups       map[*tcpCarrierGroup]struct{}
-	accepted     map[*tcpAcceptedConn]struct{}
-	acceptWG     sync.WaitGroup
-	groupWG      sync.WaitGroup
-	backgroundWG sync.WaitGroup
-	shutdownOnce sync.Once
+	mu            sync.Mutex
+	closing       bool
+	flows         map[tcpstream.StreamID]*tcpstream.Flow
+	paths         map[string]tcpClientPath
+	carriers      map[tcpstream.StreamID]map[string]*tcpstream.Carrier
+	traffic       map[string]*stats.Traffic
+	lastReceived  map[string]*atomic.Int64
+	sessions      map[string]*tcpPathSession
+	groups        map[*tcpCarrierGroup]struct{}
+	addressMisses map[string]int
+	active        *tcpActiveCoordinator
+	accepted      map[*tcpAcceptedConn]struct{}
+	acceptWG      sync.WaitGroup
+	groupWG       sync.WaitGroup
+	backgroundWG  sync.WaitGroup
+	shutdownOnce  sync.Once
+	recoveryMu    sync.Mutex
+	nextFlowOrder uint64
 }
 
 type tcpAcceptedConn struct {
@@ -67,21 +74,23 @@ func (client *Client) runTCP(ctx context.Context) error {
 	}
 	runtimeCtx, cancelRuntime := context.WithCancel(ctx)
 	runtime := &tcpClientRuntime{
-		client:       client,
-		ctx:          runtimeCtx,
-		cancel:       cancelRuntime,
-		listener:     listener,
-		flows:        make(map[tcpstream.StreamID]*tcpstream.Flow),
-		paths:        make(map[string]tcpClientPath),
-		carriers:     make(map[tcpstream.StreamID]map[string]*tcpstream.Carrier),
-		traffic:      make(map[string]*stats.Traffic),
-		lastReceived: make(map[string]*atomic.Int64),
-		sessions:     make(map[string]*tcpPathSession),
-		groups:       make(map[*tcpCarrierGroup]struct{}),
-		accepted:     make(map[*tcpAcceptedConn]struct{}),
+		client:        client,
+		ctx:           runtimeCtx,
+		cancel:        cancelRuntime,
+		listener:      listener,
+		flows:         make(map[tcpstream.StreamID]*tcpstream.Flow),
+		paths:         make(map[string]tcpClientPath),
+		carriers:      make(map[tcpstream.StreamID]map[string]*tcpstream.Carrier),
+		traffic:       make(map[string]*stats.Traffic),
+		lastReceived:  make(map[string]*atomic.Int64),
+		sessions:      make(map[string]*tcpPathSession),
+		groups:        make(map[*tcpCarrierGroup]struct{}),
+		addressMisses: make(map[string]int),
+		accepted:      make(map[*tcpAcceptedConn]struct{}),
 	}
 	defer runtime.shutdown()
 	client.setTCPRuntime(runtime)
+	runtime.startActiveCoordinator()
 	runtime.refresh()
 	log.Info("Listening on " + client.cfg.ListenAddr + " over TCP")
 	runtime.backgroundWG.Add(1)
@@ -116,6 +125,10 @@ func (client *Client) runTCP(ctx context.Context) error {
 }
 
 func (runtime *tcpClientRuntime) startAccept(conn net.Conn) bool {
+	if runtime.client.cfg.Transfer.TCP.ActiveStandby() && !runtime.recoveryCapacityAvailable() {
+		_ = conn.Close()
+		return false
+	}
 	accepted := &tcpAcceptedConn{conn: conn}
 	runtime.mu.Lock()
 	maxStreams := runtime.client.cfg.Transfer.TCP.MaxStreams
@@ -215,12 +228,16 @@ func (runtime *tcpClientRuntime) refresh() {
 		return
 	}
 	current := make(map[string]tcpClientPath)
+	eligible := make(map[string]struct{})
+	unresolved := make(map[string]struct{})
 	for _, iface := range interfaces {
 		if runtime.client.paths.IsExcluded(iface.Name) {
 			continue
 		}
+		eligible[iface.Name] = struct{}{}
 		address := runtime.client.interfaceAddress(iface)
 		if address == "" {
+			unresolved[iface.Name] = struct{}{}
 			continue
 		}
 		current[iface.Name] = tcpClientPath{
@@ -229,7 +246,35 @@ func (runtime *tcpClientRuntime) refresh() {
 			destination: runtime.client.paths.Destination(iface.Name),
 		}
 	}
+	runtime.retainPathsWithTransientAddressMisses(current, eligible, unresolved)
 	runtime.refreshCarrierGroups(current)
+}
+
+func (runtime *tcpClientRuntime) retainPathsWithTransientAddressMisses(current map[string]tcpClientPath, eligible, unresolved map[string]struct{}) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.addressMisses == nil {
+		runtime.addressMisses = make(map[string]int)
+	}
+	for interfaceName := range runtime.addressMisses {
+		if _, exists := eligible[interfaceName]; !exists {
+			delete(runtime.addressMisses, interfaceName)
+		}
+	}
+	for interfaceName := range current {
+		delete(runtime.addressMisses, interfaceName)
+	}
+	for interfaceName := range unresolved {
+		path, exists := runtime.paths[interfaceName]
+		if !exists {
+			delete(runtime.addressMisses, interfaceName)
+			continue
+		}
+		runtime.addressMisses[interfaceName]++
+		if runtime.addressMisses[interfaceName] <= tcpPathAddressMissGraceRefreshes {
+			current[interfaceName] = path
+		}
+	}
 }
 
 func (runtime *tcpClientRuntime) status() (control.ClientStatus, error) {
@@ -238,7 +283,8 @@ func (runtime *tcpClientRuntime) status() (control.ClientStatus, error) {
 		return control.ClientStatus{}, err
 	}
 	now := time.Now().Unix()
-	sessionActive, sessionCount := runtime.pathSessionStatus()
+	sessionQuality, sessionCount := runtime.pathSessionStatus()
+	activeStandby := runtime.client.cfg.Transfer.TCP.ActiveStandby()
 	sources := make(map[string]tcpClientInterfaceStatusSource, len(interfaces))
 	runtime.mu.Lock()
 	carrierCount := 0
@@ -260,17 +306,43 @@ func (runtime *tcpClientRuntime) status() (control.ClientStatus, error) {
 		sources[interfaceName] = source
 	}
 	streamCount := len(runtime.flows)
+	flowSources := make([]*tcpstream.Flow, 0, streamCount)
+	for _, flow := range runtime.flows {
+		flowSources = append(flowSources, flow)
+	}
 	runtime.mu.Unlock()
+	recovering := 0
+	for _, flow := range flowSources {
+		if flow != nil && flow.State() == tcpstream.FlowStateRecovering {
+			recovering++
+		}
+	}
 
 	webInterfaces := make([]control.WebInterface, 0, len(interfaces))
 	for _, iface := range interfaces {
 		interfaceName := iface.Name
 		source := sources[interfaceName]
+		quality, hasQuality := sessionQuality[interfaceName]
+		senderAddress := runtime.client.interfaceAddress(iface)
+		excluded := runtime.client.paths.IsExcluded(interfaceName)
+		if activeStandby && !excluded && !hasQuality {
+			quality.state = "connecting"
+			if senderAddress == "" {
+				quality.state = "unavailable"
+			}
+		}
 		webInterface := control.WebInterface{
-			Name:          interfaceName,
-			Label:         runtime.client.paths.Label(interfaceName),
-			SenderAddress: runtime.client.interfaceAddress(iface),
-			Traffic:       source.traffic.Snapshot(),
+			Name:                 interfaceName,
+			Label:                runtime.client.paths.Label(interfaceName),
+			SenderAddress:        senderAddress,
+			Traffic:              source.traffic.Snapshot(),
+			QualityState:         quality.state,
+			RTTMillis:            quality.rttMillis,
+			JitterMillis:         quality.jitterMillis,
+			ScoreMillis:          quality.scoreMillis,
+			FailurePenaltyMillis: quality.failurePenaltyMillis,
+			ActiveFlows:          quality.activeFlows,
+			ServerInstanceID:     quality.serverInstanceID,
 		}
 		if lastReceived := source.lastReceived; lastReceived != nil {
 			if last := lastReceived.Load(); last > 0 {
@@ -281,11 +353,11 @@ func (runtime *tcpClientRuntime) status() (control.ClientStatus, error) {
 				webInterface.Last = &age
 			}
 		}
-		if runtime.client.paths.IsExcluded(interfaceName) {
+		if excluded {
 			webInterface.Status = "excluded"
 		} else {
 			webInterface.DstAddress = runtime.client.paths.Destination(interfaceName)
-			if sessionActive[interfaceName] || source.activeCarriers > 0 {
+			if quality.active || source.activeCarriers > 0 {
 				webInterface.Status = "active"
 			} else {
 				webInterface.Status = "idle"
@@ -304,6 +376,8 @@ func (runtime *tcpClientRuntime) status() (control.ClientStatus, error) {
 		Streams:             streamCount,
 		Carriers:            carrierCount,
 		Sessions:            sessionCount,
+		CarrierMode:         string(runtime.client.cfg.Transfer.TCP.CarrierMode),
+		Recovering:          recovering,
 	}, nil
 }
 
@@ -402,6 +476,8 @@ func (runtime *tcpClientRuntime) flowConfig() tcpstream.FlowConfig {
 		CarrierQueueBytes:  tcpConfig.CarrierQueueBytes,
 		ReorderWindowBytes: tcpConfig.ReorderWindowBytes,
 		WriteTimeout:       time.Duration(tcpConfig.WriteTimeoutMillis) * time.Millisecond,
+		RecoveryTimeout:    time.Duration(tcpConfig.ClientRecoveryTimeoutMillis) * time.Millisecond,
+		SingleCarrier:      tcpConfig.ActiveStandby(),
 	}
 }
 
@@ -464,6 +540,7 @@ func (runtime *tcpClientRuntime) shutdown() {
 		runtime.lastReceived = make(map[string]*atomic.Int64)
 		runtime.sessions = make(map[string]*tcpPathSession)
 		runtime.groups = make(map[*tcpCarrierGroup]struct{})
+		runtime.addressMisses = make(map[string]int)
 		runtime.accepted = make(map[*tcpAcceptedConn]struct{})
 		runtime.mu.Unlock()
 	})

@@ -110,6 +110,44 @@ func TestPrefaceAuthRequiredFlagRoundTrip(t *testing.T) {
 	}
 }
 
+func TestActiveStandbyPrefaceRoundTrip(t *testing.T) {
+	want := Preface{
+		Version:                     Version,
+		Flags:                       PrefaceFlagAuthRequired | PrefaceFlagActiveStandby,
+		MaxPayload:                  32 * 1024,
+		ServerInstanceID:            ServerInstanceID{1, 2, 3},
+		ServerOrphanRetentionMillis: 9000,
+	}
+	var buffer bytes.Buffer
+	if err := WritePreface(&buffer, want); err != nil {
+		t.Fatal(err)
+	}
+	if buffer.Len() != ActiveStandbyPrefaceSize {
+		t.Fatalf("active-standby preface size = %d, want %d", buffer.Len(), ActiveStandbyPrefaceSize)
+	}
+	got, err := ReadPreface(&buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("preface = %#v, want %#v", got, want)
+	}
+}
+
+func TestActiveStandbyPrefaceRejectsInvalidExtension(t *testing.T) {
+	buffer, _, err := marshalPreface(Preface{Flags: PrefaceFlagActiveStandby, ServerInstanceID: ServerInstanceID{1}, ServerOrphanRetentionMillis: 9000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffer[len(buffer)-1] = 1
+	if _, err := ReadPreface(bytes.NewReader(buffer)); !errors.Is(err, ErrInvalidPreface) {
+		t.Fatalf("reserved extension error = %v, want ErrInvalidPreface", err)
+	}
+	if _, err := ReadPreface(bytes.NewReader(buffer[:PrefaceSize])); err == nil {
+		t.Fatal("truncated active-standby preface was accepted")
+	}
+}
+
 func TestOpenAndResultRoundTrip(t *testing.T) {
 	streamID, err := NewStreamID()
 	if err != nil {
@@ -176,5 +214,93 @@ func TestOpenValidation(t *testing.T) {
 	}
 	if err := WriteFrame(&bytes.Buffer{}, Frame{Type: FrameOpen, Direction: DirectionClientToServer, Payload: payload}); !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("zero stream ID OPEN error = %v", err)
+	}
+}
+
+func TestRecoverableOpenAndResumeRoundTrip(t *testing.T) {
+	streamID := StreamID{1}
+	token := ResumeToken{2, 3, 4}
+	destination, err := ParseDestination("example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOpen := RecoverableOpen{Destination: destination, ResumeToken: token, Generation: 1, RecoveryTimeoutMillis: 3000}
+	openFrame, err := wantOpen.Frame(streamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buffer bytes.Buffer
+	if err := WriteFrame(&buffer, openFrame); err != nil {
+		t.Fatal(err)
+	}
+	readOpen, err := ReadFrame(&buffer, MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotOpen, err := DecodeRecoverableOpen(readOpen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOpen != wantOpen {
+		t.Fatalf("recoverable OPEN = %#v, want %#v", gotOpen, wantOpen)
+	}
+
+	wantResult := RecoverableOpenResult{Result: OpenResultSuccess, Generation: 1, ServerOrphanRetentionMillis: 9000}
+	if err := WriteFrame(&buffer, wantResult.Frame(streamID)); err != nil {
+		t.Fatal(err)
+	}
+	readResult, err := ReadFrame(&buffer, MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotResult, err := DecodeRecoverableOpenResult(readResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotResult != wantResult {
+		t.Fatalf("recoverable OPEN result = %#v, want %#v", gotResult, wantResult)
+	}
+
+	resume := NewResumeFrame(streamID, token, 2)
+	if err := WriteFrame(&buffer, resume); err != nil {
+		t.Fatal(err)
+	}
+	readResume, err := ReadFrame(&buffer, MaxPayloadSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotToken, err := ResumeTokenFromFrame(readResume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotToken != token || readResume.Offset != 2 {
+		t.Fatalf("RESUME = token %x generation %d", gotToken, readResume.Offset)
+	}
+	if err := WriteFrame(&buffer, NewResumeResultFrame(streamID, 2, ResumeResultSuccess)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFrame(&buffer, MaxPayloadSize); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverableFrameValidation(t *testing.T) {
+	destination, err := ParseDestination("example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := RecoverableOpen{Destination: destination, ResumeToken: ResumeToken{1}, Generation: 1, RecoveryTimeoutMillis: 3000}
+	if _, err := (RecoverableOpen{Destination: destination, Generation: 1, RecoveryTimeoutMillis: 3000}).Frame(StreamID{1}); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("zero resume token error = %v", err)
+	}
+	valid.Generation = 2
+	if _, err := valid.Frame(StreamID{1}); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("initial generation error = %v", err)
+	}
+	if err := WriteFrame(&bytes.Buffer{}, NewResumeFrame(StreamID{1}, ResumeToken{1}, 1)); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("stale RESUME generation error = %v", err)
+	}
+	if err := WriteFrame(&bytes.Buffer{}, (RecoverableOpenResult{Result: OpenResultSuccess, Generation: 1}).Frame(StreamID{1})); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("zero retention result error = %v", err)
 	}
 }

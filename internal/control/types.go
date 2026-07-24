@@ -6,13 +6,20 @@ type WebSocket struct {
 }
 
 type WebInterface struct {
-	Name          string       `json:"name"`
-	Label         string       `json:"label,omitempty"`
-	Status        string       `json:"status"`
-	SenderAddress string       `json:"senderAddress"`
-	DstAddress    string       `json:"dstAddress"`
-	Last          *int64       `json:"last"`
-	Traffic       TrafficStats `json:"traffic"`
+	Name                 string       `json:"name"`
+	Label                string       `json:"label,omitempty"`
+	Status               string       `json:"status"`
+	SenderAddress        string       `json:"senderAddress"`
+	DstAddress           string       `json:"dstAddress"`
+	Last                 *int64       `json:"last"`
+	Traffic              TrafficStats `json:"traffic"`
+	QualityState         string       `json:"qualityState,omitempty"`
+	RTTMillis            float64      `json:"rttMillis,omitempty"`
+	JitterMillis         float64      `json:"jitterMillis,omitempty"`
+	ScoreMillis          float64      `json:"scoreMillis,omitempty"`
+	FailurePenaltyMillis float64      `json:"failurePenaltyMillis,omitempty"`
+	ActiveFlows          int          `json:"activeFlows,omitempty"`
+	ServerInstanceID     string       `json:"serverInstanceId,omitempty"`
 }
 
 type TrafficCounters struct {
@@ -37,6 +44,8 @@ type TCPStreamStatus struct {
 	Destination string `json:"destination"`
 	Carriers    int    `json:"carriers"`
 	State       string `json:"state"`
+	Recoverable bool   `json:"recoverable,omitempty"`
+	Generation  uint64 `json:"carrierGeneration,omitempty"`
 }
 
 type ServerStatus struct {
@@ -50,6 +59,8 @@ type ServerStatus struct {
 	Streams         int               `json:"streams,omitempty"`
 	Carriers        int               `json:"carriers,omitempty"`
 	Sessions        int               `json:"sessions,omitempty"`
+	CarrierMode     string            `json:"carrierMode,omitempty"`
+	Recovering      int               `json:"recovering,omitempty"`
 }
 
 type ClientStatus struct {
@@ -63,4 +74,6 @@ type ClientStatus struct {
 	Streams             int            `json:"streams,omitempty"`
 	Carriers            int            `json:"carriers,omitempty"`
 	Sessions            int            `json:"sessions,omitempty"`
+	CarrierMode         string         `json:"carrierMode,omitempty"`
+	Recovering          int            `json:"recovering,omitempty"`
 }

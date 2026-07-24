@@ -77,6 +77,8 @@ IPv4 地址。该命令不读取配置，也不应用 `includeInterfaces` 和
 | `includeInterfaces` | 否 | `[]` | 按完整网卡名匹配的 glob 允许列表。空列表允许所有其他条件合格的网卡。 |
 | `excludedInterfaces` | 否 | `[]` | 按完整网卡名匹配的 glob 拒绝列表；排除规则优先于包含规则。 |
 | `interfaceLabels` | 否 | `{}` | 精确网卡名到显示标签的映射，用于管理界面。 |
+| `pathSelection` | 否 | active-standby 时为 `adaptive` | 路径选择策略；当前唯一有效值是 `adaptive`。 |
+| `interfaceHints` | 否 | `{}` | 精确网卡名到可选资费提示的映射；仅在 active-standby 路径评分中使用。 |
 | `dstOverrides` | 否 | `[]` | 按网卡覆盖 Session 目标；每项包含精确的 `ifName` 和可通过 IPv4 到达的 `dstAddr`。 |
 | `transfer` | 否 | 参见[传输字段](#传输字段) | 传输调优与资源限制。 |
 | `webManager` | 否 | 禁用 | 内嵌管理 HTTP 监听。参见 [Web Manager 字段](#web-manager-字段)。 |
@@ -113,6 +115,10 @@ excludedInterfaces:
 interfaceLabels:
   eth0: "Primary ISP"
   eth1: "Backup ISP"
+pathSelection: adaptive
+interfaceHints:
+  wwan0:
+    cost: metered
 dstOverrides:
   - ifName: "eth1"
     dstAddr: "198.51.100.20:59501"
@@ -121,6 +127,10 @@ dstOverrides:
 网卡必须通过这些筛选规则，并且 Engarde 能从中选出非 loopback、非 link-local 的
 IPv4 地址，才可用于 Session。管理界面的运行时操作可以临时反转某个精确网卡名的
 配置状态；重置 override 后会恢复 YAML 规则。
+
+`interfaceHints.<网卡名>.cost` 必须为 `normal`、`metered` 或 `avoid`。该提示只表达系统
+无法自动判断的资费偏好，不是固定优先级：Engarde 仍会结合 Session RTT、抖动、失败
+惩罚和当前负载自适应选择。通常可完全省略 `pathSelection` 和 `interfaceHints`。
 
 ## Server 字段
 
@@ -169,24 +179,34 @@ transfer:
   keepaliveIntervalMillis: 1000
   keepaliveTimeoutMillis: 5000
   tcp:
+    carrierMode: redundant
     chunkSize: 16384
     carrierQueueBytes: 1048576
     reorderWindowBytes: 4194304
     dialTimeoutMillis: 5000
     openTimeoutMillis: 5000
     writeTimeoutMillis: 10000
+    clientRecoveryTimeoutMillis: 0
+    serverOrphanRetentionMillis: 0
+    resumeOpenTimeoutMillis: 0
     maxStreams: 0
     maxCarriersPerStream: 0
     maxPendingConnections: 0
     maxPendingStreams: 0
     maxSessions: 0
+    maxConcurrentResumes: 0
+    maxPendingResumes: 0
+    maxRecoveringStreams: 0
+    maxRecoveryBytes: 0
 ```
 
-对于具有正数默认值的字段，不配置和显式填写 `0` 都会采用默认值；负数无效。五个
-`max*` 字段是例外，其中 `0` 表示不限。
+对于具有正数默认值的字段，不配置和显式填写 `0` 都会采用默认值；负数无效。
+`redundant` 模式下，原有五个资源 `max*` 字段的 `0` 仍表示不限。active-standby 专用
+字段只在该模式下生效；启用后其中的 `0` 会选择下表中的有限默认值，不能表示不限。
 
 | 字段 | 生效默认值 | 有效生效值 | 生效端 | 含义 |
 | --- | ---: | ---: | --- | --- |
+| `tcp.carrierMode` | `redundant` | `redundant` 或 `active-standby` | 两端 | `redundant` 在每条健康路径重复发送；`active-standby` 每个 Flow 只使用一个 active carrier，并保留热备 Session。 |
 | `keepaliveIntervalMillis` | `1000` | `> 0` | 两端 | 复用 Session 的 keepalive 探测间隔。 |
 | `keepaliveTimeoutMillis` | `5000` | 大于同一文件中的 interval | 两端 | 无 keepalive 响应时关闭复用 Session 的等待上限。 |
 | `tcp.chunkSize` | `16384` | `1..65536` | 两端 | 一个 DATA frame 中承载的最大应用数据。 |
@@ -195,14 +215,55 @@ transfer:
 | `tcp.dialTimeoutMillis` | `5000` | `> 0` | 两端 | Client 上用于连接 server 的 Session 拨号超时；server 上用于目标拨号超时。 |
 | `tcp.openTimeoutMillis` | `5000` | `> 0` | 两端 | SOCKS5 协商、Session 握手和虚拟 stream OPEN 建立的时间边界。 |
 | `tcp.writeTimeoutMillis` | `10000` | `> 0` | 两端 | Carrier 或 endpoint 写入无进展时的 deadline。 |
-| `tcp.maxStreams` | 不限 | `>= 0` | 两端 | 最大并发逻辑 TCP stream 数。 |
-| `tcp.maxCarriersPerStream` | 不限 | `>= 0` | Server | 每个 stream 可接受的最大 carrier 数；client 仍会在每个合格网卡上尝试一条 carrier。 |
+| `tcp.clientRecoveryTimeoutMillis` | active-standby: `3000` | `> 0` | Client | 最后一条 active carrier 失效后保留 App TCP 并尝试 RESUME 的总预算。 |
+| `tcp.serverOrphanRetentionMillis` | active-standby: `9000` | 见下方关系 | Server | carrier 为空时保留原 target TCP 和 Flow 状态的预算。 |
+| `tcp.resumeOpenTimeoutMillis` | active-standby: `750` | `> 0` 且小于 client recovery | Client | 单次 RESUME stream 建立与结果等待上限。 |
+| `tcp.maxStreams` | redundant: 不限；active-standby: `2048` | `>= 0`；active 时 `> 0` | 两端 | 最大并发逻辑 TCP stream 数。 |
+| `tcp.maxCarriersPerStream` | 不限 | `>= 0` | Server | redundant Flow 每个 stream 可接受的最大 carrier 数；active-standby Flow 始终只有一个。 |
 | `tcp.maxPendingConnections` | 不限 | `>= 0` | Server | 尚未成为复用 Session 的物理连接最大并发握手数。 |
 | `tcp.maxPendingStreams` | 不限 | `>= 0` | Server | 仍在处理 OPEN 和目标连接建立的虚拟 stream 最大并发数。 |
 | `tcp.maxSessions` | 不限 | `>= 0` | Server | 已建立的物理复用 Session 最大数量。 |
+| `tcp.maxConcurrentResumes` | active-standby: `64` | active 时 `> 0` | Client | 同时执行的 recoverable OPEN、RESUME 或主动迁移数量。 |
+| `tcp.maxPendingResumes` | active-standby: `128` | active 时 `> 0` | 两端 | Client 恢复/迁移队列和 server 并发 RESUME 准入上限。 |
+| `tcp.maxRecoveringStreams` | active-standby: `1024` | active 时 `1..maxStreams` | 两端 | 可同时保留 endpoint 的 recovering Flow 上限。 |
+| `tcp.maxRecoveryBytes` | active-standby: `536870912` | active 时至少为 `reorderWindowBytes` | 两端 | 所有 recovering Flow 未确认重放历史的聚合上限。 |
 
 标记为仅 server 生效的设置如果出现在 client 文件中，仍会被解析和校验，但不会施加
 client 侧限制。
+
+### Active-standby 模式
+
+Client 与 server 必须同时配置：
+
+```yaml
+transfer:
+  tcp:
+    carrierMode: active-standby
+```
+
+不支持该能力或模式不一致的 peer 会使 Session 明确失败，不会静默降级到重复发送。每条
+合格网卡仍维持一条已鉴权、已探测的物理 Session，但每个逻辑 Flow 健康时只有一条
+active carrier。Session 级探测提供 RTT/抖动样本；路径评分还考虑衰减的失败惩罚、
+当前 active Flow 数和 smux stream 压力，完全相同时按网卡名确定性选择。
+
+既有 Flow 只能在返回相同 `serverInstanceID` 的 Session 间 RESUME。不同 `dstOverrides`
+可以指向同一 server 进程的不同地址，但不能指向互不共享内存状态的多个 server 实例；
+server 重启后旧 target TCP 也无法恢复。成功切换会保留原 App TCP 和原 target TCP；
+所有路径持续不可用并超过 recovery budget 后，Flow 才会以终端错误关闭。
+Client 会过滤握手中声明的 retention 短于自身 recovery budget 的 Session；server 也会在
+拨号 target 前拒绝请求预算超过自身 retention 的 recoverable OPEN。
+
+配置必须满足：
+
+```text
+resumeOpenTimeoutMillis < clientRecoveryTimeoutMillis
+serverOrphanRetentionMillis >= clientRecoveryTimeoutMillis + resumeOpenTimeoutMillis
+maxRecoveringStreams <= maxStreams
+maxRecoveryBytes >= reorderWindowBytes
+```
+
+恢复过载时优先保护已建立 Flow，并按“最晚建立的 Flow 先失败”确定性释放超额状态。
+回到 `carrierMode: redundant` 需要重启进程，现有 Flow 会随重启中断。
 
 ### 两端之间的 keepalive 设置
 

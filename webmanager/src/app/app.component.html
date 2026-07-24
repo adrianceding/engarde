@@ -14,6 +14,8 @@
           <div class="tcp-summary-item"><span>Streams</span><strong>{{ streams }}</strong></div>
           <div class="tcp-summary-item"><span>Carriers</span><strong>{{ carriers }}</strong></div>
           <div class="tcp-summary-item"><span>Sessions</span><strong>{{ sessions }}</strong></div>
+          <div class="tcp-summary-item"><span>Carrier mode</span><strong>{{ carrierMode }}</strong></div>
+          <div class="tcp-summary-item"><span>Recovering</span><strong>{{ recovering }}</strong></div>
           <div class="tcp-summary-item"><span>Frontend auth</span><strong>{{ frontendAuthEnabled ? 'Required' : 'Disabled' }}</strong></div>
           <div class="tcp-summary-item"><span>Peer auth</span><strong>{{ peerAuthEnabled ? 'Required' : 'Disabled' }}</strong></div>
         </div>
@@ -73,6 +75,14 @@
                   <span class="interface-status status-idle"><span class="status-dot"></span>Idle</span>
                 }
               </div>
+              @if (carrierMode == 'active-standby') {
+                <div class="path-quality" [title]="iface.serverInstanceId || ''">
+                  <span [ngClass]="['quality-state', 'quality-' + (iface.qualityState || 'unavailable')]">{{ iface.qualityState || 'unavailable' }}</span>
+                  <span>RTT {{ iface.rttMillis || 0 | number:'1.0-1' }} ms</span>
+                  <span>Jitter {{ iface.jitterMillis || 0 | number:'1.0-1' }} ms</span>
+                  <span>{{ iface.activeFlows || 0 }} active flows</span>
+                </div>
+              }
               <mat-card-content>
               <div class="stats-grid" [ngClass]="{'stats-muted': iface.status == 'idle'}">
                 <div class="stat-block stat-data">
@@ -200,12 +210,14 @@
         <div class="tcp-summary-item"><span>Streams</span><strong>{{ streams }}</strong></div>
         <div class="tcp-summary-item"><span>Carriers</span><strong>{{ carriers }}</strong></div>
         <div class="tcp-summary-item"><span>Sessions</span><strong>{{ sessions }}</strong></div>
+        <div class="tcp-summary-item"><span>Carrier mode</span><strong>{{ carrierMode }}</strong></div>
+        <div class="tcp-summary-item"><span>Recovering</span><strong>{{ recovering }}</strong></div>
         <div class="tcp-summary-item"><span>Peer auth</span><strong>{{ peerAuthEnabled ? 'Required' : 'Disabled' }}</strong></div>
       </div>
       <p class="subtitle main-text">Active streams</p>
       <div class="tcp-stream-table" role="table" aria-label="Active TCP streams">
         <div class="tcp-stream-row tcp-stream-header" role="row">
-          <span>Stream</span><span>Protocol</span><span>Destination</span><span>Carriers</span><span>State</span>
+          <span>Stream</span><span>Protocol</span><span>Destination</span><span>Carriers</span><span>Generation</span><span>State</span>
         </div>
         @for (stream of tcpStreams; track trackByStreamId($index, stream)) {
           <div class="tcp-stream-row" role="row">
@@ -213,6 +225,7 @@
             <span>v{{ stream.protocolVersion }}</span>
             <span class="stream-destination">{{ stream.destination }}</span>
             <span>{{ stream.carriers }}</span>
+            <span>{{ stream.recoverable ? stream.carrierGeneration : '--' }}</span>
             <span>{{ stream.state }}</span>
           </div>
         }

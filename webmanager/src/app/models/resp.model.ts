@@ -14,5 +14,7 @@ export interface RespModel {
     tcpStreams?: TCPStreamModel[],
     streams?: number,
     carriers?: number,
-    sessions?: number
+    sessions?: number,
+    carrierMode?: string,
+    recovering?: number
 }

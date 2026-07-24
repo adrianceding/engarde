@@ -13,6 +13,7 @@ func FuzzReadPreface(f *testing.F) {
 	f.Add(valid)
 	f.Add(fuzzPrefaceWire(PrefaceFlagAuthRequired, 1))
 	f.Add(fuzzPrefaceWire(PrefaceFlagAuthRequired, MaxPayloadSize))
+	f.Add(fuzzPrefaceWire(PrefaceFlagActiveStandby, MaxPayloadSize))
 	f.Add(append(append([]byte(nil), valid...), 0xa5))
 
 	for _, size := range []int{0, 1, 4, 5, 8, 12, PrefaceSize - 1} {
@@ -33,7 +34,7 @@ func FuzzReadPreface(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, wire []byte) {
-		if len(wire) > PrefaceSize+32 {
+		if len(wire) > ActiveStandbyPrefaceSize+32 {
 			return
 		}
 
@@ -61,16 +62,20 @@ func FuzzReadPreface(f *testing.F) {
 		if preface.MaxPayload == 0 || preface.MaxPayload > MaxPayloadSize {
 			t.Fatalf("accepted max payload = %d", preface.MaxPayload)
 		}
-		if reader.Len() != len(wire)-PrefaceSize {
-			t.Fatalf("ReadPreface consumed %d bytes, want %d", len(wire)-reader.Len(), PrefaceSize)
+		consumed := PrefaceSize
+		if preface.Flags&PrefaceFlagActiveStandby != 0 {
+			consumed = ActiveStandbyPrefaceSize
+		}
+		if reader.Len() != len(wire)-consumed {
+			t.Fatalf("ReadPreface consumed %d bytes, want %d", len(wire)-reader.Len(), consumed)
 		}
 
 		var canonical bytes.Buffer
 		if err := WritePreface(&canonical, preface); err != nil {
 			t.Fatalf("WritePreface after successful read: %v", err)
 		}
-		if !bytes.Equal(canonical.Bytes(), wire[:PrefaceSize]) {
-			t.Fatalf("accepted non-canonical preface %x; canonical encoding is %x", wire[:PrefaceSize], canonical.Bytes())
+		if !bytes.Equal(canonical.Bytes(), wire[:consumed]) {
+			t.Fatalf("accepted non-canonical preface %x; canonical encoding is %x", wire[:consumed], canonical.Bytes())
 		}
 		roundTrip, err := ReadPreface(bytes.NewReader(canonical.Bytes()))
 		if err != nil {
@@ -85,6 +90,11 @@ func FuzzReadPreface(f *testing.F) {
 func FuzzReadFrame(f *testing.F) {
 	streamID := StreamID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	destination := []byte{byte(DestinationDomain), 11, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm', 0x01, 0xbb}
+	resumeToken := ResumeToken{1}
+	recoverablePayload := make([]byte, recoverableOpenFixedPayloadSize+len(destination))
+	copy(recoverablePayload[:resumeTokenSize], resumeToken[:])
+	binary.BigEndian.PutUint32(recoverablePayload[resumeTokenSize:recoverableOpenFixedPayloadSize], 3000)
+	copy(recoverablePayload[recoverableOpenFixedPayloadSize:], destination)
 	validFrames := []Frame{
 		{Type: FrameOpen, Direction: DirectionClientToServer, StreamID: streamID, Payload: destination},
 		{Type: FrameData, Direction: DirectionClientToServer, StreamID: streamID, Offset: 9, Payload: []byte{0}},
@@ -94,6 +104,12 @@ func FuzzReadFrame(f *testing.F) {
 		{Type: FrameData, Direction: DirectionServerToClient, StreamID: streamID, Offset: ^uint64(0) - 1, Payload: []byte{0}},
 		{Type: FrameAck, Direction: DirectionClientToServer, StreamID: streamID, Offset: 10, Payload: []byte{1}},
 		{Type: FrameOpenResult, Direction: DirectionServerToClient, StreamID: streamID, Payload: []byte{byte(OpenResultPolicyDenied)}},
+		{Type: FrameRecoverableOpen, Direction: DirectionClientToServer, StreamID: streamID, Offset: 1, Payload: recoverablePayload},
+		(RecoverableOpenResult{Result: OpenResultSuccess, Generation: 1, ServerOrphanRetentionMillis: 9000}).Frame(streamID),
+		NewResumeFrame(streamID, resumeToken, 2),
+		NewResumeResultFrame(streamID, 2, ResumeResultSuccess),
+		{Type: FramePing, Direction: DirectionClientToServer, Offset: 1},
+		{Type: FramePong, Direction: DirectionServerToClient, Offset: 1},
 	}
 	for _, frame := range validFrames {
 		f.Add(fuzzFrameWire(frame), uint32(MaxPayloadSize))
@@ -209,11 +225,15 @@ func FuzzReadFrame(f *testing.F) {
 }
 
 func fuzzPrefaceWire(flags uint8, maxPayload uint32) []byte {
-	wire := make([]byte, PrefaceSize)
+	size := PrefaceSize
+	if flags&PrefaceFlagActiveStandby != 0 {
+		size = ActiveStandbyPrefaceSize
+	}
+	wire := make([]byte, size)
 	binary.BigEndian.PutUint32(wire[0:4], Magic)
 	wire[4] = Version
 	wire[5] = flags
-	binary.BigEndian.PutUint16(wire[6:8], PrefaceSize)
+	binary.BigEndian.PutUint16(wire[6:8], uint16(size))
 	binary.BigEndian.PutUint32(wire[8:12], maxPayload)
 	return wire
 }
