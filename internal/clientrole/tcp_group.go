@@ -487,7 +487,6 @@ func (pathSession *tcpPathSession) clearProbe(session *tcpstream.Session, probe 
 		return false
 	}
 	pathSession.probe = nil
-	pathSession.lastProbe = time.Time{}
 	return true
 }
 

@@ -773,8 +773,18 @@ func TestTCPPathSessionProbeFailureDoesNotReplaceSession(t *testing.T) {
 		pathSession.mu.Lock()
 		probe := pathSession.probe
 		pathSession.mu.Unlock()
-		return probe == nil && pathSession.qualityStatus(path, config.InterfaceCostNormal, tcpRetryNow()).state == "degraded"
+		return probe == nil
 	})
+	pathSession.mu.Lock()
+	lastSuccessfulProbe := pathSession.lastProbe
+	pathSession.mu.Unlock()
+	if quality := pathSession.qualityStatus(path, config.InterfaceCostNormal, lastSuccessfulProbe.Add(tcpSessionProbeStandbyInterval)); quality.state != "healthy" {
+		t.Fatalf("quality after one established probe failure = %q, want healthy during grace period", quality.state)
+	}
+	staleAt := lastSuccessfulProbe.Add(2*tcpSessionProbeStandbyInterval + tcpSessionProbeTimeout + time.Nanosecond)
+	if quality := pathSession.qualityStatus(path, config.InterfaceCostNormal, staleAt); quality.state != "degraded" {
+		t.Fatalf("quality after probe grace period = %q, want degraded", quality.state)
+	}
 	currentSession, currentGeneration, currentAvailable := pathSession.current(path)
 	if !currentAvailable || currentSession != physicalSession || currentGeneration != generation || physicalSession.IsClosed() || dialCount.Load() != 1 {
 		t.Fatalf("Session after established probe failure = available %v/same %v/generation %d/closed %v/dials %d, want true/true/1/false/1", currentAvailable, currentSession == physicalSession, currentGeneration, physicalSession.IsClosed(), dialCount.Load())
