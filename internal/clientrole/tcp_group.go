@@ -20,6 +20,7 @@ const (
 	tcpSessionProbeActiveInterval  = 250 * time.Millisecond
 	tcpSessionProbeStandbyInterval = time.Second
 	tcpSessionProbeTimeout         = 400 * time.Millisecond
+	tcpSessionProbeFailureLimit    = 2
 )
 
 var newTCPSessionRetryTimer = func(delay time.Duration) (<-chan time.Time, func()) {
@@ -82,6 +83,7 @@ type tcpPathSession struct {
 	penaltyAt     time.Time
 	cooldownUntil time.Time
 	lastProbe     time.Time
+	probeFailures int
 	activeFlows   int
 }
 
@@ -371,6 +373,7 @@ func (pathSession *tcpPathSession) dial(generation uint64) {
 		pathSession.recordProbeRTTLocked(probeRTT, probedAt)
 	} else if tcpConfig.ActiveStandby() {
 		pathSession.lastProbe = time.Time{}
+		pathSession.probeFailures = 1
 	}
 	pathSession.cooldownUntil = time.Time{}
 	pathSession.inFlight = false
@@ -441,6 +444,9 @@ func (pathSession *tcpPathSession) monitorProbe(session *tcpstream.Session) {
 			tcpConfig := pathSession.runtime.client.cfg.Transfer.TCP
 			opened, err := session.OpenProbe(time.Duration(tcpConfig.ResumeOpenTimeoutMillis) * time.Millisecond)
 			if err != nil {
+				if pathSession.recordProbeFailure(session) {
+					return
+				}
 				continue
 			}
 			if !pathSession.installProbe(session, opened) {
@@ -457,6 +463,9 @@ func (pathSession *tcpPathSession) monitorProbe(session *tcpstream.Session) {
 			}
 			if pathSession.clearProbe(session, probe) {
 				pathSession.retireProbe(probe)
+				if pathSession.recordProbeFailure(session) {
+					return
+				}
 			}
 			continue
 		}
@@ -490,6 +499,23 @@ func (pathSession *tcpPathSession) clearProbe(session *tcpstream.Session, probe 
 	return true
 }
 
+func (pathSession *tcpPathSession) recordProbeFailure(session *tcpstream.Session) bool {
+	pathSession.mu.Lock()
+	if pathSession.closed || pathSession.session != session || session.IsClosed() {
+		pathSession.mu.Unlock()
+		return true
+	}
+	if pathSession.probeFailures < tcpSessionProbeFailureLimit {
+		pathSession.probeFailures++
+	}
+	hardFailure := pathSession.probeFailures >= tcpSessionProbeFailureLimit
+	pathSession.mu.Unlock()
+	if hardFailure {
+		_ = session.Close()
+	}
+	return hardFailure
+}
+
 func (pathSession *tcpPathSession) detachProbe(session *tcpstream.Session) *tcpstream.SessionProbe {
 	pathSession.mu.Lock()
 	defer pathSession.mu.Unlock()
@@ -512,6 +538,7 @@ func (pathSession *tcpPathSession) recordProbeRTT(session *tcpstream.Session, pr
 }
 
 func (pathSession *tcpPathSession) recordProbeRTTLocked(sample time.Duration, now time.Time) {
+	pathSession.probeFailures = 0
 	if sample > 0 {
 		pathSession.recordRTTLocked(sample, now)
 		return

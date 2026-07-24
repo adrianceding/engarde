@@ -263,6 +263,12 @@ while each healthy logical Flow has exactly one active carrier. Session probes
 provide RTT and jitter samples; scoring also includes decaying failure
 penalties, active Flow count, and smux stream pressure, with interface name as
 a deterministic final tie-breaker.
+Sessions carrying active Flows probe every `250ms`; idle warm Sessions probe
+every `1s`, with a `400ms` response limit. One failure remains inside the
+health grace period. Two consecutive failures make the physical Session
+unavailable, enqueue its Flows for priority recovery, and RESUME them through
+a healthy warm Session. Any successful probe resets the consecutive-failure
+count.
 
 An existing Flow can RESUME only across Sessions with the same
 `serverInstanceID`. Different `dstOverrides` may reach different addresses of

@@ -138,6 +138,7 @@ func TestTCPSOCKS5EndToEndWithRedundantCarriers(t *testing.T) {
 }
 
 func TestTCPSOCKS5ActiveStandbyResumesWithoutApplicationReconnect(t *testing.T) {
+	_ = installTCPManualSessionProbeTimer(t)
 	echoListener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -249,8 +250,14 @@ func TestTCPSOCKS5ActiveStandbyResumesWithoutApplicationReconnect(t *testing.T) 
 	if failedInterface == "" || failedCarrier == nil || failedSession == nil || initialGeneration != 1 {
 		t.Fatalf("initial active path = %q carrier %v session %v generation %d", failedInterface, failedCarrier, failedSession, initialGeneration)
 	}
-	if err := failedSession.Close(); err != nil {
-		t.Fatal(err)
+	if failedPathSession.recordProbeFailure(failedSession) {
+		t.Fatal("first active-path probe failure was treated as hard failure")
+	}
+	if failedSession.IsClosed() {
+		t.Fatal("first active-path probe failure closed Session")
+	}
+	if !failedPathSession.recordProbeFailure(failedSession) {
+		t.Fatal("second active-path probe failure did not close Session")
 	}
 	waitForTCPStatus(t, func() (int, int, int) {
 		group.mu.Lock()

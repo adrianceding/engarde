@@ -687,6 +687,26 @@ func TestTCPPathSessionZeroProbeRTTRefreshesHealthWithoutBiasingScore(t *testing
 	}
 }
 
+func TestTCPPathSessionProbeFailureLimitClosesSession(t *testing.T) {
+	session := newActiveSelectionSession(t, tcpstream.ServerInstanceID{1})
+	pathSession := &tcpPathSession{session: session}
+
+	if pathSession.recordProbeFailure(session) {
+		t.Fatal("first probe failure was treated as hard failure")
+	}
+	if session.IsClosed() {
+		t.Fatal("first probe failure closed Session")
+	}
+	if !pathSession.recordProbeFailure(session) {
+		t.Fatal("second consecutive probe failure was not treated as hard failure")
+	}
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("hard probe failure did not close Session")
+	}
+}
+
 func TestTCPPathSessionProbeFailureDoesNotReplaceSession(t *testing.T) {
 	probeTimers := installTCPManualSessionProbeTimer(t)
 	retryTimers := installTCPManualSessionRetryTimer(t)
@@ -762,8 +782,9 @@ func TestTCPPathSessionProbeFailureDoesNotReplaceSession(t *testing.T) {
 	waitTCPSessionManagerCondition(t, func() bool {
 		pathSession.mu.Lock()
 		firstReplacement = pathSession.probe
+		probeFailures := pathSession.probeFailures
 		pathSession.mu.Unlock()
-		return firstReplacement != nil && pathSession.qualityStatus(path, config.InterfaceCostNormal, tcpRetryNow()).state == "healthy"
+		return firstReplacement != nil && probeFailures == 0 && pathSession.qualityStatus(path, config.InterfaceCostNormal, tcpRetryNow()).state == "healthy"
 	})
 
 	failedEstablishedProbe := probeTimers.next(t)
@@ -772,8 +793,9 @@ func TestTCPPathSessionProbeFailureDoesNotReplaceSession(t *testing.T) {
 	waitTCPSessionManagerCondition(t, func() bool {
 		pathSession.mu.Lock()
 		probe := pathSession.probe
+		probeFailures := pathSession.probeFailures
 		pathSession.mu.Unlock()
-		return probe == nil
+		return probe == nil && probeFailures == 1
 	})
 	pathSession.mu.Lock()
 	lastSuccessfulProbe := pathSession.lastProbe
@@ -797,8 +819,9 @@ func TestTCPPathSessionProbeFailureDoesNotReplaceSession(t *testing.T) {
 	waitTCPSessionManagerCondition(t, func() bool {
 		pathSession.mu.Lock()
 		probe := pathSession.probe
+		probeFailures := pathSession.probeFailures
 		pathSession.mu.Unlock()
-		return probe != nil && probe != firstReplacement && pathSession.qualityStatus(path, config.InterfaceCostNormal, tcpRetryNow()).state == "healthy"
+		return probe != nil && probe != firstReplacement && probeFailures == 0 && pathSession.qualityStatus(path, config.InterfaceCostNormal, tcpRetryNow()).state == "healthy"
 	})
 	currentSession, currentGeneration, currentAvailable = pathSession.current(path)
 	if !currentAvailable || currentSession != physicalSession || currentGeneration != generation || physicalSession.IsClosed() || dialCount.Load() != 1 {

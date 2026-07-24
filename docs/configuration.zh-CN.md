@@ -245,6 +245,10 @@ transfer:
 合格网卡仍维持一条已鉴权、已探测的物理 Session，但每个逻辑 Flow 健康时只有一条
 active carrier。Session 级探测提供 RTT/抖动样本；路径评分还考虑衰减的失败惩罚、
 当前 active Flow 数和 smux stream 压力，完全相同时按网卡名确定性选择。
+承载 active Flow 的 Session 每 `250ms` 发起一次探测，空闲热备 Session 每 `1s` 探测一次，
+单次响应上限为 `400ms`。一次失败只进入宽限期并保留最近成功状态；连续两次失败会把
+整个物理 Session 判为不可用，使其上的 Flow 进入高优先级恢复队列并通过健康热备 Session
+执行 RESUME。任意一次成功探测都会清零连续失败计数。
 
 既有 Flow 只能在返回相同 `serverInstanceID` 的 Session 间 RESUME。不同 `dstOverrides`
 可以指向同一 server 进程的不同地址，但不能指向互不共享内存状态的多个 server 实例；
